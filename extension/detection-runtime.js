@@ -83,13 +83,20 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
  }
  async function deliver(event,delivery_id,retry,submission,authority,observed){
   await requireAuthority(authority);if(retry&&authority===null){throw new Error('Legacy replay unavailable');}
-  if(retry){const receipt=await bridge({op:'event_receipt',tool,delivery_id,authority});if(receipt?.ok!==true||receipt.delivery_id!==delivery_id){throw new Error('Receipt lookup rejected');}if(receipt.durable===true){if(!receiptID(receipt.id)){throw new Error('Receipt identity absent');}
+  if(retry){
+   const receipt=await bridge({op:'event_receipt',tool,delivery_id,authority});
+   if(receipt?.ok!==true||receipt.delivery_id!==delivery_id){throw new Error('Receipt lookup rejected');}
+   if(receipt.durable===true){
+    if(!receiptID(receipt.id)){throw new Error('Receipt identity absent');}
    // Attempted once, at the moment the request is observed, and never queued: storing
    // it would put a conversation identifier in browser storage, which this projection
    // exists to forbid. Losing it leaves the event as it is today, never worse.
    const completion=observed?completionOf(observed):null;
    if(completion){try{await bridge({op:'event_complete',tool,delivery_id,completion,authority});}catch{}}
-   return receipt;}if(receipt.durable!==false){throw new Error('Receipt state absent');}if(submission){return receipt;}}
+   return receipt;}
+  if(receipt.durable!==false){throw new Error('Receipt state absent');}
+  if(submission){return receipt;}
+ }
   const result=await bridge({op:'event_v2',tool,event,delivery_id,authority});
   if(result?.ok!==true||!receiptID(result.id)){throw new Error('Event delivery receipt absent');}
   return result;
