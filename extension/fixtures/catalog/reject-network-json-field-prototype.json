@@ -1,0 +1,55 @@
+{
+  "case": "network-json-field-prototype",
+  "reason": "Unwrapping writes back into the decoded body, so a field named __proto__ would reach the prototype instead of a field. Refused by the catalogue validators, and refused again by the engine that walks it.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": [
+          "assistant.example-corp.test"
+        ],
+        "aliases": [
+          "assistant-alias.example-corp.test"
+        ],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": {
+          "editor": "textarea.prompt",
+          "send": "button.send",
+          "response": ".response"
+        },
+        "network": [
+          {
+            "method": "POST",
+            "host": "assistant.example-corp.test",
+            "path": "/api/v1/complete",
+            "text_path": "messages[*].content",
+            "model_path": "model",
+            "conversation_path": "session_id",
+            "json_fields": [
+              "__proto__"
+            ],
+            "files_path": "imageAttachments[*].name"
+          }
+        ],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": [
+        "messages",
+        "prompt",
+        "model",
+        "input"
+      ],
+      "mime_types": [
+        "text/event-stream",
+        "application/json"
+      ]
+    }
+  }
+}

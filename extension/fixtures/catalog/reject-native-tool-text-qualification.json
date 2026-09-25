@@ -1,0 +1,34 @@
+{
+  "case": "native-tool-text-qualification",
+  "reason": "Go unconditionally refuses to publish any native tool entry that declares telemetry_text_qualified_versions, with a dedicated 409 qualification_required: raw native telemetry text has not been safety-qualified on any real managed tool yet. The Rust validator had no equivalent gate and would accept such an entry; since fixed (endpoint/src/detection.rs validate()) to reject a non-empty telemetry_text_qualified_versions the same way.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": ["assistant.example-corp.test"],
+        "aliases": [],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": "button.send", "response": ".response" },
+        "network": [],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [
+      {
+        "id": "codex",
+        "platform": "windows",
+        "parser": "otlp-v1",
+        "qualified_versions": ["1.0.0"],
+        "telemetry_text_qualified_versions": ["1.0.0"]
+      }
+    ],
+    "heuristics": {
+      "keys": ["messages", "prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

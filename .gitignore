@@ -1,0 +1,19 @@
+# Build outputs.
+target/
+extension-community/
+extension-firefox-community/
+extension/node_modules/
+coverage/
+*.info
+
+# None of this belongs in a public repository.
+.local/
+.env
+*.log
+*.pem
+*.key
+*.crx
+*.xpi
+*.msi
+
+.DS_Store

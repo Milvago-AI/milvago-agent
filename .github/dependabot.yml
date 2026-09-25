@@ -1,0 +1,37 @@
+# Every dependency is pinned to an exact version: an upgrade is an explicit, reviewed change,
+# never a resolution side effect. Dependabot proposes those changes, grouped per ecosystem.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: cargo
+    directory: /browser-engine
+    schedule:
+      interval: weekly
+    groups:
+      engine:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /extension
+    schedule:
+      interval: weekly
+    versioning-strategy: increase
+    groups:
+      npm:
+        patterns: ["*"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

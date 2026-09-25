@@ -1,0 +1,60 @@
+{
+  "manifest_version": 3,
+  "name": "Milvago Browser",
+  "version": "0.5.45",
+  "description": "Politiques navigateur Milvago. Aucune analyse des applications du poste.",
+  "storage": {
+    "managed_schema": "managed-schema.json"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "alarms",
+    "declarativeNetRequest",
+    "webRequest",
+    "webRequestBlocking",
+    "tabs",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Milvago Browser",
+    "default_icon": "milvago-symbol-256.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://gemini.google.com/*",
+        "https://copilot.microsoft.com/*",
+        "https://chat.mistral.ai/*",
+        "https://notebooklm.google.com/*",
+        "https://notebook.google.com/*",
+        "https://chat.deepseek.com/*",
+        "https://www.perplexity.ai/*",
+        "https://grok.com/*",
+        "https://chat.openai.com/*",
+        "https://copilot.cloud.microsoft/*",
+        "https://perplexity.ai/*"
+      ],
+      "js": [
+        "adapters.js",
+        "capture.js"
+      ],
+      "run_at": "document_start",
+      "all_frames": false
+    }
+  ],
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6psB08/C75Ww30aqcvp8o68joR11V8wVt4qdT2bAsSyCbwbeJpuPJR+LSN/eVzpKz6/URJBszKKREIFyFtde+3uxa5MJB9PLW1C0Nxcp4jIHCD2vmVE7Orf2rkZw8bbokH1b/5rN7qEwiXPe0O5Xmq31rAAKCPmGJmzWumSOIs82eTn88uPixJWBbYue7dQ0Yes1kD62LeSgXSIaDxUfvlsnwF7GrIBhZwA0ILg1m7uq1tV3aLAv6JcReHEhadYtyAsWl7jI1vC+tGbxGqTa4oEA6iGkzZT+d5pjOS/q5rPxaOyksyJowzZtlPz/YAqyizVm5Zf/Or8ddBnXYYY02wIDAQAB",
+  "icons": {
+    "256": "milvago-symbol-256.png"
+  }
+}

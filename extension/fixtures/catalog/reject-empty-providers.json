@@ -1,0 +1,14 @@
+{
+  "case": "empty-providers",
+  "reason": "Both validators treat an empty providers list as an invalid catalogue size (Go: len(c.Providers)==0 in validateDetection; Rust: c.providers.is_empty() in validate()). A catalogue must declare at least one provider to be either publishable or applicable.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [],
+    "native_tools": [],
+    "heuristics": {
+      "keys": [],
+      "mime_types": []
+    }
+  }
+}

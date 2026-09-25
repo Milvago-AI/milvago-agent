@@ -1,0 +1,23 @@
+[package]
+name = "milvago-browser-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = []
+# Detection and local masking are shared by both editions.
+# Only the endpoint model-control feature is Enterprise-only.
+
+[dependencies]
+regex = "=1.13.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+unicode-normalization = "=0.1.25"
+unicode-security = "=0.1.2"
+url = "=2.5.8"
+

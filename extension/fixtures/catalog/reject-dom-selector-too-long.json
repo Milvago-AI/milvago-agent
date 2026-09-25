@@ -1,0 +1,40 @@
+{
+  "case": "dom-selector-too-long",
+  "reason": "A DOM selector over 512 characters exceeds the metadata length ceiling both validators enforce (Go's validMetadata caps at max=512; Rust checks s.len() > 512).",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": [
+          "assistant.example-corp.test"
+        ],
+        "aliases": [],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": {
+          "editor": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "send": "button.send",
+          "response": ".response"
+        },
+        "network": [],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": [
+        "messages",
+        "prompt",
+        "model",
+        "input"
+      ],
+      "mime_types": [
+        "text/event-stream",
+        "application/json"
+      ]
+    }
+  }
+}

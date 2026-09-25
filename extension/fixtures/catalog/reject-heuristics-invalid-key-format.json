@@ -1,0 +1,26 @@
+{
+  "case": "heuristics-invalid-key-format",
+  "reason": "Heuristic keys share the provider-id identifier grammar (lowercase-start, then lowercase/digit/dot/underscore/hyphen only); \"Prompt\" fails it in Go because of the capital P. The Rust validator previously reused the generic version-token grammar (which allows uppercase) for this field, silently accepting it; since fixed (endpoint/src/detection.rs) to use the same strict identifier grammar as Go for provider ids and heuristic keys.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": ["assistant.example-corp.test"],
+        "aliases": [],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": "button.send", "response": ".response" },
+        "network": [],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": ["messages", "Prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

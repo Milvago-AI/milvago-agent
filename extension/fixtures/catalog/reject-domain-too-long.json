@@ -1,0 +1,26 @@
+{
+  "case": "domain-too-long",
+  "reason": "A domain over 253 characters exceeds the DNS name-length ceiling both validators enforce (Go checks len(d)>253 explicitly; Rust's domain_ok checks s.len() <= 253). Each label here is 63 characters, the per-label maximum, so only the overall length is the defect being tested.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": ["xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.test"],
+        "aliases": [],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": "button.send", "response": ".response" },
+        "network": [],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": ["messages", "prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

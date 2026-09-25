@@ -1,0 +1,70 @@
+# This workflow is the standing proof that the published tree builds and passes on its own,
+# on both systems the agent supports. It knows only this repository, and no secret.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Windows and Linux compile different code (`#[cfg(windows)]` / `#[cfg(unix)]`): a change is
+  # only proven on the system whose code it touches.
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here pushes: the token must not stay on disk for later steps.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-22
+        with:
+          toolchain: 1.94.1
+      - run: cargo test --locked
+      - run: cargo test --locked --manifest-path browser-engine/Cargo.toml
+      # A release build without the signed extension packages, as a contributor would make it.
+      - run: cargo build --release --locked
+        env:
+          MILVAGO_EMBED_EXTENSION: '0'
+
+  # cargo-audit reads the RustSec advisories against both lock files. A non-zero exit fails.
+  audit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-22
+        with:
+          toolchain: 1.94.1
+      - run: cargo install cargo-audit --version =0.22.2 --locked
+      - run: cargo audit
+      - run: cargo audit --file browser-engine/Cargo.lock
+
+  extension:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '26.9.0'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+      - run: npm ci
+        working-directory: extension
+      - run: npm test
+        working-directory: extension
+      - run: node extension/build-editions.js
+      # Edition guard, on the assembled package: capture limited to ChatGPT and Claude, and no
+      # per-model decision. The check is structural: a grep of names would fail on
+      # `known_platforms`, which names platforms without capturing anything.
+      - run: node scripts/verify-community-package.mjs

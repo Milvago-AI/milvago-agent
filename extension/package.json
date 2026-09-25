@@ -1,0 +1,14 @@
+{
+  "name": "milvago-browser-extension",
+  "private": true,
+  "version": "0.5.45",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test *.test.js"
+  },
+  "devDependencies": {
+    "eslint": "10.10.0",
+    "jsdom": "26.1.0"
+  }
+}

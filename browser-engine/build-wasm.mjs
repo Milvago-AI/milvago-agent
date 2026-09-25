@@ -1,0 +1,15 @@
+import { copyFile, mkdir, rm } from "node:fs/promises";
+import { resolve } from "node:path";
+import { spawnSync } from "node:child_process";
+const edition = process.argv[2] ?? "commercial";
+if (!["community", "commercial"].includes(edition)) throw new Error("edition must be community or commercial");
+const root = resolve(import.meta.dirname);
+const source = resolve(root, "target", "wasm32-unknown-unknown", "release", "milvago_browser_engine.wasm");
+const output = resolve(root, "dist", edition, "milvago-browser-engine.wasm");
+const args = ["build", "--manifest-path", resolve(root, "Cargo.toml"), "--release", "--target", "wasm32-unknown-unknown"];
+if (edition === "commercial") args.push("--features", "sensitive-detection");
+const result = spawnSync("cargo", args, { stdio: "inherit" });
+if (result.status !== 0) process.exit(result.status ?? 1);
+await rm(resolve(root, "dist", edition), { recursive: true, force: true });
+await mkdir(resolve(root, "dist", edition), { recursive: true });
+await copyFile(source, output);

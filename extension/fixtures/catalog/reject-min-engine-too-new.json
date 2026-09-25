@@ -1,0 +1,36 @@
+{
+  "case": "min-engine-too-new",
+  "reason": "min_engine is envelope metadata: the server stamps it unconditionally (server/internal/app/detection.go deviceDetectionCatalog always emits {\"extension\":\"0.5.0\",\"bridge\":\"0.5.0\"}) and never validates a min_engine value against content at all, so a catalogue whose declared floor is 9.9.9 is fully publishable. The Rust engine (endpoint/src/detection.rs verify()) refuses to apply any catalogue whose min_engine exceeds its own compiled ENGINE_VERSION (0.5.0), so it is never actually applied by a 0.5.0 engine. This fixture's top-level min_engine field is consumed only by the corpus-replay tests (content itself carries no min_engine field in either schema); the Rust test mirrors verify()'s version comparison and the extension's engineVersionOk() mirrors it too, so JS and Rust agree.",
+  "server": "accept",
+  "engine": "reject",
+  "min_engine": { "extension": "9.9.9", "bridge": "9.9.9" },
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": ["assistant.example-corp.test"],
+        "aliases": ["assistant-alias.example-corp.test"],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": "button.send", "response": ".response" },
+        "network": [
+          {
+            "method": "POST",
+            "host": "assistant.example-corp.test",
+            "path": "/api/v1/complete",
+            "text_path": "messages[*].content",
+            "model_path": "model",
+            "conversation_path": "session_id"
+          }
+        ],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": ["messages", "prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

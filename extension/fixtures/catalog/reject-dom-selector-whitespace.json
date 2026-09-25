@@ -1,0 +1,26 @@
+{
+  "case": "dom-selector-whitespace",
+  "reason": "Go's metadata check requires DOM selectors to have no leading or trailing whitespace (validMetadata rejects when strings.TrimSpace(s) != s). The Rust validator only checked length and control characters, accepting a padded selector like \" button.send \"; since fixed (endpoint/src/detection.rs validate()) to reject leading/trailing whitespace the same way.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": ["assistant.example-corp.test"],
+        "aliases": [],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": " button.send ", "response": ".response" },
+        "network": [],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": ["messages", "prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "case": "network-host-not-owned",
+  "reason": "Go requires a network rule's host to be one of the provider's own declared domains or aliases (server/internal/app/detection.go validateDetection: the network loop checks slices.Contains(p.Domains,n.Host) || slices.Contains(p.Aliases,n.Host)), so a provider can never declare a network rule pointing at a host it never qualified. The Rust validator did not enforce this containment at all; since fixed (endpoint/src/detection.rs validate()) to require the same containment.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": ["assistant.example-corp.test"],
+        "aliases": ["assistant-alias.example-corp.test"],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": "button.send", "response": ".response" },
+        "network": [
+          {
+            "method": "POST",
+            "host": "unrelated-host.example-corp.test",
+            "path": "/api/v1/complete",
+            "text_path": "messages[*].content",
+            "model_path": "model",
+            "conversation_path": "session_id"
+          }
+        ],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": ["messages", "prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

@@ -1,0 +1,46 @@
+[package]
+name = "milvago-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Standalone workspace: this crate must never join the implicit workspace
+# of `endpoint/` or `endpoint/browser-engine/`, so it never touches
+# their respective Cargo.lock files.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.151"
+base64 = "=0.22.1"
+ed25519-dalek = "=2.2.0"
+milvago-browser-agent = { path = ".." }
+milvago-browser-engine = { path = "../browser-engine", default-features = false }
+
+[[bin]]
+name = "fuzz_browser_broker_parse"
+path = "fuzz_targets/fuzz_browser_broker_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_model_access"
+path = "fuzz_targets/fuzz_model_access.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_engine_inspect"
+path = "fuzz_targets/fuzz_engine_inspect.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_update_verify"
+path = "fuzz_targets/fuzz_update_verify.rs"
+test = false
+doc = false

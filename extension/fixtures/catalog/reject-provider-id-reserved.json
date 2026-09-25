@@ -1,0 +1,26 @@
+{
+  "case": "provider-id-reserved",
+  "reason": "Go reserves the native-tool identifiers (codex, claude-code, claude-desktop, claude-desktop-agent) so a browser provider can never claim one, avoiding collisions between the two catalogues. The Rust validator did not check this reserved list, so a provider id of \"codex\" passed its generic syntax check; since fixed (endpoint/src/detection.rs validate()) to reject the same reserved ids.",
+  "server": "reject",
+  "engine": "reject",
+  "content": {
+    "providers": [
+      {
+        "id": "codex",
+        "label": "Acme Assistant",
+        "domains": ["assistant.example-corp.test"],
+        "aliases": [],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": { "editor": "textarea.prompt", "send": "button.send", "response": ".response" },
+        "network": [],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": ["messages", "prompt", "model", "input"],
+      "mime_types": ["text/event-stream", "application/json"]
+    }
+  }
+}

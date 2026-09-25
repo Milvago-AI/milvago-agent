@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "milvago_pin": {
+      "type": "string"
+    }
+  }
+}

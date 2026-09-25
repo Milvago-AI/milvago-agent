@@ -1,0 +1,12 @@
+Milvago Community — endpoint agent and browser extension
+Copyright (c) 2026 Milvago AI, LLC
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+Milvago AI, LLC is the copyright holder and licensor of this repository.
+
+"Milvago" and the Milvago logo are trademarks of Milvago AI, LLC.
+
+The Milvago server and console are distributed separately under AGPL-3.0-only. The
+Enterprise modules are proprietary and are not part of this repository.
+
+Third-party dependencies retain their own licenses.
