@@ -2,6 +2,31 @@ import {currentAuthority} from './broker.js';
 import {factoryCatalog,coveredProviders} from './detection-factory.js';
 import {observeRequest,candidateSignals,glob,Fusion} from './detection.js';
 import {modelObservation} from './model-rules.js';
+function appendMeasurement(event,output,key){
+  if(event[key]===undefined){return;}
+  if(!Number.isSafeInteger(event[key])||event[key]<0||(key==='body_bytes'&&event[key]>16*1024*1024)){throw new Error('Invalid detection measurement');}
+  output[key]=event[key];
+ }
+function enrichResponse(event,observed){
+  if(!observed||event.kind!=='response'){return;}
+   // Only the response: it is the one event guaranteed to be emitted after its own
+   // request was seen. A prompt is recorded before the request leaves, so attaching
+   // what the tab last said would attribute it to the previous exchange. The
+   // conversation identifier obeys the same rule for the same reason: the prompt that
+   // opens a thread is emitted while the page still shows `/new`, and the tab still
+   // remembers the PREVIOUS conversation -- attaching it there is precisely the
+   // cross-conversation mix-up this chain exists to avoid. That prompt keeps its link
+   // through the correlation it shares with the navigation that follows, which does
+   // carry the identifier because the document reports its live URL.
+  if(observed.model){event.model=observed.model;}
+  if(observed.effort){event.effort=observed.effort;}
+  if(!event.conversation_id&&observed.conversation_id){event.conversation_id=observed.conversation_id;}
+ }
+function metricFor(kind){
+  if(kind==='navigation'){return 'navigations';}
+  if(kind==='response'){return 'responses_dom';}
+  return 'prompts_dom';
+ }
 function completionOf(event){
   const out={};
   if(modelObservation&&typeof event.model==='string'&&/^[A-Za-z0-9._:/-]{1,200}$/.test(event.model)){out.model=event.model;}
@@ -82,11 +107,7 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
  }
  async function count(id,key,observedRevision,observedState,authority){if(observedRevision===undefined){observedRevision=revision;}if(observedState===undefined){observedState=catalogState;}const at=Date.now();if(authority===undefined){authority=await currentAuthority(api);}return change(()=>{observe(at,observedRevision,observedState,authority);if(!health.providers[id]&&Object.keys(health.providers).length>=128){throw new Error('detector health providers full');}const row=health.providers[id]||={provider:id,navigations:0,prompts_network:0,prompts_dom:0,responses_dom:0,candidates:0};row[key]=Math.min(1e6,row[key]+1);});}
  const receiptID=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
- function appendMeasurement(event,output,key){
-  if(event[key]===undefined){return;}
-  if(!Number.isSafeInteger(event[key])||event[key]<0||(key==='body_bytes'&&event[key]>16*1024*1024)){throw new Error('Invalid detection measurement');}
-  output[key]=event[key];
- }
+
  function metadata(event){
   // This is the only persistent event projection in the browser. Neither content,
   // filenames, conversation identifiers nor their fingerprints enter storage.
@@ -214,26 +235,8 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   if(Date.now()-entry.at>TAB_TTL){seenByTab.delete(tabId);return null;}
   return entry;
  }
- function enrichResponse(event,observed){
-  if(!observed||event.kind!=='response'){return;}
-   // Only the response: it is the one event guaranteed to be emitted after its own
-   // request was seen. A prompt is recorded before the request leaves, so attaching
-   // what the tab last said would attribute it to the previous exchange. The
-   // conversation identifier obeys the same rule for the same reason: the prompt that
-   // opens a thread is emitted while the page still shows `/new`, and the tab still
-   // remembers the PREVIOUS conversation -- attaching it there is precisely the
-   // cross-conversation mix-up this chain exists to avoid. That prompt keeps its link
-   // through the correlation it shares with the navigation that follows, which does
-   // carry the identifier because the document reports its live URL.
-  if(observed.model){event.model=observed.model;}
-  if(observed.effort){event.effort=observed.effort;}
-  if(!event.conversation_id&&observed.conversation_id){event.conversation_id=observed.conversation_id;}
- }
- function metricFor(kind){
-  if(kind==='navigation'){return 'navigations';}
-  if(kind==='response'){return 'responses_dom';}
-  return 'prompts_dom';
- }
+
+
  async function dom(event,sender,input){
   await ready;await pendingReady;const id=A.resolve(sender.url)?.id;if(!id){return {ok:false};}
   enrichResponse(event,recall(sender.tab?.id,event.provider));
