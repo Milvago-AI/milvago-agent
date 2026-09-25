@@ -39,7 +39,8 @@ test('collection withdrawal clears a held pending entry without sending it to B'
 test('content receipt carrying authority A cannot create a fresh network event under B',async()=>{
  const f=fixture();f.pin(pinB);const r=f.runtime();await r.refresh();f.hooks.onBeforeRequest({requestId:'synthetic-request',tabId:7,frameId:0,documentId:'synthetic-document',method:'POST',url:'https://ai.example.invalid/send',requestBody:{raw:[{bytes:new TextEncoder().encode(JSON.stringify({message:'synthetic'})).buffer}]}});
  f.hooks.onHeadersReceived({requestId:'synthetic-request',statusCode:200,responseHeaders:[]});
- for(let n=0;n<100&&f.storage.detectorHealth.diagnostics.last_error!=='authority_changed';n++){await new Promise(resolve=>setImmediate(resolve));}
+ // Bounded in time, not in event-loop turns: a slow shared runner may need more turns.
+ for(const deadline=Date.now()+5000;Date.now()<deadline&&f.storage.detectorHealth.diagnostics.last_error!=='authority_changed';){await new Promise(resolve=>setTimeout(resolve,5));}
  assert.equal(f.storage.detectorHealth.diagnostics.last_error,'authority_changed');assert.equal(f.calls.filter(c=>['event_v2','event_receipt'].includes(c.q.op)).length,0);assert.equal(f.storage.detectorPending[0].authority,authorityA);
 });
 test('managed pin replacement before native exchange sends no request',async()=>{
