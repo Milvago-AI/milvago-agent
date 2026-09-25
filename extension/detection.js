@@ -1,5 +1,5 @@
 import './adapters.js';
-import {strictJSON} from './model-access.js';
+import {strictJSON,hostOf} from './model-access.js';
 export const BODY_LIMIT=128*1024;
 // Ceiling of the DECOMPRESSED body, distinct from the transmitted body's ceiling. Measured on
 // claude.ai on 2026-09-14: 21,191 bytes on the wire render 108,884 bytes, of which 100 KB
@@ -41,7 +41,7 @@ export function valuesAt(value,path){
  for(const part of path.split('.')){
   const each=part.endsWith('[*]'),key=each?part.slice(0,-3):part;
   if(!/^[A-Za-z0-9_-]{1,64}$/.test(key)||['__proto__','constructor','prototype'].includes(key)){return [];}
-  values=values.flatMap(v=>v&&typeof v==='object'&&Object.hasOwn(v,key)?(each?(Array.isArray(v[key])?v[key]:[]):[v[key]]):[]).slice(0,1024);
+  values=values.flatMap(v=>{if(!v||typeof v!=='object'||!Object.hasOwn(v,key)){return [];}if(!each){return [v[key]];}if(Array.isArray(v[key])){return v[key];}return [];}).slice(0,1024);
  }return values;
 }
 export async function fingerprint(text){const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));return Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,'0')).join('');}
@@ -133,7 +133,7 @@ export function only(body,path,shape){
 // definition of "which rule describes this request" on both sides, never two.
 export function matchRule(catalog,details,url,kind='prompt'){
  // Trailing dot stripped: `claude.ai.` is the same host, and its route must not stop being one.
- const host=url.hostname.replace(/\.+$/,'');
+ const host=hostOf(url);
  const matches=catalog?.providers.flatMap(p=>(p.network||[]).filter(n=>(n.kind||'prompt')===kind&&n.method===details.method&&n.host===host&&glob(n.path,url.pathname)).map(rule=>({provider:p,rule})))||[];
  return matches.length===1?matches[0]:null;
 }
@@ -212,7 +212,7 @@ export async function observeRequest(details,catalog,modelEnabled=false){
  // where interception of the file picker does not exist. Several values are
  // legitimate here, as with text: it is not an ambiguity. Never their
  // content, and the policy decides afterward whether they are kept.
- const files=(rule.files_path?valuesAt(body,rule.files_path):[]).filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127)).slice(0,20);
+ const files=(rule.files_path?valuesAt(body,rule.files_path):[]).filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.codePointAt(0)<32||c.codePointAt(0)===127)).slice(0,20);
  return {provider,characters:texts.length?Array.from(text).length:0,characters_known:!!texts.length,body_bytes,model,effort,conversation_id:conversation,files,fingerprint:texts.length?await fingerprint(text):null};
 }
 export async function candidateSignals(details,catalog){
@@ -241,7 +241,7 @@ export class Fusion {
   await this.emit({...p.event,detector:p.source},p.id,retry,p.submission===true,p.authority,observed);
   await this.commit(this.pending.filter(row=>row!==p));
  }
- add(event,identity,digest,source,immediate=false,authority=null,deliveryId){return this.run(async()=>{
+ add(event,identity,digest,source,immediate,authority,deliveryId){if(immediate===undefined){immediate=false;}if(authority===undefined){authority=null;}return this.run(async()=>{
   if(deliveryId!==undefined&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deliveryId)){throw new Error('Invalid capture delivery identity');}
   const existing=deliveryId&&this.pending.find(p=>p.id===deliveryId);
   if(existing){
@@ -277,6 +277,6 @@ export class Fusion {
   if(this.inflight.has(id)){throw new Error('Submission still in flight');}
   await this.deliver(entry,event);
  });}
- flush(){return this.run(async()=>{const now=this.clock();for(const p of [...this.pending]){if(!this.inflight.has(p.id)&&(p.attempted||now-p.at>=3000||now<p.at)){await this.deliver(p);}}});}
+ flush(){return this.run(async()=>{const now=this.clock();for(const p of this.pending){if(!this.inflight.has(p.id)&&(p.attempted||now-p.at>=3000||now<p.at)){await this.deliver(p);}}});}
  clear(){return this.run(async()=>{await this.commit([]);this.inflight.clear();});}
 }

@@ -1,28 +1,28 @@
 import './adapters.js';
 // The per-model decision lives in model-rules.js so the Community package can swap
 // it for a stub. Everything below is shared by both editions and must stay here.
-import { modelDecision, modelRulesValid, requestModel, ruleFor } from './model-rules.js';
-export { modelDecision, modelRulesValid, requestModel, ruleFor };
+import { modelDecision, requestModel, ruleFor } from './model-rules.js';
+export {modelRulesValid} from './model-rules.js'; export { modelDecision, requestModel, ruleFor };
 export const apiHosts={'api.openai.com':'chatgpt','api.anthropic.com':'claude'};
 // The hostname without its trailing dot: `api.anthropic.com.` reaches the same server, and an
 // exact comparison let it slip past every guard.
-export function hostOf(u){return u.hostname.replace(/\.+$/,'');}
+export function hostOf(u){const name=u.hostname;let end=name.length;while(end>0&&name[end-1]==='.')end--;return name.slice(0,end);}
 // Reject duplicate keys including escaped spellings, at every depth, before JSON.parse.
 // Default `limit` unchanged. Only the asynchronous observation in `detection.js` raises it,
 // for a decompressed body whose size no longer matches the one on the wire. The Enterprise
 // control in `model-rules.js` decides, for its part, inside a BLOCKING webRequest handler:
 // it must stay synchronous and tight, and never calls with another value.
 export function strictJSON(text,limit=131072){
- if(text.length>limit){throw Error('body too large');}let at=0,depth=0;
+ if(text.length>limit){throw new Error('body too large');}let at=0,depth=0;
  function ws(){while(/[ \t\r\n]/.test(text[at]||'\0')){at++;}}
- function string(){const start=at++;while(at<text.length){const c=text[at++];if(c==='"'){return JSON.parse(text.slice(start,at));}if(c==='\\'){at++;}}throw Error('string');}
- function value(){ws();if(++depth>40){throw Error('depth');}const c=text[at];
-  if(c==='{'){at++;ws();const keys=new Set();if(text[at]!=='}'){for(;;){ws();if(text[at]!=='"'){throw Error('key');}const key=string();if(keys.has(key)){throw Error('duplicate');}keys.add(key);ws();if(text[at++]!==':'){throw Error('colon');}value();ws();if(text[at]!==','){break;}at++;}}if(text[at++]!=='}'){throw Error('object');}}
-  else if(c==='['){at++;ws();if(text[at]!==']'){for(;;){value();ws();if(text[at]!==','){break;}at++;}}if(text[at++]!==']'){throw Error('array');}}
-  else if(c==='"'){string();}else {const start=at;while(at<text.length&&!/[,\]}\s]/.test(text[at])){at++;}if(start===at){throw Error('value');}}
+ function string(){const start=at++;while(at<text.length){const c=text[at++];if(c==='"'){return JSON.parse(text.slice(start,at));}if(c==='\\'){at++;}}throw new Error('string');}
+ function value(){ws();if(++depth>40){throw new Error('depth');}const c=text[at];
+  if(c==='{'){at++;ws();const keys=new Set();if(text[at]!=='}'){for(;;){ws();if(text[at]!=='"'){throw new Error('key');}const key=string();if(keys.has(key)){throw new Error('duplicate');}keys.add(key);ws();if(text[at++]!==':'){throw new Error('colon');}value();ws();if(text[at]!==','){break;}at++;}}if(text[at++]!=='}'){throw new Error('object');}}
+  else if(c==='['){at++;ws();if(text[at]!==']'){for(;;){value();ws();if(text[at]!==','){break;}at++;}}if(text[at++]!==']'){throw new Error('array');}}
+  else if(c==='"'){string();}else {const start=at;while(at<text.length&&!/[,\]}\s]/.test(text[at])){at++;}if(start===at){throw new Error('value');}}
   depth--;
  }
- value();ws();if(at!==text.length){throw Error('trailing');}return JSON.parse(text);
+ value();ws();if(at!==text.length){throw new Error('trailing');}return JSON.parse(text);
 }
 export function requestBodyJSON(details){ try{
   let length=0;for(const part of details.requestBody.raw){if(!part.bytes||part.file){return null;}length+=part.bytes.byteLength;if(length>131072){return null;}}
@@ -141,7 +141,7 @@ function contentDecision(details,policy,wire,approval,adapter,u,target){
  // A body the synchronous path cannot read only goes out, on a prompt route,
  // within the window opened by an approval, for that tab and that document: this is
  // the case for claude.ai, which compresses its request body. Outside a prompt route, it passes.
- if(!wire?.readable){return wire?.route?(approval?{allow:true,approved:true}:{seal:true}):{seal:false};}
+ if(!wire?.readable){if(!wire?.route){return {seal:false};}if(approval){return {allow:true,approved:true};}return {seal:true};}
  if(!wire.texts.length&&!promptShaped(wire.body,wire.keys)){return {seal:false};}
  // The text must be PRESENT, not merely equal: without this condition, a body shaped
  // like a prompt but carrying nothing at its rule's path yields an empty string,

@@ -30,6 +30,15 @@ export function networkRules(policy,now=Date.now()){
  const unknownRules=policy.version===1?[]:(policy.config.model_access||[]).filter(r=>r.channel==='browser'&&r.mode!=='off'&&!factoryCatalog.providers.some(p=>p.id===r.platform_id)).flatMap((r,i)=>(policy.config.services||[]).filter(s=>s.id===r.platform_id).flatMap(s=>[{id:30000+i*2,priority:200,action:{type:'block'},condition:{requestDomains:s.domains}},{id:30001+i*2,priority:200,action:{type:'block'},condition:{initiatorDomains:s.domains}}]));
  return [...apiRules,...unknownRules,...rules.filter(r=>r.enabled&&r.action==='block'&&(policy.version!==1||providers.includes(r.domain))&&typeof r.domain==='string'&&/^[a-z0-9.-]{1,253}$/.test(r.domain)).map((r,index)=>({id:index+1,priority:1,action:{type:'block'},condition:{requestDomains:[r.domain],resourceTypes:['main_frame','sub_frame','xmlhttprequest','websocket']}}))];
 }
+function validObservedEvent(input){
+ return ['navigation','prompt','response'].includes(input?.kind)&&
+  ['observed','blocked','redirected'].includes(input.action)&&
+  Number.isInteger(input.characters)&&input.characters>=0&&input.characters<=32768;
+}
+function observedFileNames(input,collection){
+ if(input.kind!=='prompt'||!collection.store_file_names||!Array.isArray(input.files)){return [];}
+ return input.files.filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.codePointAt(0)<32||c.codePointAt(0)===127)).slice(0,20);
+}
 export function eventForPolicy(input,senderUrl,tool,policy){
  if(!validPolicy(policy)||![2,3].includes(policy.version)||!policy.config.collection.enabled){return null;}
  const frame=globalThis.MilvagoAdapters.context(senderUrl);if(!frame){return null;}
@@ -43,19 +52,17 @@ export function eventForPolicy(input,senderUrl,tool,policy){
  const live=typeof input?.url==='string'?globalThis.MilvagoAdapters.context(input.url):null;
  const context=live&&live.provider===frame.provider?live:frame;
  if(!policy.config.services.some(s=>s.enabled&&s.domains.includes(context.provider))){return null;}
- if(!['navigation','prompt','response'].includes(input?.kind)||!['observed','blocked','redirected'].includes(input.action)||!Number.isInteger(input.characters)||input.characters<0||input.characters>32768){return null;}
+ if(!validObservedEvent(input)){return null;}
  const event={...context,source:'browser',tool,kind:input.kind,action:input.action,characters:input.kind==='navigation'?0:input.characters,labels:Array.isArray(input.labels)?input.labels.filter(s=>typeof s==='string'&&/^[a-z0-9_-]{1,64}$/i.test(s)).slice(0,32):[],policy_revision:policy.revision};
  if(typeof input.correlation_id==='string'&&/^[a-zA-Z0-9_-]{1,200}$/.test(input.correlation_id)){event.correlation_id=input.correlation_id;}
  // No model here on purpose: it is never supplied by the document. It is read from the
  // outgoing request by the service worker and attached there, so a compromised page
  // cannot name the model its own traffic is attributed to.
- const body=input.kind==='prompt'?'prompt':input.kind==='response'?'response':null;
+ let body=null;if(input.kind==='prompt'){body='prompt';}else if(input.kind==='response'){body='response';}
  if(body&&policy.config.collection.store_content&&typeof input[body]==='string'&&new TextEncoder().encode(input[body]).length<=32768){event[body]=input[body];}
  // Names of attached files, never their contents, and only while the policy asks
  // for them. A page cannot widen this: the switch comes from the signed policy.
- if(input.kind==='prompt'&&policy.config.collection.store_file_names&&Array.isArray(input.files)){
-  const files=input.files.filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127)).slice(0,20);
-  if(files.length){event.files=files;}
- }
+ const files=observedFileNames(input,policy.config.collection);
+ if(files.length){event.files=files;}
  return event;
 }

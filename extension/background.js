@@ -113,16 +113,21 @@ function sealDnr(){
 function adopt(answer){managed=!answer.legacy;mode=answer.legacy?'connected':answer.mode;gracePerfStart=performance.now();graceWallStart=Date.now();graceDeadline=mode==='grace'?gracePerfStart+answer.remaining_ms:0;graceWallDeadline=mode==='grace'?graceWallStart+answer.remaining_ms:0;if(mode==='grace'&&!blocking){mode='blocked';graceDeadline=graceWallDeadline=0;void sealDnr();}}
 function remaining(){return Math.max(0,Math.min(graceDeadline-performance.now(),graceWallDeadline-Date.now()));}
 function authorized(){if(!validPolicy(policy)||mode==='blocked'||(mode==='grace'&&!blocking)){return false;}if(mode!=='grace'){return true;}const wallElapsed=Date.now()-graceWallStart,perfElapsed=performance.now()-gracePerfStart;return performance.now()<graceDeadline&&Date.now()>=graceWallStart&&Date.now()<graceWallDeadline&&Math.abs(wallElapsed-perfElapsed)<=1000;}
+// Completion names an existing durable delivery and carries no new event or text.
+async function completeBrowserEvent(message){
+ const fields={tool,delivery_id:message.delivery_id,completion:message.completion};
+ const answer=await guarded('browser_complete',fields,{op:'event_complete',tool,delivery_id:message.delivery_id,completion:message.completion},message.authority);
+ adopt(answer);
+ const reply=answer.reply;
+ if(reply?.ok!==true){throw new Error('Invalid completion reply');}
+ return reply;
+}
 async function brokerBridge(message){
  const legacy={...message};delete legacy.authority;
  if(message.op==='catalog') {const a=await guarded('browser_catalog',{tool},legacy,message.authority);adopt(a);return a.reply;}
  if(message.op==='event_v2') {const fields={tool,event:message.event,delivery_id:message.delivery_id};const a=await guarded('browser_event',fields,legacy,message.authority);adopt(a);const reply=a.reply;if(!a.legacy&&(!reply?.durable||reply.delivery_id!==message.delivery_id||typeof reply.id!=='string'||!globalThis.MilvagoAdapters.RECEIPT_ID.test(reply.id))){throw new Error('event not durable');}return reply;}
  if(message.op==='event_receipt') {const a=await guarded('browser_receipt',{tool,delivery_id:message.delivery_id},{op:'event_receipt',tool,delivery_id:message.delivery_id},message.authority);adopt(a);if(a.legacy){throw new Error('Managed receipt lookup unavailable');}const reply=a.reply;if(reply?.ok!==true||reply.delivery_id!==message.delivery_id||typeof reply.durable!=='boolean'){throw new Error('Invalid receipt lookup');}return reply;}
- // What the request said about an exchange already made durable. It names that send
- // by its delivery identity and carries nothing else: no event, no text, no decision.
- // The service translates the identity, so a completion can never designate a send
- // this browser account did not make, nor create an event.
- if(message.op==='event_complete') {const fields={tool,delivery_id:message.delivery_id,completion:message.completion};const a=await guarded('browser_complete',fields,{op:'event_complete',tool,delivery_id:message.delivery_id,completion:message.completion},message.authority);adopt(a);const reply=a.reply;if(reply?.ok!==true){throw new Error('Invalid completion reply');}return reply;}
+ if(message.op==='event_complete') {return completeBrowserEvent(message);}
  if(message.op==='detector_health') {const a=await guarded('browser_health',{tool,batch:message.batch},legacy,message.authority);adopt(a);const reply=a.reply;if(!a.legacy&&(!reply?.durable||!Array.isArray(reply.accepted_health_ids))){throw new Error('health not durable');}return reply;}
  return bridge(legacy);
 }
@@ -304,9 +309,9 @@ async function refresh(){if(refreshing){return refreshing;}refreshing=(async()=>
  // still unqualified, so content_control must never report complete coverage.
  if(contentChanged){await reloadCovered(()=>true);}
  else if(changed&&(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')){await reloadCovered(a=>!!ruleFor(policy,a.id));}
-  await report(policy).catch(()=>{});
-  await api.storage.local.set({status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online:answer.online,managed,revision:policy.revision,expires_at:policy.expires_at,content_control:contentControl(policy)?'unavailable':'off',content_control_reason:contentControl(policy)?(blocking?'unverified_web_transport':'managed_extension_required'):null,model_control:(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}});
-  refreshedAt=performance.now();
+ await report(policy).catch(()=>{});
+ await api.storage.local.set({status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online:answer.online,managed,revision:policy.revision,expires_at:policy.expires_at,content_control:contentControl(policy)?'unavailable':'off',content_control_reason:(()=>{if(!contentControl(policy)){return null;}if(blocking){return 'unverified_web_transport';}return 'managed_extension_required';})(),model_control:(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}});
+ refreshedAt=performance.now();
   }catch(error){
   // Only slowness is tolerated: broker delay exceeded or full queue. Agent absent,
   // refusal, signature, replay, pin or authority changed, invalid policy: seal.

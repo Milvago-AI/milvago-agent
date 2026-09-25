@@ -42,7 +42,9 @@ export function restrictAdapters(source, allowed) {
   const index = lines.findIndex(line => line.includes('const aliases={'));
   if (index < 0) {throw new Error('The adapters alias map was not found');}
   const pairs = [...lines[index].matchAll(/'([^']+)':'([^']+)'/g)].filter(pair => domains.includes(pair[2]));
-  lines[index] = lines[index].replace(/\{[^}]*\}/, '{' + pairs.map(pair => `'${pair[1]}':'${pair[2]}'`).join(',') + '}');
+  const aliasOpen = lines[index].indexOf('{'), aliasClose = lines[index].indexOf('}', aliasOpen);
+  if (aliasOpen < 0 || aliasClose < 0) {throw new Error('The adapters alias map is malformed');}
+  lines[index] = lines[index].slice(0, aliasOpen) + '{' + pairs.map(pair => `'${pair[1]}':'${pair[2]}'`).join(',') + '}' + lines[index].slice(aliasClose + 1);
   return { source: lines.join('\n'), hosts: [...domains, ...pairs.map(pair => pair[1])] };
 }
 

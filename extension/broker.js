@@ -2,8 +2,8 @@ const encoder=new TextEncoder(),decoder=new TextDecoder();
 const MAX_EXCHANGE_MS=8000,pinFields=['installation','edition','origin','organization_anchor','signing_key'];
 let issued=0,acceptedGeneration=-1,acceptedPin='';
 let exchangeTail=Promise.resolve(),queued=0;
-const standard=value=>{let text='';for(let i=0;i<value.length;i+=8192){text+=String.fromCharCode(...value.subarray(i,i+8192));}return btoa(text);};
-const decoded=value=>Uint8Array.from(atob(value),c=>c.charCodeAt(0));
+const standard=value=>{let text='';for(let i=0;i<value.length;i+=8192){text+=String.fromCodePoint(...value.subarray(i,i+8192));}return btoa(text);};
+const decoded=value=>Uint8Array.from(atob(value),c=>c.codePointAt(0));
 const hex=bytes=>[...bytes].map(b=>b.toString(16).padStart(2,'0')).join('');
 function samePin(a,b){return !!a&&!!b&&Object.keys(a).length===pinFields.length&&Object.keys(b).length===pinFields.length&&pinFields.every(key=>typeof a[key]==='string'&&a[key]===b[key]);}
 function pinId(pin){return pinFields.map(key=>pin[key]).join('\u0000');}

@@ -1,6 +1,8 @@
 (() => {
  const A=globalThis.MilvagoAdapters,api=globalThis.browser||globalThis.chrome;
  const encoder=new TextEncoder();
+ function stop(event){event.preventDefault();event.stopImmediatePropagation();}
+ function sameFiles(list,files){return list?.length===files.length&&files.every((file,index)=>list[index]===file);}
  const COMMUNITY_SIGNATURE='';
  const TEXT=[["Envoi en attente","Send pending","Envío pendiente","Envio pendente"],["Fichier en attente","File pending","Archivo pendiente","Arquivo pendente"],["Envoi bloqué","Send blocked","Envío bloqueado","Envio bloqueado"],["Redirection refusée","Redirect refused","Redirección rechazada","Redirecionamento recusado"],["Service autorisé","Allowed service","Servicio autorizado","Serviço permitido"],["Informations confidentielles","Confidential information","Información confidencial","Informações confidenciais"],["Valider et envoyer","Confirm and send","Confirmar y enviar","Confirmar e enviar"],["Utiliser ce texte","Use this text","Usar este texto","Usar este texto"],["Annuler","Cancel","Cancelar","Cancelar"],["Fermer","Close","Cerrar","Fechar"],["Ouvrir le service","Open service","Abrir el servicio","Abrir o serviço"],["Milvago — contrôle local","Milvago — local inspection","Milvago — control local","Milvago — verificação local"],["Texte contrôlé à envoyer","Inspected text to send","Texto revisado para enviar","Texto verificado para enviar"],["Les informations que vous avez fournies contiennent des informations confidentielles, merci de vérifier les éléments que nous avons masqués ci-dessous avant envoi.","The information you provided contains confidential information. Please review the elements we masked below before sending.","La información que has proporcionado contiene información confidencial. Revisa los elementos que hemos enmascarado a continuación antes de enviar.","As informações que você forneceu contêm informações confidenciais. Verifique os elementos que mascaramos abaixo antes de enviar."],["Ce contrôle ne permet pas de reprendre automatiquement l’envoi.","This control cannot resume sending automatically.","Este control no permite reanudar el envío automáticamente.","Este controle não permite retomar o envio automaticamente."],["Le texte dépasse la limite du contrôle local (32 Kio). Réduisez-le avant de réessayer.","The text exceeds the local inspection limit (32 KiB). Shorten it before retrying.","El texto supera el límite del control local (32 KiB). Redúcelo antes de volver a intentarlo.","O texto excede o limite da verificação local (32 KiB). Reduza-o antes de tentar novamente."],["Connectez l’agent local puis réessayez.","Connect the local agent and retry.","Conecta el agente local y vuelve a intentarlo.","Conecte o agente local e tente novamente."],["Réponse de contrôle non valide.","Invalid inspection response.","Respuesta de control no válida.","Resposta de verificação inválida."],["Le lien avec le reçu durable est indisponible.","The durable receipt link is unavailable.","El vínculo con el recibo persistente no está disponible.","O vínculo com o recibo persistente está indisponível."],["La validation finale ou l’enregistrement durable a échoué.","Final validation or durable recording failed.","La validación final o el registro persistente falló.","A validação final ou o registro persistente falhou."],["La validation finale a échoué.","Final validation failed.","La validación final falló.","A validação final falhou."],["La politique locale bloque cet envoi.","The local policy blocks this send.","La política local bloquea este envío.","A política local bloqueia este envio."],["La destination de la politique est invalide.","The policy destination is invalid.","El destino de la política no es válido.","O destino da política é inválido."],["Le texte contrôlé n’a pas pu être appliqué au brouillon.","The inspected text could not be applied to the draft.","No se pudo aplicar el texto revisado al borrador.","Não foi possível aplicar o texto verificado ao rascunho."],["Ce navigateur ne permet pas de reprendre ce transfert. Utilisez le sélecteur de fichiers.","This browser cannot resume this transfer. Use the file picker.","Este navegador no permite reanudar esta transferencia. Usa el selector de archivos.","Este navegador não permite retomar esta transferência. Use o seletor de arquivos."],["La sélection de fichiers a changé.","The file selection changed.","La selección de archivos cambió.","A seleção de arquivos mudou."],["Le contrôle local refuse ce transfert.","Local inspection refuses this transfer.","El control local rechaza esta transferencia.","A verificação local recusa esta transferência."],["L’agent local ne répond pas.","The local agent is not responding.","El agente local no responde.","O agente local não responde."],["La validation a expiré. Réessayez.","Validation expired. Retry.","La validación caducó. Vuelve a intentarlo.","A validação expirou. Tente novamente."],
  // Edition signature. The key is the French string, the one `build-editions.js`
@@ -12,7 +14,7 @@
  function start(document,location,send){
   const adapter=A.resolve(location.href);if(!adapter){return null;}
   const win=document.defaultView;
-  const language=()=>{const value=(document.documentElement.lang||win.navigator.language||'fr').toLowerCase();return value.startsWith('en')?1:value.startsWith('es')?2:value.startsWith('pt')?3:0;};
+  const language=()=>{const value=(document.documentElement.lang||win.navigator.language||'fr').toLowerCase();if(value.startsWith('en')){return 1;}if(value.startsWith('es')){return 2;}if(value.startsWith('pt')){return 3;}return 0;};
   const t=value=>TEXT.find(row=>row[0]===value)?.[language()]||value;
   let policy,overlay,pending=false,correlation,lastUrl='',replay,disposed=false,draftEpoch=0,attempt=0;
   // The correlation of the exchange **currently being composed**. A file goes to the
@@ -36,7 +38,7 @@
    respond(entry?{ok:true,delivery_id:entry.delivery_id,authority:entry.authority}:{ok:true,delivery_id:null});return false;
   }
   const attached=new Set();
-  const fileNames=list=>Array.from(list||[]).map(file=>file?.name).filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.charCodeAt(0)<32||c.charCodeAt(0)===127));
+  const fileNames=list=>Array.from(list||[]).map(file=>file?.name).filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.codePointAt(0)<32||c.codePointAt(0)===127));
   function attach(list){if(!policy?.config.collection.store_file_names){return;}for(const name of fileNames(list)){if(attached.size>=20){return;}attached.add(name);}}
   // `knownResponses` is keyed by node identity. A provider that REPLACES a response's
   // node with another one carrying identical text — measured on copilot.microsoft.com on
@@ -79,7 +81,7 @@
    shade.append(card);shadow.append(style,shade);document.documentElement.append(host);overlay=host;cancel.focus();
    shadow.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();close();}if(event.key==='Tab'){const focusable=[...card.querySelectorAll('textarea,button')];const index=focusable.indexOf(shadow.activeElement),next=(index+(event.shiftKey?-1:1)+focusable.length)%focusable.length;event.preventDefault();focusable[next].focus();}});
   }
-  async function emit(kind,text,action='observed',labels=[],id=correlation,delivery_id){
+  async function emit(kind,text,action,labels,id,delivery_id){if(action===undefined){action='observed';}if(labels===undefined){labels=[];}if(id===undefined){id=correlation;}
    try{
    if(!policy?.config.collection.enabled){return false;}
    // `location.href` as the document sees it now. The service worker cannot read it:
@@ -125,7 +127,7 @@
   // then failed with "Final validation or durable recording failed." The background rejects inspect/submit anyway
   // when the policy is not authorized.
   async function refresh(){const answer=await message({type:'policy'});if(answer.ok){policy=answer.policy;}if(policy){navigation();}}
-  function stop(event){event.preventDefault();event.stopImmediatePropagation();}
+
   const policyState=()=>JSON.stringify(policy&&{version:policy.version,revision:policy.revision,config:policy.config});
   const state=()=>({url:location.href,policy:policyState(),epoch:draftEpoch,attempt});
   const unchanged=s=>!disposed&&s.url===location.href&&s.policy===policyState()&&s.epoch===draftEpoch&&s.attempt===attempt;
@@ -166,7 +168,7 @@
    const labels=Array.isArray(answer.labels)?answer.labels:[];
    if(answer.action==='block'){emit('prompt',text,'blocked',labels,win.crypto.randomUUID());const found=typeof answer.evidence==='string'&&answer.evidence.length<=200?`\n\nDétecté : ${answer.evidence}`:'';notice('Envoi bloqué',(answer.reason||'La politique locale bloque cet envoi.')+found);return;}
    if(answer.action==='redirect'){
-    emit('prompt',text,'redirected',labels,win.crypto.randomUUID());let target;try{target=new URL(answer.redirect_url);if(target.protocol!=='https:'||target.username||target.password){throw new Error();}}catch{notice('Redirection refusée','La destination de la politique est invalide.');return;}
+    emit('prompt',text,'redirected',labels,win.crypto.randomUUID());let target;try{target=new URL(answer.redirect_url);if(target.protocol!=='https:'||target.username||target.password){throw new Error('Invalid redirect target');}}catch{notice('Redirection refusée','La destination de la politique est invalide.');return;}
     notice('Service autorisé',`${answer.reason||'Utilisez le service prévu par votre organisation.'}\n${target.origin}`,undefined,()=>location.assign(target.href),'Ouvrir le service');return;
    }
    const allow=async()=>{
@@ -184,12 +186,12 @@
   // Opening a local picker transmits nothing. Intercept its change event instead,
   // when the actual selected FileList exists. Never read file contents.
   let uploadReplay;const fileSelections=new WeakMap();
-  function sameFiles(list,files){return list?.length===files.length&&files.every((file,index)=>list[index]===file);}
+
   async function upload(event){
    if(event===uploadReplay){return;}
    if(!event.isTrusted){return;}
    const picker=['input','change'].includes(event.type)&&event.target?.matches?.('input[type="file"]');
-   const transfer=event.type==='drop'?event.dataTransfer:event.type==='paste'?event.clipboardData:null;
+   let transfer=null;if(event.type==='drop'){transfer=event.dataTransfer;}else if(event.type==='paste'){transfer=event.clipboardData;}
    const list=picker?event.target.files:transfer?.files;
    if(!list?.length){if(picker){attached.clear();draftCorrelation=null;draftEpoch++;fileSelections.delete(event.target);}return;}
    stop(event);
@@ -213,7 +215,7 @@
     if(!answer.ok||answer.action!=='observe'){notice('Fichier en attente',answer.reason||'Le contrôle local refuse ce transfert.');return;}
     draftCorrelation=draftCorrelation||win.crypto.randomUUID();
     const final=await message({type:'submit',text:'',upload:true,event:{kind:'prompt',action:'observed',characters:0,labels:[],url:location.href,correlation_id:draftCorrelation,...(policy?.config.collection.store_file_names?{files:fileNames(files)}:{})}});
-    if(!final.ok||final.action!=='observe'||final.text!==''||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)))||!unchanged(snapshot)||!target.isConnected||!sameFiles(picker?target.files:event.type==='drop'?resume.dataTransfer.files:resume.clipboardData.files,files)){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}
+    if(!final.ok||final.action!=='observe'||final.text!==''||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)))||!unchanged(snapshot)||!target.isConnected){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}let resumedFiles;if(picker){resumedFiles=target.files;}else if(event.type==='drop'){resumedFiles=resume.dataTransfer.files;}else {resumedFiles=resume.clipboardData.files;}if(!sameFiles(resumedFiles,files)){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}
     if(picker){attached.clear();}attach(files);uploadReplay=resume;
     try{if(picker){const input=new win.Event('input',{bubbles:true,cancelable:false});uploadReplay=input;target.dispatchEvent(input);uploadReplay=resume;}target.dispatchEvent(resume);}finally{uploadReplay=null;}
    }finally{pending=false;}

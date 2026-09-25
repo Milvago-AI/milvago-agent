@@ -19,7 +19,7 @@ const check = (name, ok, detail) => { if (!ok) failures.push(name + (detail ? ' 
 const factorySource = await readFile(join(packageDirectory, 'detection-factory.js'), 'utf8');
 const start = factorySource.indexOf('=', factorySource.indexOf('factoryCatalog')) + 1;
 const end = factorySource.indexOf(';\nexport const coveredProviders');
-if (start < 1 || end < 0) throw Error('The assembled catalogue module is unreadable.');
+if (start < 1 || end < 0) throw new Error('The assembled catalogue module is unreadable.');
 const catalog = JSON.parse(factorySource.slice(start, end));
 const covered = JSON.parse(factorySource.slice(factorySource.indexOf('[', end), factorySource.indexOf(';', end + 2)));
 
@@ -37,7 +37,7 @@ const stray = matches.filter(match => ![...hosts].some(host => match.includes(ho
 check('manifest: no content script outside the edition', stray.length === 0, stray.join(' ') || matches.length + ' matches');
 
 const adapters = await readFile(join(packageDirectory, 'adapters.js'), 'utf8');
-const adapterIds = [...adapters.matchAll(/^\s*\['([a-z]+)','([^']+)'/gm)].map(entry => entry[1]);
+const adapterIds = [...adapters.matchAll(/^[ \t]{0,8}\['([a-z]+)','([^']+)'/gm)].map(entry => entry[1]);
 check('adapters: one per covered provider', JSON.stringify([...new Set(adapterIds)].sort((left, right) => expected.indexOf(left) - expected.indexOf(right))) === JSON.stringify(expected), adapterIds.join(' '));
 
 // The package never carries a per-model decision: its rules module is the Community stub.
