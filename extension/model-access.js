@@ -6,23 +6,58 @@ export {modelRulesValid} from './model-rules.js'; export { modelDecision, reques
 export const apiHosts={'api.openai.com':'chatgpt','api.anthropic.com':'claude'};
 // The hostname without its trailing dot: `api.anthropic.com.` reaches the same server, and an
 // exact comparison let it slip past every guard.
-export function hostOf(u){const name=u.hostname;let end=name.length;while(end>0&&name[end-1]==='.')end--;return name.slice(0,end);}
+export function hostOf(u){const name=u.hostname;let end=name.length;while(end>0&&name[end-1]==='.'){end--;}return name.slice(0,end);}
 // Reject duplicate keys including escaped spellings, at every depth, before JSON.parse.
 // Default `limit` unchanged. Only the asynchronous observation in `detection.js` raises it,
 // for a decompressed body whose size no longer matches the one on the wire. The Enterprise
 // control in `model-rules.js` decides, for its part, inside a BLOCKING webRequest handler:
 // it must stay synchronous and tight, and never calls with another value.
 export function strictJSON(text,limit=131072){
- if(text.length>limit){throw new Error('body too large');}let at=0,depth=0;
+ if(text.length>limit){throw new Error('body too large');}
+ let at=0,depth=0;
  function ws(){while(/[ \t\r\n]/.test(text[at]||'\0')){at++;}}
  function string(){const start=at++;while(at<text.length){const c=text[at++];if(c==='"'){return JSON.parse(text.slice(start,at));}if(c==='\\'){at++;}}throw new Error('string');}
- function value(){ws();if(++depth>40){throw new Error('depth');}const c=text[at];
-  if(c==='{'){at++;ws();const keys=new Set();if(text[at]!=='}'){for(;;){ws();if(text[at]!=='"'){throw new Error('key');}const key=string();if(keys.has(key)){throw new Error('duplicate');}keys.add(key);ws();if(text[at++]!==':'){throw new Error('colon');}value();ws();if(text[at]!==','){break;}at++;}}if(text[at++]!=='}'){throw new Error('object');}}
-  else if(c==='['){at++;ws();if(text[at]!==']'){for(;;){value();ws();if(text[at]!==','){break;}at++;}}if(text[at++]!==']'){throw new Error('array');}}
-  else if(c==='"'){string();}else {const start=at;while(at<text.length&&!/[,\]}\s]/.test(text[at])){at++;}if(start===at){throw new Error('value');}}
+ function member(keys){
+  if(text[at]!=='"'){throw new Error('key');}
+  const key=string();
+  if(keys.has(key)){throw new Error('duplicate');}
+  keys.add(key);
+  ws();
+  if(text[at++]!==':'){throw new Error('colon');}
+  value();
+ }
+ function object(){
+  at++;ws();
+  const keys=new Set();
+  if(text[at]!=='}'){
+   for(;;){ws();member(keys);ws();if(text[at]!==','){break;}at++;}
+  }
+  if(text[at++]!=='}'){throw new Error('object');}
+ }
+ function array(){
+  at++;ws();
+  if(text[at]!==']'){
+   for(;;){value();ws();if(text[at]!==','){break;}at++;}
+  }
+  if(text[at++]!==']'){throw new Error('array');}
+ }
+ function primitive(){
+  const start=at;
+  while(at<text.length&&!/[,}\]\s]/.test(text[at])){at++;}
+  if(start===at){throw new Error('value');}
+ }
+ function value(){
+  ws();
+  if(++depth>40){throw new Error('depth');}
+  const c=text[at];
+  if(c==='{'){object();}
+  else if(c==='['){array();}
+  else if(c==='"'){string();}
+  else{primitive();}
   depth--;
  }
- value();ws();if(at!==text.length){throw new Error('trailing');}return JSON.parse(text);
+ value();ws();if(at!==text.length){throw new Error('trailing');}
+ return JSON.parse(text);
 }
 export function requestBodyJSON(details){ try{
   let length=0;for(const part of details.requestBody.raw){if(!part.bytes||part.file){return null;}length+=part.bytes.byteLength;if(length>131072){return null;}}
@@ -87,7 +122,17 @@ export function ownedPlatform(value){
  return globalThis.MilvagoAdapters.adapters.find(a=>host.endsWith('.'+a.domain)||(a.assets||[]).includes(host))||null;
 }
 function providerOwned(value,adapter){return ownedPlatform(value)?.id===adapter.id;}
-function contentDecision(details,policy,wire,approval,adapter,u,target){
+function providerRead(details,adapter){
+ if(!['GET','HEAD','OPTIONS'].includes(details.method)||details.requestBody){return false;}
+ const navigation=['main_frame','sub_frame'].includes(details.type);
+ const initiator=details.initiator||details.originUrl||details.documentUrl;
+ return providerOwned(details.url,adapter)&&(navigation||providerOwned(initiator||'',adapter));
+}
+function unreadableContentDecision(wire,approval){
+ if(!wire?.route){return {seal:false};}
+ return approval?{allow:true,approved:true}:{seal:true};
+}
+function contentDecision(details,policy,wire,approval,adapter){
  const protection=policy.config?.protection,masking=masks(policy);
  // `HEAD` and `OPTIONS` follow the `GET` rule because they carry NO payload:
  // a CORS preflight is a metadata request, and sealing it protected nothing
@@ -96,7 +141,7 @@ function contentDecision(details,policy,wire,approval,adapter,u,target){
  // refusal (measured on 2026-09-16; a sealed `OPTIONS` request was observed on chatgpt.com).
  // `POST`, `PUT`, `PATCH` and `DELETE` stay outside this branch: they can carry
  // a body, and therefore go through the inspection below.
- if(['GET','HEAD','OPTIONS'].includes(details.method)&&!details.requestBody){
+ if(providerRead(details,adapter)){
   // A `GET` whose DESTINATION is the covered provider passes, regardless of its
   // path and query, with `Referer` stripped. The previous rule only allowed a
   // navigation to the exact root: it sealed `/login`, `/chat/<id>` and
@@ -113,9 +158,7 @@ function contentDecision(details,policy,wire,approval,adapter,u,target){
   // a banner for the page's telemetry. Risk accepted and recorded: a covered
   // page that called a third party with data in the URL would pass; the
   // `declarativeNetRequest` fallback, which has no blocking handler, keeps its own rules.
-  const navigation=['main_frame','sub_frame'].includes(details.type);
-  const initiator=details.initiator||details.originUrl||details.documentUrl;
-  if(providerOwned(details.url,adapter)&&(navigation||providerOwned(initiator||'',adapter))){return {allow:true,strip:true};}
+  return {allow:true,strip:true};
  }
  // A `file` route from the catalog — a MEASURED upload URL — is sealed under
  // file-upload blocking, before any read of the body.
@@ -141,7 +184,7 @@ function contentDecision(details,policy,wire,approval,adapter,u,target){
  // A body the synchronous path cannot read only goes out, on a prompt route,
  // within the window opened by an approval, for that tab and that document: this is
  // the case for claude.ai, which compresses its request body. Outside a prompt route, it passes.
- if(!wire?.readable){if(!wire?.route){return {seal:false};}if(approval){return {allow:true,approved:true};}return {seal:true};}
+ if(!wire?.readable){return unreadableContentDecision(wire,approval);}
  if(!wire.texts.length&&!promptShaped(wire.body,wire.keys)){return {seal:false};}
  // The text must be PRESENT, not merely equal: without this condition, a body shaped
  // like a prompt but carrying nothing at its rule's path yields an empty string,
@@ -149,36 +192,41 @@ function contentDecision(details,policy,wire,approval,adapter,u,target){
  // would match it. The payload could then travel in any other field of the body.
  return approval&&wire.texts.length&&approval.text===wire.texts.join('')?{allow:true,approved:true}:{seal:true};
 }
+function blockedService(policy,target,origin){
+ return [target,origin].filter(Boolean).some(a=>policy?.config?.services?.some(s=>s.enabled&&['block','redirect'].includes(s.mode)&&(s.id===a.id||s.domains?.includes(a.domain))));
+}
+function controlledRequestDecision(details,policy,wire,approval,adapter,u,base){
+ const direct=(u&&apiHosts[hostOf(u)])||!u;
+ const read=!!u&&['GET','HEAD','OPTIONS'].includes(details.method)&&!details.requestBody;
+ if(direct&&masks(policy)&&!read){return {...base,reason:'control_unavailable'};}
+ const verdict=contentDecision(details,policy,wire,approval,adapter);
+ if(verdict.seal){return {...base,reason:'control_unavailable'};}
+ if(verdict.allow){return {...base,allow:true,strip:!!verdict.strip,approved:!!verdict.approved};}
+ return null;
+}
+function unqualifiedNavigation(details,target,u){
+ return target&&u?.protocol==='https:'&&!apiHosts[hostOf(u)]&&details.type==='main_frame'&&details.method==='GET'&&!details.requestBody&&!u.search&&(u.pathname==='/'||target.conversation.test(u.pathname));
+}
 export function requestDecision(details,policy,wire,approval,now=Date.now()){
  const target=networkPlatform(details.url),origin=networkPlatform(details.initiator||details.originUrl||details.documentUrl);
  const adapter=(origin&&ruleFor(policy,origin.id)&&origin.id!==target?.id)?origin:target||origin;if(!adapter){return null;}
  const fresh=policy&&Date.parse(policy.expires_at)>now,rule=ruleFor(policy,adapter.id);
  const base={platform_id:adapter.id,provider:adapter.domain,revision:policy?.revision};
- const blocked=[target,origin].filter(Boolean).some(a=>policy?.config?.services?.some(s=>s.enabled&&['block','redirect'].includes(s.mode)&&(s.id===a.id||s.domains?.includes(a.domain))));
- if(blocked){return {...base,reason:'control_unavailable'};}
+ if(blockedService(policy,target,origin)){return {...base,reason:'control_unavailable'};}
  // Content restrictions apply to private web transports as well as public APIs.
- if(fresh&&!rule&&!contentControl(policy)){return null;}
+ const controlled=contentControl(policy);
+ if(fresh&&!rule&&!controlled){return null;}
  const u=urlOf(details.url);
  if(!fresh){return {...base,reason:'control_unavailable'};}
- if(contentControl(policy)){
-  // A direct API has no composer to inspect: under masking, it stays sealed —
-  // except for a bodyless read (`GET`/`HEAD`/`OPTIONS`) that the provider's own page makes
-  // at home, which `contentDecision` judges like any other: measured on 2026-09-16, claude.ai
-  // queries `api.anthropic.com/api/directory/servers` on a model change. Under
-  // file-upload blocking alone, the API host has no `file` route: nothing there is sealed.
-  const direct=(u&&apiHosts[hostOf(u)])||!u,read=!!u&&['GET','HEAD','OPTIONS'].includes(details.method)&&!details.requestBody;
-  if(direct&&masks(policy)&&!read){return {...base,reason:'control_unavailable'};}
-  const verdict=contentDecision(details,policy,wire,approval,adapter,u,target);
-  if(verdict.seal){return {...base,reason:'control_unavailable'};}
-  // An approval carries its own directives and **no** `reason`: the caller seals on
-  // `decision.reason`, never merely on an object's presence.
-  if(verdict.allow){return {...base,allow:true,strip:!!verdict.strip,approved:!!verdict.approved};}
+ if(controlled){
+  const verdict=controlledRequestDecision(details,policy,wire,approval,adapter,u,base);
+  if(verdict){return verdict;}
  }
  // Outside content control, a top-level navigation to the root or to a
  // conversation remains a navigation, not a request to qualify: this is the
  // compatibility that per-model rules have always had. Under content control,
  // the branch above has already decided.
- if(!contentControl(policy)&&target&&u?.protocol==='https:'&&!apiHosts[hostOf(u)]&&details.type==='main_frame'&&details.method==='GET'&&!details.requestBody&&!u.search&&(u.pathname==='/'||target.conversation.test(u.pathname))){return null;}
+ if(!controlled&&unqualifiedNavigation(details,target,u)){return null;}
  const model=requestModel(details,adapter.id),reason=modelDecision(rule,model);
  return reason?{...base,reason,model:model||undefined}:null;
 }

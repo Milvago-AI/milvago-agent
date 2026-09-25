@@ -81,6 +81,8 @@
    shade.append(card);shadow.append(style,shade);document.documentElement.append(host);overlay=host;cancel.focus();
    shadow.addEventListener('keydown',event=>{if(event.key==='Escape'){event.preventDefault();close();}if(event.key==='Tab'){const focusable=[...card.querySelectorAll('textarea,button')];const index=focusable.indexOf(shadow.activeElement),next=(index+(event.shiftKey?-1:1)+focusable.length)%focusable.length;event.preventDefault();focusable[next].focus();}});
   }
+  function addCaptureID(event,delivery_id){if(delivery_id){event.capture_id=delivery_id;}}
+  async function textFingerprint(text){const digest=await win.crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));return Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');}
   async function emit(kind,text,action,labels,id,delivery_id){if(action===undefined){action='observed';}if(labels===undefined){labels=[];}if(id===undefined){id=correlation;}
    try{
    if(!policy?.config.collection.enabled){return false;}
@@ -92,12 +94,12 @@
    const event={kind,characters:Array.from(text).length,action,labels,url:location.href};if(id){event.correlation_id=id;}
    if(kind!=='navigation'&&policy.config.collection.store_content&&withinLimit(text)){event[kind]=text;}
    if(kind==='prompt'&&policy.config.collection.store_file_names&&attached.size){event.files=[...attached];}
-   if(kind==='prompt'&&win.crypto.subtle){const digest=await win.crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));event.fingerprint=Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join('');}
+    if(kind==='prompt'&&win.crypto.subtle){event.fingerprint=await textFingerprint(text);}
    // Recheck consent after asynchronous work, before passing any content.
    if(!policy?.config.collection.enabled){return false;}
    if(!policy.config.collection.store_content){delete event.prompt;delete event.response;}
    if(!policy.config.collection.store_file_names){delete event.files;}
-   if(delivery_id){event.capture_id=delivery_id;}
+   addCaptureID(event,delivery_id);
    return (await message({type:'event',event}))?.ok===true;
    }catch{return false;}
   }
@@ -131,6 +133,7 @@
   const policyState=()=>JSON.stringify(policy&&{version:policy.version,revision:policy.revision,config:policy.config});
   const state=()=>({url:location.href,policy:policyState(),epoch:draftEpoch,attempt});
   const unchanged=s=>!disposed&&s.url===location.href&&s.policy===policyState()&&s.epoch===draftEpoch&&s.attempt===attempt;
+  function invalidSubmit(final,text,snapshot,editor,target,control){return !final.ok||final.action!=='observe'||final.text!==text||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)||(final.authority!==null&&!(typeof final.authority==='string'&&/^[0-9a-f]{64}$/.test(final.authority)))))||!unchanged(snapshot)||!editor.isConnected||!target.isConnected||A.read(editor)!==text||control?.disabled||control?.getAttribute('aria-disabled')==='true';}
   async function submit(editor,text,intent,snapshot){
    const {control,form,target}=intent;
    if(!unchanged(snapshot)||!editor.isConnected||!target.isConnected||A.read(editor)!==text){return;}
@@ -140,7 +143,7 @@
     try{if(win.crypto.subtle){submitDigest=await win.crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));}}catch{notice('Envoi en attente','Le lien avec le reçu durable est indisponible.');return;}
     if(!unchanged(snapshot)||A.read(editor)!==text){return;}
     const final=await message({type:'submit',text,upload:false,event:{kind:'prompt',action:'observed',characters:Array.from(text).length,labels:[],url:location.href,correlation_id:deliveryCorrelation,...(policy?.config.collection.store_file_names&&attached.size?{files:[...attached]}:{})}});
-    if(!final.ok||final.action!=='observe'||final.text!==text||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)||(final.authority!==null&&!(typeof final.authority==='string'&&/^[0-9a-f]{64}$/.test(final.authority)))))||!unchanged(snapshot)||!editor.isConnected||!target.isConnected||A.read(editor)!==text||control?.disabled||control?.getAttribute('aria-disabled')==='true'){notice('Envoi en attente',final.reason||'La validation finale ou l’enregistrement durable a échoué.');return;}
+    if(invalidSubmit(final,text,snapshot,editor,target,control)){notice('Envoi en attente',final.reason||'La validation finale ou l’enregistrement durable a échoué.');return;}
     if(final.recording_required!==false&&final.durable===true&&validReceipt(final.delivery_id)){
      if(!submitDigest){notice('Envoi en attente','Le lien avec le reçu durable est indisponible.');return;}
      if(receipts.length>=128){receipts.shift();}
@@ -150,6 +153,27 @@
     replay={editor,text,target,form,clicked:false,submitted:false};
     try{if(control){control.click();}else {form.requestSubmit();}}finally{replay=null;}
    }finally{pending=false;}
+  }
+  function onBlockedInspection(answer,text,labels){emit('prompt',text,'blocked',labels,win.crypto.randomUUID());const found=typeof answer.evidence==='string'&&answer.evidence.length<=200?`\n\nDétecté : ${answer.evidence}`:'';notice('Envoi bloqué',(answer.reason||'La politique locale bloque cet envoi.')+found);}
+  function onRedirectInspection(answer,text,labels){
+    emit('prompt',text,'redirected',labels,win.crypto.randomUUID());let target;try{target=new URL(answer.redirect_url);if(target.protocol!=='https:'||target.username||target.password){throw new Error('Invalid redirect target');}}catch{notice('Redirection refusée','La destination de la politique est invalide.');return;}
+    notice('Service autorisé',`${answer.reason||'Utilisez le service prévu par votre organisation.'}\n${target.origin}`,undefined,()=>location.assign(target.href),'Ouvrir le service');return;
+  }
+  async function completeInspection(answer,editor,text,intent,snapshot){
+   const labels=Array.isArray(answer.labels)?answer.labels:[];
+   if(answer.action==='block'){onBlockedInspection(answer,text,labels);return;}
+   if(answer.action==='redirect'){onRedirectInspection(answer,text,labels);return;}
+   const allow=async()=>{
+    if(!unchanged(snapshot)||!editor.isConnected||A.read(editor)!==text){return;}
+    // The submitted text is whatever the editor actually contains: the agent inspects it
+    // again on submit and rejects any difference from what it approved.
+    const applied=answer.text===text?text:A.write(editor,answer.text);
+    if(applied===null){notice('Envoi en attente','Le texte contrôlé n’a pas pu être appliqué au brouillon.');return;}
+    editor.focus();await submit(editor,applied,intent,state());
+   };
+   // Review text: product decision of 2026-09-16.
+   if(answer.action==='review'||answer.text!==text){notice('Informations confidentielles','Les informations que vous avez fournies contiennent des informations confidentielles, merci de vérifier les éléments que nous avons masqués ci-dessous avant envoi.',answer.text,allow,'Valider et envoyer');}
+   else {await allow();}
   }
   async function handle(event){
    if(replay&&A.read(replay.editor)===replay.text){
@@ -165,49 +189,27 @@
    if(!unchanged(snapshot)||!editor.isConnected||A.read(editor)!==text){return;}
    if(!answer.ok){notice('Envoi en attente',answer.reason||'Connectez l’agent local puis réessayez.');return;}
    if(!['observe','review','block','redirect'].includes(answer.action)||typeof answer.text!=='string'||!withinLimit(answer.text)){notice('Envoi en attente','Réponse de contrôle non valide.');return;}
-   const labels=Array.isArray(answer.labels)?answer.labels:[];
-   if(answer.action==='block'){emit('prompt',text,'blocked',labels,win.crypto.randomUUID());const found=typeof answer.evidence==='string'&&answer.evidence.length<=200?`\n\nDétecté : ${answer.evidence}`:'';notice('Envoi bloqué',(answer.reason||'La politique locale bloque cet envoi.')+found);return;}
-   if(answer.action==='redirect'){
-    emit('prompt',text,'redirected',labels,win.crypto.randomUUID());let target;try{target=new URL(answer.redirect_url);if(target.protocol!=='https:'||target.username||target.password){throw new Error('Invalid redirect target');}}catch{notice('Redirection refusée','La destination de la politique est invalide.');return;}
-    notice('Service autorisé',`${answer.reason||'Utilisez le service prévu par votre organisation.'}\n${target.origin}`,undefined,()=>location.assign(target.href),'Ouvrir le service');return;
-   }
-   const allow=async()=>{
-    if(!unchanged(snapshot)||!editor.isConnected||A.read(editor)!==text){return;}
-    // The submitted text is whatever the editor actually contains: the agent inspects it
-    // again on submit and rejects any difference from what it approved.
-    const applied=answer.text===text?text:A.write(editor,answer.text);
-    if(applied===null){notice('Envoi en attente','Le texte contrôlé n’a pas pu être appliqué au brouillon.');return;}
-    editor.focus();await submit(editor,applied,intent,state());
-   };
-   // Review text: product decision of 2026-09-16.
-   if(answer.action==='review'||answer.text!==text){notice('Informations confidentielles','Les informations que vous avez fournies contiennent des informations confidentielles, merci de vérifier les éléments que nous avons masqués ci-dessous avant envoi.',answer.text,allow,'Valider et envoyer');}
-   else {await allow();}
+   await completeInspection(answer,editor,text,intent,snapshot);
   }
   // Opening a local picker transmits nothing. Intercept its change event instead,
   // when the actual selected FileList exists. Never read file contents.
   let uploadReplay;const fileSelections=new WeakMap();
 
-  async function upload(event){
-   if(event===uploadReplay){return;}
-   if(!event.isTrusted){return;}
-   const picker=['input','change'].includes(event.type)&&event.target?.matches?.('input[type="file"]');
-   let transfer=null;if(event.type==='drop'){transfer=event.dataTransfer;}else if(event.type==='paste'){transfer=event.clipboardData;}
-   const list=picker?event.target.files:transfer?.files;
-   if(!list?.length){if(picker){attached.clear();draftCorrelation=null;draftEpoch++;fileSelections.delete(event.target);}return;}
-   stop(event);
-   if(picker&&event.type==='change'){const selection=fileSelections.get(event.target);if(selection?.changePending&&sameFiles(list,selection.files)){selection.changePending=false;return;}}
-   draftEpoch++;if(pending){return;}
-   const target=event.target,snapshot=state(),files=Array.from(list||[]);let resume;
-   if(picker){fileSelections.set(target,{files,changePending:event.type==='input'});}
-   // The event data store is readable only during dispatch. Preserve File references
-   // synchronously; no contents or names are read here.
-   if(picker){resume=new win.Event('change',{bubbles:true,cancelable:true});}
+  function createUploadReplay(event,picker,files){
+   if(picker){return new win.Event('change',{bubbles:true,cancelable:true});}
    else{
-    if(typeof win.DataTransfer!=='function'){notice('Fichier en attente','Ce navigateur ne permet pas de reprendre ce transfert. Utilisez le sélecteur de fichiers.');return;}
+    if(typeof win.DataTransfer!=='function'){notice('Fichier en attente','Ce navigateur ne permet pas de reprendre ce transfert. Utilisez le sélecteur de fichiers.');return null;}
     const copy=new win.DataTransfer();for(const file of files){copy.items.add(file);}
-    if(!sameFiles(copy.files,files)){notice('Fichier en attente','La sélection de fichiers a changé.');return;}
-    resume=event.type==='drop'?new win.DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:copy}):new win.ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:copy});
+    if(!sameFiles(copy.files,files)){notice('Fichier en attente','La sélection de fichiers a changé.');return null;}
+    return event.type==='drop'?new win.DragEvent('drop',{bubbles:true,cancelable:true,dataTransfer:copy}):new win.ClipboardEvent('paste',{bubbles:true,cancelable:true,clipboardData:copy});
    }
+  }
+  function replayedFiles(picker,event,target,resume){
+   if(picker){return target.files;}
+   if(event.type==='drop'){return resume.dataTransfer.files;}
+   return resume.clipboardData.files;
+  }
+  async function inspectUpload(event,picker,target,snapshot,files,resume){
    pending=true;
    try{
     const answer=await message({type:'inspect',text:'',upload:true});
@@ -215,10 +217,33 @@
     if(!answer.ok||answer.action!=='observe'){notice('Fichier en attente',answer.reason||'Le contrôle local refuse ce transfert.');return;}
     draftCorrelation=draftCorrelation||win.crypto.randomUUID();
     const final=await message({type:'submit',text:'',upload:true,event:{kind:'prompt',action:'observed',characters:0,labels:[],url:location.href,correlation_id:draftCorrelation,...(policy?.config.collection.store_file_names?{files:fileNames(files)}:{})}});
-    if(!final.ok||final.action!=='observe'||final.text!==''||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)))||!unchanged(snapshot)||!target.isConnected){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}let resumedFiles;if(picker){resumedFiles=target.files;}else if(event.type==='drop'){resumedFiles=resume.dataTransfer.files;}else {resumedFiles=resume.clipboardData.files;}if(!sameFiles(resumedFiles,files)){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}
+    if(!final.ok||final.action!=='observe'||final.text!==''||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)))||!unchanged(snapshot)||!target.isConnected){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}
+    const resumedFiles=replayedFiles(picker,event,target,resume);
+    if(!sameFiles(resumedFiles,files)){notice('Fichier en attente',final.reason||'La validation finale a échoué.');return;}
     if(picker){attached.clear();}attach(files);uploadReplay=resume;
     try{if(picker){const input=new win.Event('input',{bubbles:true,cancelable:false});uploadReplay=input;target.dispatchEvent(input);uploadReplay=resume;}target.dispatchEvent(resume);}finally{uploadReplay=null;}
    }finally{pending=false;}
+  }
+  function uploadSelection(event){
+   const picker=['input','change'].includes(event.type)&&event.target?.matches?.('input[type="file"]');
+   let transfer=null;if(event.type==='drop'){transfer=event.dataTransfer;}else if(event.type==='paste'){transfer=event.clipboardData;}
+   const list=picker?event.target.files:transfer?.files;
+   return {picker,list};
+  }
+  async function upload(event){
+   if(event===uploadReplay){return;}
+   if(!event.isTrusted){return;}
+   const {picker,list}=uploadSelection(event);
+   if(!list?.length){if(picker){attached.clear();draftCorrelation=null;draftEpoch++;fileSelections.delete(event.target);}return;}
+   stop(event);
+   if(picker&&event.type==='change'){const selection=fileSelections.get(event.target);if(selection?.changePending&&sameFiles(list,selection.files)){selection.changePending=false;return;}}
+   draftEpoch++;if(pending){return;}
+   const target=event.target,snapshot=state(),files=Array.from(list||[]);
+   if(picker){fileSelections.set(target,{files,changePending:event.type==='input'});}
+   // The event data store is readable only during dispatch. Preserve File references
+   // synchronously; no contents or names are read here.
+   const resume=createUploadReplay(event,picker,files);if(!resume){return;}
+   await inspectUpload(event,picker,target,snapshot,files,resume);
   }
   function responses(nodes){if(!correlation||!policy?.config.collection.enabled){return;}
    for(const node of nodes||document.querySelectorAll(adapter.response)){
@@ -242,7 +267,18 @@
     entry.timer=win.setTimeout(collect,1200);
    }
   }
-  function blocked(message){if(message?.type!=='model-blocked'){return;}attempt++;correlation=null;const en=document.documentElement.lang.startsWith('en');notice(en?'Request blocked':'Envoi bloqué',en?`Model: ${message.model||'unknown'}. Policy ${message.revision??'unavailable'}. ${message.reason==='model_denied'?'This model is forbidden.':'The requested model or transport cannot be verified.'}`:`Modèle : ${message.model||'indéterminé'}. Politique ${message.revision??'indisponible'}. ${message.reason==='model_denied'?'Ce modèle est interdit.':'Le modèle demandé ou le transport ne peut pas être vérifié.'}`);}
+  function blocked(message){
+   if(message?.type!=='model-blocked'){return;}
+   attempt++;correlation=null;
+   const denied=message.reason==='model_denied';
+   if(document.documentElement.lang.startsWith('en')){
+    const reason=denied?'This model is forbidden.':'The requested model or transport cannot be verified.';
+    notice('Request blocked','Model: '+(message.model||'unknown')+'. Policy '+(message.revision??'unavailable')+'. '+reason);
+    return;
+   }
+   const reason=denied?'Ce modèle est interdit.':'Le modèle demandé ou le transport ne peut pas être vérifié.';
+   notice('Envoi bloqué','Modèle : '+(message.model||'indéterminé')+'. Politique '+(message.revision??'indisponible')+'. '+reason);
+  }
   api?.runtime?.onMessage?.addListener(blocked);
   api?.runtime?.onMessage?.addListener(receipt);
   function listen(type,fn){document.addEventListener(type,fn,true);listeners.push([type,fn]);}

@@ -39,9 +39,6 @@ function observedFileNames(input,collection){
  if(input.kind!=='prompt'||!collection.store_file_names||!Array.isArray(input.files)){return [];}
  return input.files.filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.codePointAt(0)<32||c.codePointAt(0)===127)).slice(0,20);
 }
-export function eventForPolicy(input,senderUrl,tool,policy){
- if(!validPolicy(policy)||![2,3].includes(policy.version)||!policy.config.collection.enabled){return null;}
- const frame=globalThis.MilvagoAdapters.context(senderUrl);if(!frame){return null;}
  // `sender.url` is the URL the document was COMMITTED at, and none of these providers
  // reloads when the conversation changes: measured on claude.ai 2026-09-15, the worker
  // still read `/new` while the tab was on `/chat/<uuid>`. Every event of that tab then
@@ -49,9 +46,17 @@ export function eventForPolicy(input,senderUrl,tool,policy){
  // so distinct conversations became one. The document reports its live `location.href`;
  // it is honoured only while it names the same provider the frame is trusted for, so a
  // compromised page can still only speak about its own domain.
+function eventContext(input,senderUrl,policy){
+ const frame=globalThis.MilvagoAdapters.context(senderUrl);
+ if(!frame){return null;}
  const live=typeof input?.url==='string'?globalThis.MilvagoAdapters.context(input.url):null;
  const context=live&&live.provider===frame.provider?live:frame;
- if(!policy.config.services.some(s=>s.enabled&&s.domains.includes(context.provider))){return null;}
+ return policy.config.services.some(s=>s.enabled&&s.domains.includes(context.provider))?context:null;
+}
+export function eventForPolicy(input,senderUrl,tool,policy){
+ if(!validPolicy(policy)||![2,3].includes(policy.version)||!policy.config.collection.enabled){return null;}
+ const context=eventContext(input,senderUrl,policy);
+ if(!context){return null;}
  if(!validObservedEvent(input)){return null;}
  const event={...context,source:'browser',tool,kind:input.kind,action:input.action,characters:input.kind==='navigation'?0:input.characters,labels:Array.isArray(input.labels)?input.labels.filter(s=>typeof s==='string'&&/^[a-z0-9_-]{1,64}$/i.test(s)).slice(0,32):[],policy_revision:policy.revision};
  if(typeof input.correlation_id==='string'&&/^[a-zA-Z0-9_-]{1,200}$/.test(input.correlation_id)){event.correlation_id=input.correlation_id;}

@@ -141,20 +141,30 @@ export function matchRule(catalog,details,url,kind='prompt'){
 // unreadable here — `DecompressionStream` is asynchronous — and declares itself as such
 // rather than passing for an empty body: this is the difference between "nothing to
 // mask" and "I could not read it".
-export function bodyTextSync(details,rule){
- const raw=details.requestBody;
- if(raw?.error){return {readable:false,texts:[]};}
- let decoded=null;
- if(raw?.formData){decoded=decodeForm(raw.formData);}
- else if(Array.isArray(raw?.raw)){
-  let bytes=0;
-  for(const part of raw.raw){if(!part.bytes||part.file){return {readable:false,texts:[]};}bytes+=part.bytes.byteLength;}
-  if(bytes>BODY_LIMIT){return {readable:false,texts:[]};}
-  const joined=new Uint8Array(bytes);let at=0;for(const part of raw.raw){joined.set(new Uint8Array(part.bytes),at);at+=part.bytes.byteLength;}
-  // Compressed: `compressionOf` recognizes it, and this path cannot open it.
-  if(compressionOf(joined)){return {readable:false,texts:[]};}
-  try{decoded=strictJSON(new TextDecoder('utf-8',{fatal:true}).decode(joined));}catch{return {readable:false,texts:[]};}
+function decodeRawSync(parts){
+ let bytes=0;
+ for(const part of parts){
+  if(!part.bytes||part.file){return {readable:false,texts:[]};}
+  bytes+=part.bytes.byteLength;
  }
+ if(bytes>BODY_LIMIT){return {readable:false,texts:[]};}
+ const joined=new Uint8Array(bytes);
+ let at=0;
+ for(const part of parts){joined.set(new Uint8Array(part.bytes),at);at+=part.bytes.byteLength;}
+ if(compressionOf(joined)){return {readable:false,texts:[]};}
+ try{return {decoded:strictJSON(new TextDecoder('utf-8',{fatal:true}).decode(joined))};}
+ catch{return {readable:false,texts:[]};}
+}
+function decodeBodySync(raw){
+ if(raw?.error){return {readable:false,texts:[]};}
+ if(raw?.formData){return {decoded:decodeForm(raw.formData)};}
+ if(Array.isArray(raw?.raw)){return decodeRawSync(raw.raw);}
+ return {decoded:null};
+}
+export function bodyTextSync(details,rule){
+ const read=decodeBodySync(details.requestBody);
+ if(!Object.hasOwn(read,'decoded')){return read;}
+ const {decoded}=read;
  if(decoded===null||typeof decoded!=='object'){return {readable:decoded!==null,texts:[],body:decoded};}
  const body=unwrapFields(decoded,rule?.json_fields);
  return {readable:true,texts:rule?textsAt(body,rule):[],body};
@@ -241,26 +251,37 @@ export class Fusion {
   await this.emit({...p.event,detector:p.source},p.id,retry,p.submission===true,p.authority,observed);
   await this.commit(this.pending.filter(row=>row!==p));
  }
- add(event,identity,digest,source,immediate,authority,deliveryId){if(immediate===undefined){immediate=false;}if(authority===undefined){authority=null;}return this.run(async()=>{
-  if(deliveryId!==undefined&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deliveryId)){throw new Error('Invalid capture delivery identity');}
-  const existing=deliveryId&&this.pending.find(p=>p.id===deliveryId);
-  if(existing){
-   if(existing.identity!==identity||existing.authority!==authority||existing.source!==source||JSON.stringify(existing.event)!==JSON.stringify(event)){throw new Error('Capture delivery identity collision');}
-   if(immediate){await this.deliver(existing);}return deliveryId;
-  }
-  const now=this.clock();
-  const matches=this.pending.filter(p=>p.identity===identity&&p.authority===authority&&p.digest&&p.digest===digest&&p.source!==source&&p.source!=='both'&&now>=p.at&&now-p.at<=3000);
-  if(matches.length===1){
-   let p=matches[0];
-   // Once delivery was attempted its payload cannot change: Update may already
-   // hold it and only its acknowledgement may have been lost.
-   if(!p.attempted){const network=source==='network'?event:p.event,dom=source==='dom'?event:p.event;const merged={...p,event:{...dom,...network,correlation_id:dom.correlation_id||network.correlation_id},source:'both'};await this.commit(this.pending.map(row=>row===p?merged:row));p=merged;}
-   await this.deliver(p);return;
-  }
+ async mergeMatch(p,event,source){
+  // Once delivery was attempted its payload cannot change: Update may already
+  // hold it and only its acknowledgement may have been lost.
+  if(!p.attempted){const network=source==='network'?event:p.event,dom=source==='dom'?event:p.event;const merged={...p,event:{...dom,...network,correlation_id:dom.correlation_id||network.correlation_id},source:'both'};await this.commit(this.pending.map(row=>row===p?merged:row));p=merged;}
+  await this.deliver(p);
+ }
+ async deliverExisting(existing,event,identity,source,immediate,authority){
+  if(existing.identity!==identity||existing.authority!==authority||existing.source!==source||JSON.stringify(existing.event)!==JSON.stringify(event)){throw new Error('Capture delivery identity collision');}
+  if(immediate){await this.deliver(existing);}
+  return existing.id;
+ }
+ async addPending({event,identity,digest,source,immediate,authority,deliveryId,now}){
   if(this.pending.length>=128){throw new Error('Pending detection queue full');}
   const entry={id:deliveryId||crypto.randomUUID(),event:structuredClone(event),authority,identity,digest,source,at:now,attempted:false};
-  await this.commit([...this.pending,entry]);if(immediate){await this.deliver(entry);}return entry.id;
- });}
+  await this.commit([...this.pending,entry]);
+  if(immediate){await this.deliver(entry);}
+  return entry.id;
+ }
+ add(event,identity,digest,source,immediate,authority,deliveryId){
+  if(immediate===undefined){immediate=false;}
+  if(authority===undefined){authority=null;}
+  return this.run(async()=>{
+   if(deliveryId!==undefined&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(deliveryId)){throw new Error('Invalid capture delivery identity');}
+   const existing=deliveryId&&this.pending.find(p=>p.id===deliveryId);
+   if(existing){return this.deliverExisting(existing,event,identity,source,immediate,authority);}
+   const now=this.clock();
+   const matches=this.pending.filter(p=>p.identity===identity&&p.authority===authority&&p.digest&&p.digest===digest&&p.source!==source&&p.source!=='both'&&now>=p.at&&now-p.at<=3000);
+   if(matches.length===1){await this.mergeMatch(matches[0],event,source);return;}
+   return this.addPending({event,identity,digest,source,immediate,authority,deliveryId,now});
+  });
+ }
  prepare(event,identity,authority=null){return this.run(async()=>{
   if(this.pending.length>=128){throw new Error('Pending detection queue full');}
   const entry={id:crypto.randomUUID(),event:structuredClone(event),authority,identity,digest:null,source:'dom',at:this.clock(),attempted:true,submission:true};

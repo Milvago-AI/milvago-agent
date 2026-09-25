@@ -146,66 +146,18 @@ function notifyBlock(details,decision){
  void brokerBridge({op:'event_v2',tool,event,delivery_id:crypto.randomUUID()}).catch(()=>{});
 }
 function cancel(details,decision){notifyBlock(details,decision);return {cancel:true};}
-try{
- api.webRequest.onBeforeRequest.addListener(details=>{
-  if(!authorized()){
-   // Worker startup: the policy hasn't come back yet. See `BOOT_MS`.
-   if(!booted&&bootReadable(details)){return {};}
-   // Fail-closed: agent/service unreachable or policy not yet loaded — block the
-   // covered AI surface (platform sites and provider API hosts), nothing else.
-   let apiHit=false;try{apiHit=!!apiHosts[hostOf(new URL(details.url))];}catch{}
-   const covered=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
-   if(covered||apiHit){return cancel(details,{platform_id:covered?.id,provider:covered?.domain||'agent-unavailable',reason:'control_unavailable',revision:policy?.revision});}
-   return {};
-  }
-  const platform=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
-  // What the catalog can tell about the body, read only once and only when
-  // content control applies: the read is synchronous, the handler is too.
-  let wire=null,approval=null;
-  if(platform&&contentControl(policy)){
-   let u=null;try{u=new URL(details.url);}catch{}
-   if(u){wire=wireFacts(details,detection.catalog(),u);wire.keys=detection.catalog()?.heuristics?.keys;}
-   approval=approvalFor(details,platform.id);
-  }
-  const decision=requestDecision(details,policy,wire,approval);
-  if(decision?.reason){return cancel(details,decision);}
-  if(decision?.allow){
-   // An approval only serves once: it is removed as soon as a request
-   // consumes it, and the request is flagged so the headers guard lets it through.
-   // The revision that approved it travels with it: the text was only ever inspected under
-   // that one. The `Referer` removal, on the other hand, is not memorized: it is RECOMPUTED on
-   // send, so that no queue saturation can make it forgotten.
-   if(decision.approved){approvals.delete(details.tabId);if(approved.size>=64){approved.delete(approved.keys().next().value);}approved.set(details.requestId,policy?.revision);}
-   return {};
-  }
-  // The second guard recomputes the decision when nothing is pending, and it does
-  // so WITHOUT the body — which it does not receive. A send that is not an `xmlhttprequest`
-  // (`ping`, `beacon`, `other`: what `sendBeacon` produces, and ChatGPT uses it for
-  // its events) used to pass the first guard and then get sealed by the second.
-  // Fail-closed, but the two guards must say the same thing about the same request:
-  // every covered POST/PUT now leaves its verdict pending.
-  if(platform&&(ruleFor(policy,platform.id)||contentControl(policy))&&(details.type==='xmlhttprequest'||['POST','PUT'].includes(details.method))){
-   if(decisions.size>=64){return cancel(details,{platform_id:platform.id,provider:platform.domain,reason:'control_unavailable',revision:policy?.revision});}
-   decisions.set(details.requestId,{platform,model:requestModel(details,platform.id),revision:policy?.revision});
-  }
-  return {};
- },{urls:['<all_urls>']},['blocking','requestBody']);
- api.webRequest.onBeforeSendHeaders.addListener(details=>{
-  // The approved request was authorized on its text, not its transport: the
-  // type and encoding checks that follow serve the model decision. Its
-  // authorization, however, survives neither the loss of the policy nor a change of
-  // revision: the text was only ever inspected under the revision that approved it.
-  if(approved.has(details.requestId)){
-   const revision=approved.get(details.requestId);approved.delete(details.requestId);
-   if(authorized()&&revision===policy?.revision){return {};}
-   const covered=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
-   return cancel(details,{platform_id:covered?.id,provider:covered?.domain||'agent-unavailable',reason:'control_unavailable',revision:policy?.revision});
-  }
-  const pending=decisions.get(details.requestId);
-  if(!pending){
+function blockedWithoutPolicy(details){
+ if(!booted&&bootReadable(details)){return {};}
+ let apiHit=false;
+ try{apiHit=!!apiHosts[hostOf(new URL(details.url))];}catch{}
+ const covered=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
+ if(covered||apiHit){return cancel(details,{platform_id:covered?.id,provider:covered?.domain||'agent-unavailable',reason:'control_unavailable',revision:policy?.revision});}
+ return {};
+}
+function untrackedHeaders(details){
    // Recheck the clock for every send. A request without its body decision is never
    // allowed to inherit authority across a worker wake or grace expiry.
-   if(!authorized()){if(!booted&&bootReadable(details)){return {};}let apiHit=false;try{apiHit=!!apiHosts[hostOf(new URL(details.url))];}catch{};const covered=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);if(covered||apiHit){return cancel(details,{platform_id:covered?.id,provider:covered?.domain||'agent-unavailable',reason:'control_unavailable',revision:policy?.revision});}return {};}
+   if(!authorized()){return blockedWithoutPolicy(details);}
    // Without a body, this guard only knows the request's route: `wireFacts` tells it whether
    // it is a catalog prompt route, the only kind masking retains (2026-09-16).
    let wire=null;
@@ -219,7 +171,8 @@ try{
    // could empty. The `Cookie` stays: it belongs to the provider's domain, and removing it
    // would cut the session.
    return decision?.strip?{requestHeaders:(details.requestHeaders||[]).filter(h=>h.name.toLowerCase()!=='referer')}:{};
-  }
+}
+function pendingHeaders(details,pending){
   const headers=details.requestHeaders||[],types=headers.filter(h=>h.name.toLowerCase()==='content-type'),enc=headers.filter(h=>h.name.toLowerCase()==='content-encoding');
   const rule=ruleFor(policy,pending.platform.id);
   const reason=!authorized()?'control_unavailable':modelDecision(rule,pending.model);
@@ -236,6 +189,55 @@ try{
    const platform=pending.platform;return cancel(details,{platform_id:platform.id,provider:platform.domain,reason:rule?'model_unknown':'control_unavailable',revision:policy?.revision});
   }
   return {};
+}
+function requestInputs(details,platform){
+ if(!platform||!contentControl(policy)){return {wire:null,approval:null};}
+ let u=null;
+ try{u=new URL(details.url);}catch{}
+ let wire=null;
+ if(u){wire=wireFacts(details,detection.catalog(),u);wire.keys=detection.catalog()?.heuristics?.keys;}
+ return {wire,approval:approvalFor(details,platform.id)};
+}
+// Keep the body verdict until the headers guard checks the same request.
+function queueDecision(details,platform){
+ if(platform&&(ruleFor(policy,platform.id)||contentControl(policy))&&(details.type==='xmlhttprequest'||['POST','PUT'].includes(details.method))){
+  if(decisions.size>=64){return cancel(details,{platform_id:platform.id,provider:platform.domain,reason:'control_unavailable',revision:policy?.revision});}
+  decisions.set(details.requestId,{platform,model:requestModel(details,platform.id),revision:policy?.revision});
+ }
+ return {};
+}
+try{
+ api.webRequest.onBeforeRequest.addListener(details=>{
+  if(!authorized()){return blockedWithoutPolicy(details);}
+  const platform=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
+  const {wire,approval}=requestInputs(details,platform);
+  const decision=requestDecision(details,policy,wire,approval);
+  if(decision?.reason){return cancel(details,decision);}
+  if(decision?.allow){
+   // An approval only serves once: it is removed as soon as a request
+   // consumes it, and the request is flagged so the headers guard lets it through.
+   // The revision that approved it travels with it: the text was only ever inspected under
+   // that one. The `Referer` removal, on the other hand, is not memorized: it is RECOMPUTED on
+   // send, so that no queue saturation can make it forgotten.
+   if(decision.approved){approvals.delete(details.tabId);if(approved.size>=64){approved.delete(approved.keys().next().value);}approved.set(details.requestId,policy?.revision);}
+   return {};
+  }
+  return queueDecision(details,platform);
+ },{urls:['<all_urls>']},['blocking','requestBody']);
+ api.webRequest.onBeforeSendHeaders.addListener(details=>{
+  // The approved request was authorized on its text, not its transport: the
+  // type and encoding checks that follow serve the model decision. Its
+  // authorization, however, survives neither the loss of the policy nor a change of
+  // revision: the text was only ever inspected under the revision that approved it.
+  if(approved.has(details.requestId)){
+   const revision=approved.get(details.requestId);approved.delete(details.requestId);
+   if(authorized()&&revision===policy?.revision){return {};}
+   const covered=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
+   return cancel(details,{platform_id:covered?.id,provider:covered?.domain||'agent-unavailable',reason:'control_unavailable',revision:policy?.revision});
+  }
+  const pending=decisions.get(details.requestId);
+  if(!pending){return untrackedHeaders(details);}
+  return pendingHeaders(details,pending);
  },{urls:['<all_urls>']},['blocking','requestHeaders']);
  const finish=details=>{decisions.delete(details.requestId);reported.delete(details.requestId);approved.delete(details.requestId);};
  api.webRequest.onCompleted.addListener(finish,{urls:['<all_urls>']});
@@ -289,7 +291,7 @@ async function reloadCovered(match){
  if(!api.tabs){return;}
  for(const tab of await api.tabs.query({})){const platform=networkPlatform(tab.url);if(platform&&match(platform)){await api.tabs.reload(tab.id,{bypassCache:true}).catch(()=>{});}}
 }
-async function refresh(){if(refreshing){return refreshing;}refreshing=(async()=>{try{
+async function updatePolicy(){
  // The browser travels with the poll so the agent knows which extensions are still
  // running: a user who disables one must not simply vanish from the console.
  const guardedAnswer=await guarded('browser_policy',{tool},{op:'policy_v3',tool});adopt(guardedAnswer);if(!guardedAnswer.legacy&&(mode==='blocked'||guardedAnswer.mode==='blocked')){throw new Error('Broker blocked');}const answer=guardedAnswer.legacy?guardedAnswer.reply:{ok:true,online:guardedAnswer.reply.online,policy:guardedAnswer.reply.policy};if(![2,3].includes(answer.policy?.version)||!validPolicy(answer.policy)){throw new Error('Invalid policy');}
@@ -312,7 +314,8 @@ async function refresh(){if(refreshing){return refreshing;}refreshing=(async()=>
  await report(policy).catch(()=>{});
  await api.storage.local.set({status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online:answer.online,managed,revision:policy.revision,expires_at:policy.expires_at,content_control:contentControl(policy)?'unavailable':'off',content_control_reason:(()=>{if(!contentControl(policy)){return null;}if(blocking){return 'unverified_web_transport';}return 'managed_extension_required';})(),model_control:(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}});
  refreshedAt=performance.now();
-  }catch(error){
+  }
+async function handleRefreshFailure(error){
   // Only slowness is tolerated: broker delay exceeded or full queue. Agent absent,
   // refusal, signature, replay, pin or authority changed, invalid policy: seal.
   if(SLOW.has(error?.message)&&mode!=='blocked'&&authorized()&&++transientFailures<=TOLERATED_FAILURES){return;}
@@ -329,20 +332,13 @@ async function refresh(){if(refreshing){return refreshing;}refreshing=(async()=>
  // `refresh()`: the popup waits for its response, and every alarm would replay an unhandled
  // rejection.
  try{await api.storage.local.set({status:{connected:false}});}catch{}
- }})().finally(()=>{refreshing=null;endBoot();});return refreshing;}
+ }
+async function refresh(){if(refreshing){return refreshing;}refreshing=updatePolicy().catch(handleRefreshFailure).finally(()=>{refreshing=null;endBoot();});return refreshing;}
 async function currentPolicy(){if(!(performance.now()-refreshedAt<REUSE_MS&&authorized())){await refresh();}if(!authorized()){throw new Error('Policy unavailable');}return policy;}
 api.runtime.onInstalled.addListener(details=>{api.alarms.create('policy',{periodInMinutes:0.5});void (async()=>{await refresh();if(details?.reason==='update'){await reloadCovered(()=>true);}})();});
 api.runtime.onStartup.addListener(()=>{api.alarms.create('policy',{periodInMinutes:0.5});void refresh();});
 api.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='policy'){void refresh();}});
-api.runtime.onMessage.addListener((message,sender,respond)=>{
- // The content script receives the catalog already filtered by this edition
- // (detection-runtime `cover`), never the broker's raw payload.
- if(message?.type==='catalog'&&sender.frameId===0&&sender.tab){respond({ok:true,catalog:detection.catalog()});return false;}
- if(message?.type==='refresh'&&!sender.tab){refresh().then(()=>respond({ok:authorized()}));return true;}
- const provider=sender.frameId===0&&sender.tab?trustedProvider(sender.url):null;if(!provider){respond({ok:false});return false;}
- (async()=>{const active=await currentPolicy();
-   if(message?.type==='policy'){return {ok:true,policy:active,tool};}
-   if(message?.type==='inspect'){
+async function inspectMessage(message,sender,provider,active){
     if(typeof message.text!=='string'||new TextEncoder().encode(message.text).length>32768||typeof message.upload!=='boolean'){return {ok:false};}
     // Without a managed pin, NEVER send text to the agent: nothing proves it is
     // the organization's install. Under content control, refuse — the network
@@ -355,8 +351,25 @@ api.runtime.onMessage.addListener((message,sender,respond)=>{
     // DOM inspection cannot authorize a model. Under restrictions, network control
     // remains the authority; the native result keeps other content controls active.
     const modelCheck=modelObservation===true&&message.check_model===true;const fields={text:message.text,provider,upload:message.upload,tool,...(modelCheck?{platform_id:globalThis.MilvagoAdapters.resolve(sender.url).id,check_model:true,...(typeof message.model==='string'?{model:message.model}:{})}:{})};const legacy={op:'inspect',text:message.text,provider,tool,upload:message.upload,...(modelCheck?{platform_id:globalThis.MilvagoAdapters.resolve(sender.url).id,check_model:true,...(typeof message.model==='string'?{model:message.model}:{})}:{})};const response=await guarded('browser_inspect',fields,legacy);adopt(response);if(!authorized()){throw new Error('inspection authorization expired');}return response.reply;
-   }
-   if(message?.type==='submit'){
+}
+async function submitDelivery(fields,managed,authority,recording){
+ if(managed.milvago_pin){
+  const result=await guarded('browser_submit',fields,{},authority);
+  if(result.legacy){throw new Error('managed authority changed');}
+  return result;
+ }
+ if(authority!==null){throw new Error('browser authority changed');}
+ // Historical event_v2 acknowledges only after Store.save. Its UUID is the receipt.
+ let saved;
+ if(recording){
+  saved=(await guarded('browser_event',{},{op:'event_v2',tool,event:fields.event,delivery_id:fields.delivery_id},null)).reply;
+  if(typeof saved.id!=='string'||!globalThis.MilvagoAdapters.RECEIPT_ID.test(saved.id)){throw new Error('legacy receipt absent');}
+ }
+ const reread=await api.storage.managed?.get('milvago_pin')||{};
+ if(reread.milvago_pin){throw new Error('managed authority changed');}
+ return {legacy:true,authority:null,reply:{ok:true,action:'observe',text:fields.text,recording_required:recording,durable:recording,delivery_id:fields.delivery_id,id:saved?.id}};
+}
+async function submitMessage(message,sender,provider,active){
     if(typeof message.text!=='string'||new TextEncoder().encode(message.text).length>32768||typeof message.upload!=='boolean'||!message.event||typeof message.event!=='object'){return {ok:false};}
     const input={...message.event,kind:'prompt',action:'observed',characters:Array.from(message.text).length,prompt:message.text};
     const recording=active.config.collection.enabled===true;
@@ -376,18 +389,7 @@ api.runtime.onMessage.addListener((message,sender,respond)=>{
     const delivery_id=recording?await detection.prepareSubmit(event,sender,authority):crypto.randomUUID();
     try{
     const fields={text:message.text,provider,upload:message.upload,tool,event,delivery_id};
-    let result;
-    if(managed.milvago_pin){result=await guarded('browser_submit',fields,{},authority);if(result.legacy){throw new Error('managed authority changed');}}
-    else{
-     if(authority!==null){throw new Error('browser authority changed');}
-     // Historical event_v2 acknowledges only after Store.save. Its UUID, not an
-     // invented durable field, is the compatibility receipt.
-     let saved;
-     if(recording){saved=(await guarded('browser_event',{},{op:'event_v2',tool,event,delivery_id:fields.delivery_id},null)).reply;if(typeof saved.id!=='string'||!globalThis.MilvagoAdapters.RECEIPT_ID.test(saved.id)){throw new Error('legacy receipt absent');}}
-     const reread=await api.storage.managed?.get('milvago_pin')||{};
-     if(reread.milvago_pin){throw new Error('managed authority changed');}
-     result={legacy:true,authority:null,reply:{ok:true,action:'observe',text:message.text,recording_required:recording,durable:recording,delivery_id:fields.delivery_id,id:saved?.id}};
-    }
+    const result=await submitDelivery(fields,managed,authority,recording);
    adopt(result);const reply=result.reply;
    if(!authorized()||!reply?.ok||reply.action!=='observe'||reply.text!==message.text){return {ok:false,reason:reply?.reason||'Le texte doit être contrôlé de nouveau.'};}
    if(reply.recording_required!==false&&(reply.durable!==true||reply.delivery_id!==fields.delivery_id||typeof reply.id!=='string')){return {ok:false,reason:'Événement non conservé.'};}
@@ -398,14 +400,26 @@ api.runtime.onMessage.addListener((message,sender,respond)=>{
    if(contentControl(policy)){approve(sender,provider&&networkPlatform(sender.url)?.id,message.text);}
    return {ok:true,authority:result.authority,mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,action:reply.action,text:reply.text,durable:reply.durable,recording_required:reply.recording_required,delivery_id:reply.delivery_id};
    }finally{if(recording){detection.releaseSubmit(delivery_id);}}
-  }
-   if(message?.type==='event'){
+}
+async function eventMessage(message,sender,active){
     const event=eventForPolicy(message.event,sender.url,tool,active);if(!event){return {ok:false};}
     // Same rule as on submit: without a managed pin, the text (prompt or response)
     // does not leave the browser, even if the policy asks for it to be kept.
     if(!(await api.storage.managed?.get('milvago_pin'))?.milvago_pin){delete event.prompt;delete event.response;}
     return detection.dom(event,sender,message.event);
-   }return {ok:false};
+}
+api.runtime.onMessage.addListener((message,sender,respond)=>{
+ // The content script receives the catalog already filtered by this edition
+ // (detection-runtime `cover`), never the broker's raw payload.
+ if(message?.type==='catalog'&&sender.frameId===0&&sender.tab){respond({ok:true,catalog:detection.catalog()});return false;}
+ if(message?.type==='refresh'&&!sender.tab){refresh().then(()=>respond({ok:authorized()}));return true;}
+ const provider=sender.frameId===0&&sender.tab?trustedProvider(sender.url):null;if(!provider){respond({ok:false});return false;}
+ (async()=>{const active=await currentPolicy();
+  if(message?.type==='policy'){return {ok:true,policy:active,tool};}
+  if(message?.type==='inspect'){return inspectMessage(message,sender,provider,active);}
+  if(message?.type==='submit'){return submitMessage(message,sender,provider,active);}
+  if(message?.type==='event'){return eventMessage(message,sender,active);}
+  return {ok:false};
  })().then(respond).catch(()=>respond({ok:false,reason:'Contrôle local indisponible. Réessayez après avoir connecté l’agent.'}));return true;
 });
 

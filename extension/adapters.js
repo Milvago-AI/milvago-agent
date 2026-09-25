@@ -62,8 +62,8 @@
  const aliases={'chat.openai.com':'chatgpt.com','copilot.cloud.microsoft':'copilot.microsoft.com','perplexity.ai':'www.perplexity.ai','notebooklm.google.com':'notebook.google.com'};
  // `claude.ai.` and `claude.ai` are the same host for DNS and TLS, but `URL` keeps the trailing
  // dot: without this canonical form, `api.anthropic.com.` escaped the network guard entirely.
- function resolve(value){try{const u=new URL(value);let end=u.hostname.length;while(end>0&&u.hostname[end-1]==='.')end--;const host=u.hostname.slice(0,end),adapter=adapters.find(a=>a.domain===(aliases[host]||host));return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&adapter?{...adapter,domain:host}:null;}catch{return null;}}
- function context(value){const adapter=resolve(value);if(!adapter){return null;}const u=new URL(value),match=u.pathname.match(adapter.conversation);const result={provider:adapter.domain,url:u.origin};if(match){result.conversation_id=match[1];result.url+=adapter.path?adapter.path(match[1]):match[0].replace(/\/$/,'');}return result;}
+ function resolve(value){try{const u=new URL(value);let end=u.hostname.length;while(end>0&&u.hostname[end-1]==='.'){end--;}const host=u.hostname.slice(0,end),adapter=adapters.find(a=>a.domain===(aliases[host]||host));return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&adapter?{...adapter,domain:host}:null;}catch{return null;}}
+ function context(value){const adapter=resolve(value);if(!adapter){return null;}const u=new URL(value),match=u.pathname.match(adapter.conversation);const result={provider:adapter.domain,url:u.origin};if(match){result.conversation_id=match[1];result.url+=adapter.path?adapter.path(match[1]):match[0].replaceAll(/\/$/g,'');}return result;}
  function read(editor){if('value' in editor){return editor.value;}if(typeof editor.innerText==='string'){return editor.innerText;}return editor.textContent||'';}
  // The model is deliberately NOT read from the page. Measured on the real sites on
  // 2026-09-14: claude.ai shows a localized composite ("Fable 5.1 Moyen" — model and
@@ -76,7 +76,7 @@
  // two lines, a trailing break or a non-breaking space, and byte-for-byte equality failed for
  // any masked prompt spanning more than one line. Only these formatting differences are tolerated;
  // the caller submits the text read back, which the agent inspects again.
- const layout=value=>value.replaceAll(/\r\n?/g,'\n').replaceAll(/ /g,' ').replaceAll(/\n+/g,'\n').trim();
+ const layout=value=>value.replaceAll(/\r\n?/g,'\n').replaceAll(' ',' ').replaceAll(/\n+/g,'\n').trim();
  function write(editor,text){
   const doc=editor.ownerDocument,win=doc.defaultView;
   if('value' in editor){const prototype=editor.tagName==='TEXTAREA'?win.HTMLTextAreaElement.prototype:win.HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(prototype,'value')?.set;if(setter){setter.call(editor,text);}else {editor.value=text;}}

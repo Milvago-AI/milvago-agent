@@ -82,12 +82,17 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
  }
  async function count(id,key,observedRevision,observedState,authority){if(observedRevision===undefined){observedRevision=revision;}if(observedState===undefined){observedState=catalogState;}const at=Date.now();if(authority===undefined){authority=await currentAuthority(api);}return change(()=>{observe(at,observedRevision,observedState,authority);if(!health.providers[id]&&Object.keys(health.providers).length>=128){throw new Error('detector health providers full');}const row=health.providers[id]||={provider:id,navigations:0,prompts_network:0,prompts_dom:0,responses_dom:0,candidates:0};row[key]=Math.min(1e6,row[key]+1);});}
  const receiptID=value=>typeof value==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+ function appendMeasurement(event,output,key){
+  if(event[key]===undefined){return;}
+  if(!Number.isSafeInteger(event[key])||event[key]<0||(key==='body_bytes'&&event[key]>16*1024*1024)){throw new Error('Invalid detection measurement');}
+  output[key]=event[key];
+ }
  function metadata(event){
   // This is the only persistent event projection in the browser. Neither content,
   // filenames, conversation identifiers nor their fingerprints enter storage.
   if(!validDetectionMetadata(event)){throw new Error('Invalid detection metadata');}
   const output={provider:event.provider,source:'browser',tool,kind:event.kind,action:event.action,characters:event.characters,characters_known:event.characters_known!==false,labels:(event.labels||[]).filter(label=>['email','phone','iban','card','social_id','ip','source_code','medical','keyword','ssn_us','custom'].includes(label)).slice(0,16)};
-  for(const key of ['policy_revision','catalog_revision','body_bytes']){if(event[key]!==undefined){if(!Number.isSafeInteger(event[key])||event[key]<0||(key==='body_bytes'&&event[key]>16*1024*1024)){throw new Error('Invalid detection measurement');}output[key]=event[key];}}
+  for(const key of ['policy_revision','catalog_revision','body_bytes']){appendMeasurement(event,output,key);}
   if(modelObservation&&event.model!==undefined){if(typeof event.model!=='string'||!/^[A-Za-z0-9._:/-]{1,200}$/.test(event.model)){throw new Error('Invalid detection model');}output.model=event.model;}
   // The reasoning effort the request asked for, in its own field: the provider names
   // it separately, and the page only ever shows it fused into a translated label.
@@ -100,22 +105,24 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
  // on the wire. They are handed over here, against the event the agent already holds,
  // and never as a second event: the anti-duplicate rule of the fusion is untouched.
 
- async function deliver(event,delivery_id,retry,submission,authority,observed){
-  await requireAuthority(authority);if(retry&&authority===null){throw new Error('Legacy replay unavailable');}
-  if(retry){
-   const receipt=await bridge({op:'event_receipt',tool,delivery_id,authority});
-   if(receipt?.ok!==true||receipt.delivery_id!==delivery_id){throw new Error('Receipt lookup rejected');}
-   if(receipt.durable===true){
-    if(!receiptID(receipt.id)){throw new Error('Receipt identity absent');}
-   // Attempted once, at the moment the request is observed, and never queued: storing
-   // it would put a conversation identifier in browser storage, which this projection
-   // exists to forbid. Losing it leaves the event as it is today, never worse.
+ async function replayReceipt(delivery_id,submission,authority,observed){
+  const receipt=await bridge({op:'event_receipt',tool,delivery_id,authority});
+  if(receipt?.ok!==true||receipt.delivery_id!==delivery_id){throw new Error('Receipt lookup rejected');}
+  if(receipt.durable===true){
+   if(!receiptID(receipt.id)){throw new Error('Receipt identity absent');}
+   // Completion is attempted once and is never queued: browser storage only holds
+   // the content-free event projection, not the conversation identifier.
    const completion=observed?completionOf(observed):null;
    if(completion){try{await bridge({op:'event_complete',tool,delivery_id,completion,authority});}catch{}}
-   return receipt;}
+   return receipt;
+  }
   if(receipt.durable!==false){throw new Error('Receipt state absent');}
-  if(submission){return receipt;}
+  return submission?receipt:null;
  }
+ async function deliver(event,delivery_id,retry,submission,authority,observed){
+  await requireAuthority(authority);
+  if(retry&&authority===null){throw new Error('Legacy replay unavailable');}
+  if(retry){const receipt=await replayReceipt(delivery_id,submission,authority,observed);if(receipt){return receipt;}}
   const result=await bridge({op:'event_v2',tool,event,delivery_id,authority});
   if(result?.ok!==true||!receiptID(result.id)){throw new Error('Event delivery receipt absent');}
   return result;
@@ -148,6 +155,16 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   if(!/^[a-z0-9.-]{1,253}$/.test(domain)||!domain.includes('.')||domain.endsWith('.local')||domain.endsWith('.internal')||/^[0-9.]+$/.test(domain)){return;}
   const at=Date.now(),observedRevision=revision,observedState=catalogState;if(authority===undefined){authority=await currentAuthority(api);}return change(()=>{observe(at,observedRevision,observedState,authority);if(!health.candidates[domain]&&Object.keys(health.candidates).length>=128){return;}const row=health.candidates[domain]||={domain,signals:[],count:0};row.count=Math.min(1e6,row.count+1);row.signals=[...new Set([...row.signals,...signals])];});
  }
+ async function syncContentScripts(){
+  if(api.scripting&&registeredRevision!==revision){
+   const ids=(await api.scripting.getRegisteredContentScripts()).filter(s=>s.id.startsWith('milvago-detection-')).map(s=>s.id);
+   if(ids.length){await api.scripting.unregisterContentScripts({ids});}
+   const builtins=new Set(api.runtime.getManifest().content_scripts.flatMap(s=>s.matches));
+   const matches=catalog?.providers.flatMap(p=>[...p.domains,...p.aliases].map(d=>'https://'+d+'/*')).filter(m=>!builtins.has(m))||[];
+   if(matches.length){await api.scripting.registerContentScripts([{id:'milvago-detection-catalog',matches,js:['adapters.js','capture.js'],runAt:'document_start',allFrames:false,persistAcrossSessions:false}]);}
+   registeredRevision=revision;for(const tab of await api.tabs.query({})){if(A.resolve(tab.url)){await api.scripting.executeScript({target:{tabId:tab.id},files:['adapters.js','capture.js']}).catch(()=>{});}}
+  }
+ }
  async function refresh(){
   const authority=await currentAuthority(api),answer=await bridge({op:'catalog',tool,authority});await ready;await requireAuthority(authority);
   // This package only looks at the providers it bundles: a larger catalogue
@@ -158,14 +175,7 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   const hash=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(nextCatalog))))).map(v=>v.toString(16).padStart(2,'0')).join('');
   await change(()=>{if(catalogIdentity?.authority===authority&&catalogIdentity.revision===nextRevision&&catalogIdentity.hash!==hash){throw new Error('catalog changed at identical revision');}catalogIdentity={revision:nextRevision,hash,authority};});
   catalog=nextCatalog;revision=nextRevision;catalogState=answer.catalog_state||'missing';excludedDomains=answer.excluded_domains||[];expires=Date.parse(answer.expires_at)||0;A.applyCatalog(served);
-  if(api.scripting&&registeredRevision!==revision){
-   const ids=(await api.scripting.getRegisteredContentScripts()).filter(s=>s.id.startsWith('milvago-detection-')).map(s=>s.id);
-   if(ids.length){await api.scripting.unregisterContentScripts({ids});}
-   const builtins=new Set(api.runtime.getManifest().content_scripts.flatMap(s=>s.matches));
-   const matches=catalog?.providers.flatMap(p=>[...p.domains,...p.aliases].map(d=>'https://'+d+'/*')).filter(m=>!builtins.has(m))||[];
-   if(matches.length){await api.scripting.registerContentScripts([{id:'milvago-detection-catalog',matches,js:['adapters.js','capture.js'],runAt:'document_start',allFrames:false,persistAcrossSessions:false}]);}
-   registeredRevision=revision;for(const tab of await api.tabs.query({})){if(A.resolve(tab.url)){await api.scripting.executeScript({target:{tabId:tab.id},files:['adapters.js','capture.js']}).catch(()=>{});}}
-  }
+  await syncContentScripts();
   await change(()=>{
    if(!getPolicy()?.config.discovery?.enabled){health.candidates={};outbox=outbox.filter(batch=>{if(batch.candidates?.length){drop('candidate_consent_withdrawn',batch);return false;}return true;});}
    const now=Date.now();if(health.start&&(Date.parse(health.start)<now-30*DAY||Date.parse(health.end)>now+60000)){drop('invalid_observation_window',health);health=emptyHealth();}outbox=outbox.filter(batch=>{if(Date.parse(batch.window_start)<now-30*DAY||Date.parse(batch.window_end)>now+60000){drop('invalid_observation_window',batch);return false;}return true;});
@@ -204,10 +214,8 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   if(Date.now()-entry.at>TAB_TTL){seenByTab.delete(tabId);return null;}
   return entry;
  }
- async function dom(event,sender,input){
-  await ready;await pendingReady;const id=A.resolve(sender.url)?.id;if(!id){return {ok:false};}
-  const observed=recall(sender.tab?.id,event.provider);
-  if(observed){
+ function enrichResponse(event,observed){
+  if(!observed||event.kind!=='response'){return;}
    // Only the response: it is the one event guaranteed to be emitted after its own
    // request was seen. A prompt is recorded before the request leaves, so attaching
    // what the tab last said would attribute it to the previous exchange. The
@@ -217,9 +225,20 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
    // cross-conversation mix-up this chain exists to avoid. That prompt keeps its link
    // through the correlation it shares with the navigation that follows, which does
    // carry the identifier because the document reports its live URL.
-   if(event.kind==='response'){if(observed.model){event.model=observed.model;}if(observed.effort){event.effort=observed.effort;}if(!event.conversation_id&&observed.conversation_id){event.conversation_id=observed.conversation_id;}}
-  }
-  const authority=await currentAuthority(api);let metric='prompts_dom';if(event.kind==='navigation'){metric='navigations';}else if(event.kind==='response'){metric='responses_dom';}await count(id,metric,revision,catalogState,authority);
+  if(observed.model){event.model=observed.model;}
+  if(observed.effort){event.effort=observed.effort;}
+  if(!event.conversation_id&&observed.conversation_id){event.conversation_id=observed.conversation_id;}
+ }
+ function metricFor(kind){
+  if(kind==='navigation'){return 'navigations';}
+  if(kind==='response'){return 'responses_dom';}
+  return 'prompts_dom';
+ }
+ async function dom(event,sender,input){
+  await ready;await pendingReady;const id=A.resolve(sender.url)?.id;if(!id){return {ok:false};}
+  enrichResponse(event,recall(sender.tab?.id,event.provider));
+  const authority=await currentAuthority(api);
+  await count(id,metricFor(event.kind),revision,catalogState,authority);
   event.catalog_revision=revision;
   const digest=typeof input?.fingerprint==='string'&&/^[0-9a-f]{64}$/.test(input.fingerprint)?input.fingerprint:null;
   const paired=event.kind==='prompt'&&event.action==='observed'&&digest&&catalog?.providers.some(p=>p.id===id&&p.network.length);
@@ -227,6 +246,52 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   if(captureId!==undefined&&!receiptID(captureId)){throw new Error('Invalid capture identity');}
   const delivery_id=await fusion.add(event,senderIdentity(sender),digest,'dom',!paired,authority,captureId);
   schedule();return {ok:true,delivery_id};
+ }
+ async function resumeNetworkReceipt(event,hit,entry,provider){
+  if(!hit.fingerprint){return false;}
+  const options={frameId:entry.details.frameId||0};
+  if(entry.details.documentId){options.documentId=entry.details.documentId;}
+  const receipt=await api.tabs.sendMessage(entry.details.tabId,{type:'detection-receipt',fingerprint:hit.fingerprint},options);
+  if(receipt?.ok!==true||!(receipt.delivery_id===null||receiptID(receipt.delivery_id))){throw new Error('Document receipt unavailable');}
+  if(!receipt.delivery_id){return false;}
+  if(!validAuthority(receipt.authority)){throw new Error('Document receipt authority unavailable');}
+  await fusion.resume(event,identity(entry.details,provider.id),receipt.delivery_id,receipt.authority);
+  return true;
+ }
+ function networkEvent(hit,provider,policy,entry){
+  const event={provider:provider.domains[0],url:'https://'+provider.domains[0]+'/',source:'browser',tool,kind:'prompt',action:'observed',characters:hit.characters,characters_known:hit.characters_known,labels:[],policy_revision:policy.revision,catalog_revision:entry.catalogRevision};
+  if(hit.body_bytes!==null){event.body_bytes=hit.body_bytes;}
+  if(hit.model){event.model=hit.model;}
+  if(hit.effort){event.effort=hit.effort;}
+  if(hit.conversation_id){event.conversation_id=hit.conversation_id;}
+  // Attached file names only travel when the signed policy asks for them.
+  if(hit.files?.length&&policy.config.collection.store_file_names){event.files=hit.files;}
+  return event;
+ }
+ async function deliverNetworkHit(hit,entry,authority){
+  const policy=getPolicy(),provider=hit.provider;
+  if(policy?.revision!==entry.policyRevision||!policy.config.collection.enabled||!policy.config.services.some(s=>s.enabled&&s.domains.includes(provider.domains[0]))){return;}
+  await count(provider.id,'prompts_network',entry.catalogRevision,entry.catalogState,authority);
+  const event=networkEvent(hit,provider,policy,entry);
+  // The exchange named itself; the response of this tab will carry it too.
+  remember(entry.details.tabId,provider.domains[0],hit);
+  if(await resumeNetworkReceipt(event,hit,entry,provider)){return;}
+  await fusion.add(event,identity(entry.details,provider.id),hit.fingerprint,'network',false,authority);
+  schedule();
+ }
+ async function deliverObserved(hit,entry,mime){
+  await ready;await pendingReady;
+  if(!hit){return;}
+  const bound=await entry.authority;
+  if(bound.failed){throw new Error('Observation authority unavailable');}
+  const authority=bound.value;await requireAuthority(authority);
+  if(hit.candidate){
+   const signals=[...hit.signals];
+   if(mime==='text/event-stream'){signals.push('sse');}
+   if(signals.length){await candidate(hit.candidate,signals,authority);}
+   return;
+  }
+  await deliverNetworkHit(hit,entry,authority);
  }
  try{api.webRequest?.onBeforeRequest?.addListener(details=>{
   const policy=getPolicy();if(!policy||Date.parse(policy.expires_at)<=Date.now()||!policy.config.collection.enabled||details.tabId<0){return;}
@@ -248,27 +313,7 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   const entry=requests.get(details.requestId);if(!entry){return;}
   if(details.statusCode<200||details.statusCode>=300){requests.delete(details.requestId);return;}
   const mime=(details.responseHeaders||[]).find(h=>h.name.toLowerCase()==='content-type')?.value?.split(';')[0]?.trim().toLowerCase();
-  void entry.work.then(async hit=>{await ready;await pendingReady;
-   if(!hit){return;}const bound=await entry.authority;if(bound.failed){throw new Error('Observation authority unavailable');}const authority=bound.value;await requireAuthority(authority);
-   if(hit.candidate){const signals=[...hit.signals];if(mime==='text/event-stream'){signals.push('sse');}if(signals.length){await candidate(hit.candidate,signals,authority);}return;}
-   const policy=getPolicy(),provider=hit.provider;
-   if(policy?.revision!==entry.policyRevision||!policy.config.collection.enabled||!policy.config.services.some(s=>s.enabled&&s.domains.includes(provider.domains[0]))){return;}
-   await count(provider.id,'prompts_network',entry.catalogRevision,entry.catalogState,authority);
-   const event={provider:provider.domains[0],url:'https://'+provider.domains[0]+'/',source:'browser',tool,kind:'prompt',action:'observed',characters:hit.characters,characters_known:hit.characters_known,labels:[],policy_revision:policy.revision,catalog_revision:entry.catalogRevision};
-   if(hit.body_bytes!==null){event.body_bytes=hit.body_bytes;}if(hit.model){event.model=hit.model;}if(hit.effort){event.effort=hit.effort;}if(hit.conversation_id){event.conversation_id=hit.conversation_id;}
-   // Attached file names only travel if the signed policy asks for them,
-   // exactly as on the DOM path: the request proposes, the policy decides.
-   if(hit.files?.length&&policy.config.collection.store_file_names){event.files=hit.files;}
-    // The exchange named itself; the response of this tab will carry it too.
-    remember(entry.details.tabId,provider.domains[0],hit);
-   if(hit.fingerprint){
-    const options={frameId:entry.details.frameId||0};if(entry.details.documentId){options.documentId=entry.details.documentId;}
-    const receipt=await api.tabs.sendMessage(entry.details.tabId,{type:'detection-receipt',fingerprint:hit.fingerprint},options);
-    if(receipt?.ok!==true||!(receipt.delivery_id===null||receiptID(receipt.delivery_id))){throw new Error('Document receipt unavailable');}
-    if(receipt.delivery_id){if(!validAuthority(receipt.authority)){throw new Error('Document receipt authority unavailable');}await fusion.resume(event,identity(entry.details,provider.id),receipt.delivery_id,receipt.authority);return;}
-   }
-   await fusion.add(event,identity(entry.details,provider.id),hit.fingerprint,'network',false,authority);schedule();
-  }).catch(()=>{});
+  void entry.work.then(hit=>deliverObserved(hit,entry,mime)).catch(()=>{});
   requests.delete(details.requestId);
  },{urls:['<all_urls>']},['responseHeaders']);
  // Presence: a platform the catalogue NAMES without covering it. The worker compares
