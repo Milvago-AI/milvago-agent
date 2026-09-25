@@ -3,7 +3,7 @@ import {webcrypto} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {JSDOM} from 'jsdom';
-import fileListUtils from 'jsdom/lib/jsdom/living/generated/utils.js';
+import fileListUtils from 'jsdom/lib/generated/idl/utils.js';
 import './adapters.js';
 import './capture.js';
 import {eventForPolicy,networkRules,providers} from './policy.js';
@@ -237,7 +237,8 @@ test('refused final upload never dispatches the selected FileList',async()=>{
 test('policy changed while durable prompt is pending never replays',async()=>{
  let finish;const gate=new Promise(resolve=>finish=resolve);
  const f=await fixture('chatgpt',undefined,false,()=>gate);try{
-  const sending=f.controller.handle(trusted('click',f.button));await delay(10);
+  const sending=f.controller.handle(trusted('click',f.button));
+  for(let i=0;i<100&&!f.messages.some(m=>m.type==='submit');i++)await delay(10);
   assert.equal(f.messages.filter(m=>m.type==='submit').length,1);f.config.revision++;
   finish({ok:true,action:'observe',text:'Synthetic prompt',durable:true,recording_required:true,authority:null,delivery_id:'00000000-0000-4000-8000-000000000001'});await sending;
   assert.equal(f.submissionCount(),0);assert.equal(A.read(f.editor),'Synthetic prompt');
