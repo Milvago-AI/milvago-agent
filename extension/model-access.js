@@ -1,8 +1,8 @@
 import './adapters.js';
 // The per-model decision lives in model-rules.js so the Community package can swap
 // it for a stub. Everything below is shared by both editions and must stay here.
-import { modelDecision, modelRulesValid, requestBodyJSON, requestModel, ruleFor } from './model-rules.js';
-export { modelDecision, modelRulesValid, requestBodyJSON, requestModel, ruleFor };
+import { modelDecision, modelRulesValid, requestModel, ruleFor } from './model-rules.js';
+export { modelDecision, modelRulesValid, requestModel, ruleFor };
 export const apiHosts={'api.openai.com':'chatgpt','api.anthropic.com':'claude'};
 // The hostname without its trailing dot: `api.anthropic.com.` reaches the same server, and an
 // exact comparison let it slip past every guard.
@@ -23,6 +23,12 @@ export function strictJSON(text,limit=131072){
   depth--;
  }
  value();ws();if(at!==text.length){throw Error('trailing');}return JSON.parse(text);
+}
+export function requestBodyJSON(details){ try{
+  let length=0;for(const part of details.requestBody.raw){if(!part.bytes||part.file){return null;}length+=part.bytes.byteLength;if(length>131072){return null;}}
+  const bytes=new Uint8Array(length);let offset=0;for(const part of details.requestBody.raw){bytes.set(new Uint8Array(part.bytes),offset);offset+=part.bytes.byteLength;}
+  return strictJSON(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+ }catch{return null;}
 }
 function urlOf(value){try{const u=new URL(value);return ['https:','wss:'].includes(u.protocol)&&!u.username&&!u.password&&!u.port?u:null;}catch{return null;}}
 export function networkPlatform(value){let u;try{u=new URL(value);if(!['https:','http:','wss:','ws:'].includes(u.protocol)){return null;}}catch{return null;}if(apiHosts[hostOf(u)]){return globalThis.MilvagoAdapters.adapters.find(a=>a.id===apiHosts[hostOf(u)]);}u.protocol='https:';u.username='';u.password='';u.port='';return globalThis.MilvagoAdapters.resolve(u.href);}

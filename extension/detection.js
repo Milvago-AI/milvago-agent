@@ -269,7 +269,7 @@ export class Fusion {
  acknowledge(id){return this.run(async()=>{await this.commit(this.pending.filter(p=>p.id!==id));this.inflight.delete(id);});}
  release(id){this.inflight.delete(id);}
  has(identity,source){return this.pending.some(p=>p.identity===identity&&p.source===source);}
- retain(keep){return this.run(async()=>{await this.commit(this.pending.filter(keep));});}
+ retain(keep){return this.run(async()=>{await this.commit(this.pending.filter(entry=>keep(entry)));});}
  resume(event,identity,id,authority=null){return this.run(async()=>{
   if(!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)){throw new Error('Invalid delivery receipt');}
   let entry=this.pending.find(p=>p.id===id);if(entry&&entry.authority!==authority){throw new Error('Pending receipt authority changed');}
