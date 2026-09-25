@@ -1,6 +1,6 @@
 [package]
 name = "milvago-browser-agent"
-version = "0.5.50"
+version = "0.5.51"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -13,18 +13,18 @@ model-control = []
 enterprise-extension = []
 
 [dependencies]
-aes-gcm = "=0.10.3"
+aes-gcm = "=0.11.1"
 milvago-browser-engine = { path = "browser-engine", default-features = false }
-base64 = "=0.22.1"
+base64 = "=0.23.1"
 chrono = { version = "=0.4.45", features = ["serde"] }
-ed25519-dalek = "=2.2.0"
+ed25519-dalek = "=3.0.0"
 fs2 = "=0.4.3"
 rand = "=0.8.8"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"
-toml = "=0.8.23"
-uuid = { version = "=1.26.0", features = ["v4", "serde"] }
+toml = "=1.1.6"
+uuid = { version = "=1.26.1", features = ["v4", "serde"] }
 zeroize = "=1.9.0"
 regex = "=1.13.1"
 unicode-normalization = "=0.1.25"

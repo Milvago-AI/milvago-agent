@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Milvago Browser",
-  "version": "0.5.46",
+  "version": "0.5.47",
   "description": "Politiques navigateur Milvago. Aucune analyse des applications du poste.",
   "storage": {
     "managed_schema": "managed-schema.json"
