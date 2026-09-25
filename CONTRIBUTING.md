@@ -26,6 +26,10 @@ node extension/build-editions.js && node scripts/verify-community-package.mjs
 Windows and Linux do not compile the same code (`#[cfg(windows)]` / `#[cfg(unix)]`): CI runs
 both, and a change to platform code is only done when both are green.
 
+On Linux, the integration tests that start a real agent need root: its IPC socket lives in
+`/run/milvago`, created by the systemd unit in production. Run them with
+`sudo -E env "PATH=$PATH" cargo test`, or in a container.
+
 A pull request that changes behavior comes with a test that fails without it. A test whose
 only proof is a zero exit code proves nothing: assert on what the code actually produced.
 

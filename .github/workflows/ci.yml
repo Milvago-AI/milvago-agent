@@ -28,6 +28,11 @@ jobs:
         with:
           toolchain: 1.94.1
       - run: cargo test --locked
+        if: runner.os == 'Windows'
+      # On Linux the agent's IPC socket lives in /run/milvago, which the systemd unit creates as
+      # root in production: the integration tests that start a real agent need root as well.
+      - run: sudo -E env "PATH=$PATH" cargo test --locked
+        if: runner.os == 'Linux'
       - run: cargo test --locked --manifest-path browser-engine/Cargo.toml
       # A release build without the signed extension packages, as a contributor would make it.
       - run: cargo build --release --locked
