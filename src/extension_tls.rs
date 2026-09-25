@@ -85,6 +85,10 @@ fn generate() -> Result<Identity> {
 
 fn load(home: &Path) -> Result<Identity> {
     let file = home.join("identity.bin");
+    // Prevent path traversal attacks by rejecting paths containing '..'.
+    if file.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err(format!("Invalid input: {}", file.display()).into());
+    }
     plain_path(&file)?;
     if fs::metadata(&file)?.len() > 65536 { return Err("TLS identity too large".into()); }
     let mut plaintext = crate::os_wrap(&fs::read(file)?, false)?;
