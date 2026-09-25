@@ -17,7 +17,7 @@ members = ["."]
 libfuzzer-sys = "=0.4.13"
 serde_json = "=1.0.151"
 base64 = "=0.22.1"
-ed25519-dalek = "=2.2.0"
+ed25519-dalek = "=3.0.0"
 milvago-browser-agent = { path = ".." }
 milvago-browser-engine = { path = "../browser-engine", default-features = false }
 
