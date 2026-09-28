@@ -105,7 +105,7 @@ pub fn public_pin(edition: &str) -> Result<Pin> {
 }
 /// Installer-only setup after it established the directory and registry ACLs.
 /// Missing files after initialization are refused, including during MSI repair.
-pub fn initialize_msi(edition: &str, package: &Path) -> Result<()> {
+pub fn initialize_msi(edition: &str, package: &Path, replace_foreign: bool) -> Result<()> {
     let bytes = crate::bootstrap::msi_provision(package)?;
     if serde_json::from_slice::<Value>(&bytes)? == json!({}) {
         // A generic update package carries no organization. The release anchor then
@@ -121,10 +121,10 @@ pub fn initialize_msi(edition: &str, package: &Path) -> Result<()> {
         }
         if windows::initialized(edition, false)? {
             let pin = public_pin(edition)?;
-            return initialize(edition, &pin.origin, &pin.organization_anchor);
+            return initialize(edition, &pin.origin, &pin.organization_anchor, false);
         }
         if let Some(provision) = previous_organization(edition)? {
-            return initialize(edition, &provision.server_url, &provision.policy_public_key);
+            return initialize(edition, &provision.server_url, &provision.policy_public_key, false);
         }
         // Upgrading a legacy generic package cannot manufacture an organization
         // anchor. Connected operation remains available; an organization MSI is
@@ -132,20 +132,20 @@ pub fn initialize_msi(edition: &str, package: &Path) -> Result<()> {
         eprintln!("Milvago browser cache requires an organization-provisioned MSI.");
         return Ok(());
     }
-    initialize_provision(edition, &bytes)
+    initialize_provision(edition, &bytes, replace_foreign)
 }
 
-pub fn initialize_file(edition: &str, file: &Path) -> Result<()> {
+pub fn initialize_file(edition: &str, file: &Path, replace_foreign: bool) -> Result<()> {
     use std::io::Read;
     let mut bytes = Vec::new();
     File::open(file)?.take(16385).read_to_end(&mut bytes)?;
     if bytes.len() > 16384 {
         return Err("cache provisioning too large".into());
     }
-    initialize_provision(edition, &bytes)
+    initialize_provision(edition, &bytes, replace_foreign)
 }
 
-fn initialize_provision(edition: &str, bytes: &[u8]) -> Result<()> {
+fn initialize_provision(edition: &str, bytes: &[u8], replace_foreign: bool) -> Result<()> {
     let provision: crate::bootstrap::InstallerProvision = serde_json::from_slice(bytes)?;
     provision.validate(edition)?;
     if provision.edition != edition || provision.platform != "windows" {
@@ -158,24 +158,37 @@ fn initialize_provision(edition: &str, bytes: &[u8]) -> Result<()> {
         update_public_key: provision.update_public_key.clone(),
         server_url: provision.server_url.clone(),
     })?;
-    initialize(edition, &provision.server_url, &provision.policy_public_key)
+    initialize(edition, &provision.server_url, &provision.policy_public_key, replace_foreign)
 }
-pub fn initialize(edition: &str, origin: &str, anchor: &str) -> Result<()> {
+/// `replace_foreign` is the installer's fresh-installation signal, as for the machine
+/// identity: a pin of the *same* instance and organization is always kept, so
+/// reinstalling never buys a new offline grace period. A pin left by an earlier,
+/// since removed, installation for another instance or organization is replaced
+/// only under this flag. Upgrades and repairs never pass it.
+pub fn initialize(edition: &str, origin: &str, anchor: &str, replace_foreign: bool) -> Result<()> {
     let root = windows::root(edition)?;
     let public = Directory::open(&root, false)?;
     let private = Directory::open(&root.join("private"), true)?;
-    if windows::initialized(edition, false)? {
+    let initialized = windows::initialized(edition, false)?;
+    if initialized {
         let pin = public_pin(edition)?;
-        if pin.origin != origin || pin.organization_anchor != anchor {
+        if pin.origin == origin && pin.organization_anchor == anchor {
+            // The running updater owns the mutable journal during MSI. Reinstallation
+            // verifies only the immutable protected pin and never recreates state,
+            // waits on its lock, or resets a lease while that process is alive.
+            return Ok(());
+        }
+        if !replace_foreign {
             return Err("cache installation identity changed".into());
         }
-        // The running updater owns the mutable journal during MSI. Reinstallation
-        // verifies only the immutable protected pin and never recreates state,
-        // waits on its lock, or resets a lease while that process is alive.
-        return Ok(());
+        // The lock below is not waited on: a live updater still holding the old
+        // cache makes this fail instead of replacing state under it. The new state
+        // and pin overwrite the old files; a leftover snapshot of the old pin can
+        // never decode against the new one.
+        eprintln!("Milvago: the browser cache pinned to {} is replaced by this fresh installation.", pin.origin);
     }
     let _lock = private.lock()?;
-    if root.join("anchor.json").exists() || root.join("private/state.bin").exists() {
+    if !initialized && (root.join("anchor.json").exists() || root.join("private/state.bin").exists()) {
         return Err("orphan cache state refused".into());
     }
     // Set the non-transactional tombstone first. Interrupted initialization must
