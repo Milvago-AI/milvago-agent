@@ -132,7 +132,22 @@ pub fn initialize_msi(edition: &str, package: &Path) -> Result<()> {
         eprintln!("Milvago browser cache requires an organization-provisioned MSI.");
         return Ok(());
     }
-    let provision: crate::bootstrap::InstallerProvision = serde_json::from_slice(&bytes)?;
+    initialize_provision(edition, &bytes)
+}
+
+pub fn initialize_file(edition: &str, file: &Path) -> Result<()> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    File::open(file)?.take(16385).read_to_end(&mut bytes)?;
+    if bytes.len() > 16384 {
+        return Err("cache provisioning too large".into());
+    }
+    initialize_provision(edition, &bytes)
+}
+
+fn initialize_provision(edition: &str, bytes: &[u8]) -> Result<()> {
+    let provision: crate::bootstrap::InstallerProvision = serde_json::from_slice(bytes)?;
+    provision.validate(edition)?;
     if provision.edition != edition || provision.platform != "windows" {
         return Err("MSI cache identity mismatch".into());
     }

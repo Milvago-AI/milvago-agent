@@ -190,9 +190,18 @@ fn run() -> Result<()> {
     }
     let op = args.first().map(String::as_str).unwrap_or("help");
     #[cfg(windows)]
-    if op == "validate-msi" {
+    if op == "validate-msi" || op == "validate-json" {
         let path = Path::new(args.get(1).ok_or("package required")?);
-        let bytes = milvago_browser_agent::bootstrap::msi_provision(path)?;
+        let bytes = if op == "validate-msi" {
+            milvago_browser_agent::bootstrap::msi_provision(path)?
+        } else {
+            let file = std::fs::File::open(path)?;
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.take(16385).read_to_end(&mut bytes)?;
+            if bytes.len() > 16384 { return Err("provisioning file too large".into()); }
+            bytes
+        };
         milvago_browser_agent::bootstrap::validate_organization_package(&bytes, "community")?;
         return Ok(());
     }

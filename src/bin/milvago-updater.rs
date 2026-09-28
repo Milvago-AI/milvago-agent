@@ -116,6 +116,8 @@ fn main() {
         .is_ok_and(|outcome| outcome.is_success()),
         #[cfg(windows)]
         "prepare-cache-msi" if args.len() == 3 => milvago_browser_agent::cache_service::initialize_msi(&args[1], Path::new(&args[2])).is_ok(),
+        #[cfg(windows)]
+        "prepare-cache-file" if args.len() == 3 => milvago_browser_agent::cache_service::initialize_file(&args[1], Path::new(&args[2])).is_ok(),
         // Same work as the service body, for diagnosis from an elevated prompt.
         "apply-now" if args.len() == 4 => {
             apply_now(Path::new(&args[1]), Path::new(&args[2]), &args[3], true)
