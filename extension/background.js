@@ -3,7 +3,7 @@ import {detectionRuntime} from './detection-runtime.js';
 import {trustedProvider,networkRules,validPolicy,eventForPolicy,detectTool} from './policy.js';
 import {apiHosts,hostOf,networkPlatform,ownedPlatform,requestDecision,requestModel,modelDecision,contentControl,ruleFor} from './model-access.js';
 import {wireFacts} from './detection.js';
-import {modelObservation} from './model-rules.js';
+import {modelObservation,keptWhenSealed,blockedTab} from './model-rules.js';
 const api=globalThis.browser||chrome,host='app.milvago.browser';
 const tool=detectTool(globalThis.navigator);
 // Product decision of 2026-09-22: two consecutive refreshes lost to
@@ -94,8 +94,8 @@ async function flagSeal(failed){if(sealFlagged===failed){return;}try{await api.s
 // replayed on every refresh. The removal names both the rules already in place AND the ones being
 // set: a set replayed against itself has nothing to contest. A failure does not block the queue.
 let dnrQueue=Promise.resolve();
-function replaceDynamicRules(rules){
- const run=dnrQueue.then(async()=>{const previous=await api.declarativeNetRequest.getDynamicRules();await api.declarativeNetRequest.updateDynamicRules({removeRuleIds:[...new Set([...previous.map(r=>r.id),...rules.map(r=>r.id)])],addRules:rules});});
+function replaceDynamicRules(rules,keep=()=>false){
+ const run=dnrQueue.then(async()=>{const previous=await api.declarativeNetRequest.getDynamicRules();const kept=previous.filter(keep).filter(r=>!rules.some(x=>x.id===r.id));await api.declarativeNetRequest.updateDynamicRules({removeRuleIds:[...new Set([...previous.map(r=>r.id),...rules.map(r=>r.id)])],addRules:[...rules,...kept]});});
  dnrQueue=run.catch(()=>{});
  return run;
 }
@@ -104,7 +104,7 @@ function replaceDynamicRules(rules){
 let sealing=null;
 function sealDnr(){
  if(sealing){return sealing;}
- sealing=replaceDynamicRules(closedRules()).then(()=>flagSeal(false),()=>flagSeal(true)).finally(()=>{sealing=null;});
+ sealing=replaceDynamicRules(closedRules(),keptWhenSealed).then(()=>flagSeal(false),()=>flagSeal(true)).finally(()=>{sealing=null;});
  return sealing;
 }
 // `managed` follows the last adopted response: the managed pin is the only proof that
@@ -291,6 +291,21 @@ async function reloadCovered(match){
  if(!api.tabs){return;}
  for(const tab of await api.tabs.query({})){const platform=networkPlatform(tab.url);if(platform&&match(platform)){await api.tabs.reload(tab.id,{bypassCache:true}).catch(()=>{});}}
 }
+async function reconcileOpenTabs(previousPolicy,active){
+ // A tab already open on a newly blocked platform keeps its page until reloaded.
+ if(JSON.stringify(previousPolicy?.config?.blocked_platforms)!==JSON.stringify(active.config.blocked_platforms)&&api.tabs){
+  for(const tab of await api.tabs.query({})){if(blockedTab(active,tab.url)){await closeBlockedTab(tab.id);}}
+ }
+ const changed=JSON.stringify(previousPolicy?.config?.model_access)!==JSON.stringify(active.config.model_access);
+ const contentChanged=contentControl(active)&&JSON.stringify([previousPolicy?.config?.privacy,previousPolicy?.config?.protection])!==JSON.stringify([active.config.privacy,active.config.protection]);
+ // Reload closes page-owned streams; service-worker/persistent transports are
+ // still unqualified, so content_control must never report complete coverage.
+ if(contentChanged){await reloadCovered(()=>true);}
+ else if(changed&&(active.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')){await reloadCovered(a=>!!ruleFor(active,a.id));}
+}
+function policyStatus(active,online){
+ return {status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online,managed,revision:active.revision,expires_at:active.expires_at,content_control:contentControl(active)?'unavailable':'off',content_control_reason:(()=>{if(!contentControl(active)){return null;}if(blocking){return 'unverified_web_transport';}return 'managed_extension_required';})(),model_control:(active.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}};
+}
 async function updatePolicy(){
  // The browser travels with the poll so the agent knows which extensions are still
  // running: a user who disables one must not simply vanish from the console.
@@ -305,14 +320,9 @@ async function updatePolicy(){
  if(mode==='blocked'){throw new Error('Broker blocked');}
  await replaceDynamicRules([...networkRules(policy),...fallbackRules(policy)]);
  await flagSeal(false);
- const changed=JSON.stringify(previousPolicy?.config?.model_access)!==JSON.stringify(policy.config.model_access);
- const contentChanged=contentControl(policy)&&JSON.stringify([previousPolicy?.config?.privacy,previousPolicy?.config?.protection])!==JSON.stringify([policy.config.privacy,policy.config.protection]);
- // Reload closes page-owned streams; service-worker/persistent transports are
- // still unqualified, so content_control must never report complete coverage.
- if(contentChanged){await reloadCovered(()=>true);}
- else if(changed&&(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')){await reloadCovered(a=>!!ruleFor(policy,a.id));}
+ await reconcileOpenTabs(previousPolicy,policy);
  await report(policy).catch(()=>{});
- await api.storage.local.set({status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online:answer.online,managed,revision:policy.revision,expires_at:policy.expires_at,content_control:contentControl(policy)?'unavailable':'off',content_control_reason:(()=>{if(!contentControl(policy)){return null;}if(blocking){return 'unverified_web_transport';}return 'managed_extension_required';})(),model_control:(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}});
+ await api.storage.local.set(policyStatus(policy,answer.online));
  refreshedAt=performance.now();
   }
 async function handleRefreshFailure(error){
@@ -338,6 +348,13 @@ async function currentPolicy(){if(!(performance.now()-refreshedAt<REUSE_MS&&auth
 api.runtime.onInstalled.addListener(details=>{api.alarms.create('policy',{periodInMinutes:0.5});void (async()=>{await refresh();if(details?.reason==='update'){await reloadCovered(()=>true);}})();});
 api.runtime.onStartup.addListener(()=>{api.alarms.create('policy',{periodInMinutes:0.5});void refresh();});
 api.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='policy'){void refresh();}});
+// A single-page app moves to a blocked path with pushState, which no request rule sees.
+// Chrome replaces the page with its error page when the reload is blocked. Firefox
+// treats a blocked navigation as cancelled and keeps the page on screen, so the tab is
+// sent to about:blank, which is what Firefox shows for any blocked navigation (measured).
+// Neither keeps a blocked URL that would fire this again.
+function closeBlockedTab(tabId){return (tool==='firefox'?api.tabs.update(tabId,{url:'about:blank'}):api.tabs.reload(tabId)).catch(()=>{});}
+api.tabs?.onUpdated?.addListener((tabId,change)=>{if(change.url&&policy&&blockedTab(policy,change.url)){void closeBlockedTab(tabId);}});
 async function inspectMessage(message,sender,provider,active){
     if(typeof message.text!=='string'||new TextEncoder().encode(message.text).length>32768||typeof message.upload!=='boolean'){return {ok:false};}
     // Without a managed pin, NEVER send text to the agent: nothing proves it is

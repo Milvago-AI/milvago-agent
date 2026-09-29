@@ -4,7 +4,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
 
 permissions:
@@ -67,6 +67,22 @@ jobs:
           node-version: '26.9.0'
           cache: npm
           cache-dependency-path: extension/package-lock.json
+      - name: Require matching agent and extension versions
+        run: |
+          node --input-type=module <<'NODE'
+          import {readFileSync} from 'node:fs';
+          import assert from 'node:assert/strict';
+          const read = name => readFileSync(name, 'utf8');
+          const version = read('Cargo.toml').match(/^version = "([0-9]+\.[0-9]+\.[0-9]+)"$/m)?.[1];
+          assert.ok(version, 'Agent version is missing');
+          for (const name of ['manifest.json', 'package.json', 'package-lock.json']) {
+            const manifest = JSON.parse(read('extension/' + name));
+            assert.equal(manifest.version, version, name);
+            if (manifest.packages) assert.equal(manifest.packages[''].version, version, 'lock package');
+          }
+          assert.equal(read('extension/firefox-version.txt').trim(), version, 'Firefox version');
+          console.log('Agent and extension versions match: ' + version);
+          NODE
       - run: npm ci --ignore-scripts
         working-directory: extension
       - run: npm test

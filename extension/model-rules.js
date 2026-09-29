@@ -27,3 +27,8 @@ export function requestModel(){return null;}
  * above stays absent from this package.
  */
 export const modelObservation=true;
+/** Blocking a known platform is Enterprise: this build never installs such a rule. */
+export function blockedPlatform(){return false;}
+export function platformBlockRules(){return [];}
+export function keptWhenSealed(){return false;}
+export function blockedTab(){return false;}

@@ -138,6 +138,8 @@ fn browser_config(config: &Value, edition: &str) -> Result<Value> {
     if edition=="commercial" {
         out["model_access"]=Value::Array(config["model_access"].as_array().into_iter().flatten()
             .filter(|rule|rule["channel"]=="browser").cloned().collect());
+        // Offline too: a blocked platform must stay blocked while the server is unreachable.
+        if let Some(blocked)=config.get("blocked_platforms") { out["blocked_platforms"]=blocked.clone(); }
     } else if config["model_access"].as_array().is_some_and(|rules|!rules.is_empty()) {
         return Err("foreign edition policy".into());
     }
@@ -209,6 +211,13 @@ mod tests {
             edition:"community".into(),origin:"https://example.test".into(),organization_anchor:keys.public(),signing_key:keys.public()}).unwrap();
         state.cache=Some(SealedCache{aad:String::new(),nonce:String::new(),ciphertext:String::new()});
         state.recovered(&uuid::Uuid::new_v4().to_string(),100).unwrap();state
+    }
+    // Offline, an Enterprise blocked platform stays blocked; a Community cache never keeps one.
+    #[test]
+    fn the_offline_document_keeps_blocked_platforms_in_enterprise_only() {
+        let config=serde_json::json!({"services":[],"collection":{"enabled":true},"blocked_platforms":[{"id":"mammouth","domains":["mammouth.ai"]}]});
+        assert!(browser_config(&config,"commercial").unwrap().get("blocked_platforms").is_some());
+        assert!(browser_config(&config,"community").unwrap().get("blocked_platforms").is_none());
     }
     #[test]
     fn idle_time_does_not_consume_grace_and_repeated_failures_never_extend_it() {

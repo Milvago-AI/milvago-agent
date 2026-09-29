@@ -202,7 +202,7 @@ fn version(v: &str) -> Option<Vec<u32>> {
         .collect::<std::result::Result<Vec<_>, _>>()
         .ok()
 }
-fn path(v: &str) -> bool {
+pub(crate) fn path(v: &str) -> bool {
     v.is_empty()
         || (v.starts_with('/')
             && v.len() <= 256
@@ -230,7 +230,7 @@ fn json_path(v: &str) -> bool {
 // Provider ids and heuristic keys share Go's stricter detectionID grammar
 // (lowercase-start, then lowercase/digit/dot/underscore/hyphen only) rather than
 // the more permissive version-string token() grammar, which also allows uppercase.
-fn identifier(v: &str) -> bool {
+pub(crate) fn identifier(v: &str) -> bool {
     let mut bytes = v.bytes();
     match bytes.next() {
         Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit() => {}

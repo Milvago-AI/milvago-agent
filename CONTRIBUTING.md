@@ -14,6 +14,12 @@ you have the right to submit the work under that license — the
 
 ## Before opening a pull request
 
+The repositories are private and use GitHub Free. Development work is pushed to `dev`. Open a
+pull request from `dev` to `main` only after CI is green; a maintainer must explicitly approve
+the merge. GitHub Free cannot enforce branch protections for private repositories, so this is a
+review procedure. Contributors without write access cannot push branches to these repositories.
+
+
 Run what your change touches, on the platform it affects:
 
 ```
@@ -49,3 +55,10 @@ only proof is a zero exit code proves nothing: assert on what the code actually 
 
 Open an issue with the version or commit, the system and browser, what you did, what happened
 and what you expected. For anything with a security dimension, follow `SECURITY.md` instead.
+
+## Release version
+
+The release pipeline is prepared but has not published `v0.6.4`. Agent and browser extension
+artifacts share version `0.6.4` across both editions and all supported browsers. The pipeline
+signs the Windows and Linux packages with Ed25519; the Windows MSI has no Authenticode publisher
+signature yet.

@@ -49,6 +49,12 @@ pub(crate) fn browser_policy(policy: &crate::shadow::ShadowPolicy) -> Value {
             out[key] = value.clone();
         }
     }
+    // Blocking a known platform is Enterprise: a Community agent never hands a list on.
+    if cfg!(feature = "enterprise-extension") {
+        if let Some(value) = config.get("blocked_platforms") {
+            out["blocked_platforms"] = value.clone();
+        }
+    }
     let protection = &config["protection"];
     let keywords = protection["keywords"].as_array().map_or(0, Vec::len);
     out["protection"] = json!({
@@ -352,6 +358,18 @@ mod tests {
         assert!(require_system_broker("policy_v3", &request).is_ok());
         let system = json!({"caller":{"system":true}});
         assert!(require_system_broker("broker_prepare_event", &system).is_ok());
+    }
+
+    // Blocking a known platform is Enterprise: only an agent built with the Enterprise
+    // extension hands the list on; a Community agent drops it whatever the server sent.
+    #[test]
+    fn browser_answer_carries_blocked_platforms_in_enterprise_only() {
+        let out = browser_policy(&policy(json!({
+            "collection": {"enabled": true},
+            "services": [],
+            "blocked_platforms": [{"id": "mammouth", "domains": ["mammouth.ai"]}]
+        })));
+        assert_eq!(out["config"].get("blocked_platforms").is_some(), cfg!(feature = "enterprise-extension"));
     }
 
     #[test]

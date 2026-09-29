@@ -1,7 +1,7 @@
 import {currentAuthority} from './broker.js';
 import {factoryCatalog,coveredProviders} from './detection-factory.js';
 import {observeRequest,candidateSignals,glob,Fusion,SESSIONS} from './detection.js';
-import {modelObservation} from './model-rules.js';
+import {modelObservation,blockedPlatform} from './model-rules.js';
 function appendMeasurement(event,output,key){
   if(event[key]===undefined){return;}
   if(!Number.isSafeInteger(event[key])||event[key]<0||(key==='body_bytes'&&event[key]>16*1024*1024)){throw new Error('Invalid detection measurement');}
@@ -401,12 +401,17 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
    const policy=getPolicy()||await waitPolicy();if(!collecting(policy)){return;}
    await ready;await pendingReady;
    const eventIdentity=identity({tabId:details.tabId,documentId:details.documentId,frameId:details.frameId},match.id);
+   // A platform the organization blocks (Enterprise): the navigation is stopped by the
+   // blocking rules, and the attempt is still reported, with its own half-hour window.
+   // Measured on 2026-09-29: Chrome and Firefox both call onBeforeRequest before the
+   // declarative rule cancels the navigation.
+   const blocked=blockedPlatform(policy,match.id),windowKey=blocked?match.provider+'#blocked':match.provider;
    const now=Date.now();
    let held={};try{held=(await api.storage.local.get('presence'))?.presence||{};}catch{}
    const kept={};for(const [key,at] of Object.entries(held)){if(typeof at==='number'&&now-at<PRESENCE_WINDOW){kept[key]=at;}}
-   if(match.provider in kept){return;}
+   if(windowKey in kept){return;}
    if(fusion.has(eventIdentity,'presence')){
-    await rememberPresence(kept,match.provider,now);
+    await rememberPresence(kept,windowKey,now);
     schedule();return;
    }
    // The hostname and nothing else: no address, no conversation, no model, no
@@ -418,9 +423,9 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
    // Authority is only read here, for admission: a reload within the half-hour
    // is filtered out earlier without paying for the managed-storage read.
    const authority=await currentAuthority(api);
-   const event={provider:match.provider,source:'browser',tool,kind:'navigation',action:'observed',characters:0,characters_known:true,labels:[],detector:'presence',policy_revision:policy.revision,catalog_revision:revision};
+   const event={provider:match.provider,source:'browser',tool,kind:'navigation',action:blocked?'blocked':'observed',characters:0,characters_known:true,labels:[],detector:'presence',policy_revision:policy.revision,catalog_revision:revision};
    await fusion.add(event,eventIdentity,null,'presence',false,authority);
-   await rememberPresence(kept,match.provider,now);
+   await rememberPresence(kept,windowKey,now);
    schedule();
   });presenceSerial=operation.catch(()=>{});
  }
