@@ -307,7 +307,7 @@
    if(responseBatchTimer){return;}
    responseBatchTimer=win.setTimeout(()=>{responseBatchTimer=null;const nodes=responseRescan?null:[...responseTargets];responseTargets.clear();responseRescan=false;responses(nodes);},50);
   }
-  const observer=new win.MutationObserver(observeResponses);observer.observe(document,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['data-is-streaming','aria-busy']});
+  const observer=new win.MutationObserver(observeResponses);observer.observe(document,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['data-is-streaming','aria-busy','data-message-streaming']});
   const navTimer=win.setInterval(navigation,1000),policyTimer=win.setInterval(refresh,30000);void refresh();
   return {handle,upload,refresh,navigation,dispose(){receipts.length=0;api?.runtime?.onMessage?.removeListener(receipt);api?.runtime?.onMessage?.removeListener(blocked);disposed=true;close();observer.disconnect();win.clearInterval(navTimer);win.clearInterval(policyTimer);for(const [type,fn]of listeners){document.removeEventListener(type,fn,true);}resetResponses();}};
  }

@@ -166,6 +166,30 @@ test('a page that resubmits the approved form itself records one prompt',async()
   assert.equal(sent,1,'the page send goes through once');
  }finally{controller.dispose();dom.window.close();}
 });
+// Measured on signed-out chatgpt.com, 2026-09-29: the answer is `li[data-message-role="assistant"]`,
+// never `[data-message-author-role]`, and it carries `data-message-streaming` while it is
+// generated, then `data-message-complete`. No response was recorded at all before.
+test('a signed-out ChatGPT answer is recorded once, after it finished streaming',async()=>{
+ const dom=new JSDOM('<form><textarea id="mobile-composer-prompt"></textarea><button type="submit">Send</button></form><ol id="thread"></ol>',{url:'https://chatgpt.com/'});
+ const doc=dom.window.document;Object.defineProperty(dom.window.crypto,'subtle',{value:webcrypto.subtle});
+ doc.querySelector('form').addEventListener('submit',event=>event.preventDefault());
+ const messages=[];const config=policy();
+ const controller=globalThis.MilvagoCapture.start(doc,dom.window.location,async msg=>{messages.push(msg);if(msg.type==='policy'){return {ok:true,policy:config};}if(msg.type==='inspect'){return {ok:true,action:'observe',text:msg.text,labels:[]};}if(msg.type==='submit'){return {ok:true,action:'observe',text:msg.text,durable:true,recording_required:true,authority:null,delivery_id:'00000000-0000-4000-8000-000000000001'};}return {ok:true};});
+ try{
+  await delay(0);
+  const editor=doc.querySelector('#mobile-composer-prompt');A.write(editor,'Donne trois fruits');
+  await controller.handle(trusted('keydown',editor,{key:'Enter'}));
+  const answer=doc.createElement('li');answer.setAttribute('data-message-role','assistant');answer.setAttribute('data-message-streaming','');answer.textContent='Pomme';
+  doc.querySelector('#thread').append(answer);
+  await delay(1350);
+  assert.equal(messages.filter(m=>m.event?.kind==='response').length,0,'a streaming answer is not recorded yet');
+  answer.textContent='Pomme, poire, banane';answer.removeAttribute('data-message-streaming');answer.setAttribute('data-message-complete','');
+  await delay(2700);
+  const responses=messages.filter(m=>m.event?.kind==='response');
+  assert.equal(responses.length,1);
+  assert.equal(responses[0].event.correlation_id,messages.find(m=>m.type==='submit').event.correlation_id,'the answer belongs to the prompt it follows');
+ }finally{controller.dispose();dom.window.close();}
+});
 test('a later submit of the same text is a new send once the window has passed',async()=>{
  const dom=new JSDOM('<form><textarea id="mobile-composer-prompt"></textarea><button type="submit">Send</button></form>',{url:'https://chatgpt.com/'});
  const doc=dom.window.document;Object.defineProperty(dom.window.crypto,'subtle',{value:webcrypto.subtle});

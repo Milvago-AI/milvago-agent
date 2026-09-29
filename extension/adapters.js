@@ -7,7 +7,7 @@
   // send control is the only `type="submit"` in its form — its classes are generated
   // and unreadable. The form is identified by the field's id so this
   // branch cannot match another send button on the desktop page.
-  ['chatgpt','chatgpt.com','#prompt-textarea,textarea[data-testid="prompt-textarea"],#mobile-composer-prompt','button[data-testid="send-button"],form:has(#mobile-composer-prompt) button[type="submit"]','[data-message-author-role="assistant"]',/^\/c\/([a-zA-Z0-9_-]{8,128})(?:\/|$)/],
+  ['chatgpt','chatgpt.com','#prompt-textarea,textarea[data-testid="prompt-textarea"],#mobile-composer-prompt','button[data-testid="send-button"],form:has(#mobile-composer-prompt) button[type="submit"]','[data-message-author-role="assistant"],[data-message-role="assistant"]',/^\/c\/([a-zA-Z0-9_-]{8,128})(?:\/|$)/],
   // Measured on the page on 2026-09-14: `data-testid="chat-input-send"` matches a
   // single button, composer filled in, and closes the Spanish / Brazilian Portuguese gap.
   // Assets host MEASURED on 2026-09-16 by replaying a network capture of claude.ai: 60 of the
@@ -64,7 +64,9 @@
  // dot: without this canonical form, `api.anthropic.com.` escaped the network guard entirely.
  function resolve(value){try{const u=new URL(value);let end=u.hostname.length;while(end>0&&u.hostname[end-1]==='.'){end--;}const host=u.hostname.slice(0,end),adapter=adapters.find(a=>a.domain===(aliases[host]||host));return u.protocol==='https:'&&!u.username&&!u.password&&!u.port&&adapter?{...adapter,domain:host}:null;}catch{return null;}}
  function context(value){const adapter=resolve(value);if(!adapter){return null;}const u=new URL(value),match=u.pathname.match(adapter.conversation);const result={provider:adapter.domain,url:u.origin};if(match){result.conversation_id=match[1];result.url+=adapter.path?adapter.path(match[1]):match[0].replaceAll(/\/$/g,'');}return result;}
- function read(editor){if('value' in editor){return editor.value;}if(typeof editor.innerText==='string'){return editor.innerText;}return editor.textContent||'';}
+ // `value` only when it is text: an `<li>` has a numeric `value` (its list ordinal), and
+ // signed-out ChatGPT answers are `li[data-message-role="assistant"]` (measured 2026-09-29).
+ function read(editor){if(typeof editor.value==='string'){return editor.value;}if(typeof editor.innerText==='string'){return editor.innerText;}return editor.textContent||'';}
  // The model is deliberately NOT read from the page. Measured on the real sites on
  // 2026-09-14: claude.ai shows a localized composite ("Fable 5.1 Moyen" — model and
  // effort fused, translated), and chatgpt.com exposes no identifiable control at all.
@@ -104,7 +106,9 @@
   if(control){return {control,form:control.form||form,target:control};}if(form&&typeof form.requestSubmit==='function'){return {control:null,form,target:form};}return null;
  }
  function responseBusy(adapter,node,document){
-  return !!node.closest('[data-is-streaming="true"],[aria-busy="true"]')||!!node.querySelector('[data-is-streaming="true"],[aria-busy="true"]')||!!document.querySelector('button[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="Stop response"],button[aria-label="Arrêter la génération"]');
+  // `data-message-streaming`: signed-out ChatGPT marks the answer being generated with it
+  // (measured 2026-09-29), whatever the interface language the stop label is in.
+  return !!node.closest('[data-is-streaming="true"],[aria-busy="true"],[data-message-streaming]')||!!node.querySelector('[data-is-streaming="true"],[aria-busy="true"],[data-message-streaming]')||!!document.querySelector('button[data-testid="stop-button"],button[aria-label="Stop generating"],button[aria-label="Stop response"],button[aria-label="Arrêter la génération"]');
  }
  // `allowEmpty`: a file from this draft has already been checked and recorded. Sending it with no
  // text must then still go through the check like any other, otherwise it leaves without approval and
