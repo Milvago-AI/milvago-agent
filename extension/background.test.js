@@ -120,3 +120,16 @@ test('concurrent seals share one DNR update and never flag a seal that holds',as
  assert.equal(storage.seal_failed,false,'the seal holds, so no failure may be flagged');
  assert.deepEqual(rules.map(r=>r.id).sort(),[20000,20001],'the covered surface is sealed exactly once');
 });
+
+// Community seals covered services without retaining Enterprise platform rules.
+test('a Community seal drops platform blocks and still seals covered services',async t=>{
+ t.after(()=>{delete globalThis.chrome;});
+ const bridge=managedBridge();bridge.setUnavailable(true);
+ const storage={},rules=[{id:1,priority:1,action:{type:'block'},condition:{requestDomains:['chatgpt.com']}},{id:40000,priority:150,action:{type:'block'},condition:{requestDomains:['mammouth.ai','mammouth.ai.']}}];
+ globalThis.chrome=fakeChrome(bridge,storage,{rules,dnr:dnrStore(rules)});
+ await import('./background.js?case=seal-keeps-platforms');
+ await settled(storage);
+ assert.equal(storage.status?.connected,false);
+ assert.equal(storage.seal_failed,false,'the seal holds');
+ assert.deepEqual(rules.map(r=>r.id).sort((a,b)=>a-b),[20000,20001]);
+});

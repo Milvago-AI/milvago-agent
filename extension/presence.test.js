@@ -95,6 +95,15 @@ test('a visit made before the first policy is recorded once the policy arrives',
  assert.equal(queued(f),1);
 });
 
+// Community ignores supplied platform blocks and reports an observed visit.
+test('a supplied platform block cannot mark a Community visit as blocked', async()=>{
+ const blocked={...policy,revision:2,config:{...policy.config,blocked_platforms:[{id:'aggregator',domains:['aggregator.example.invalid']}]}};
+ const f=fixture({current:()=>blocked,storage:{}});await f.runtime.refresh();
+ await visit(f,'https://aggregator.example.invalid/');
+ assert.equal(queued(f),1);
+ assert.equal(f.storage.detectorPending[0].event.action,'observed');
+});
+
 test('a visit is dropped when no policy can be obtained', async()=>{
  const f=fixture({current:()=>undefined,wait:async()=>null});
  await f.runtime.refresh();

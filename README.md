@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/milvago-logo-inverse.svg">
-    <img src=".github/assets/milvago-logo.svg" alt="Milvago" height="64">
-  </picture>
+  <img src=".github/assets/milvago-github-banner-v1.png" alt="Milvago">
 </p>
 
 <h3 align="center">The endpoint side of Milvago: a local agent and its browser extension.</h3>
@@ -71,7 +68,9 @@ they are absent. Without them, opt out explicitly: `MILVAGO_EMBED_EXTENSION=0 ca
 The agent then carries no extension of its own.
 
 Signed packages (CRX, Mozilla-signed XPI) and installers (MSI, Linux archives) are produced by
-the release pipeline and are not built from this repository.
+the release pipeline and are not built from this repository. The prepared release uses common
+agent and extension version `0.6.3` across both editions and all supported browsers; it has not
+been published yet.
 
 ## Repository layout
 

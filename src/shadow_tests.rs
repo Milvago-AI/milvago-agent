@@ -27,6 +27,40 @@ fn prepared(content: bool) -> State {
         ..State::default()
     }
 }
+// The policy config as signed, with `blocked_platforms` set to the given value.
+fn with_blocked(blocked: serde_json::Value) -> State {
+    let key = SigningKey::from_bytes(&[29; 32]);
+    let now = Utc::now();
+    let policy = ShadowPolicy {
+        version: 3, revision: 1, issued_at: now, expires_at: now + chrono::Duration::minutes(10), capabilities: vec![],
+        config: json!({"collection":{"enabled":true},"services":[],"blocked_platforms":blocked}),
+    };
+    let bytes = serde_json::to_vec(&policy).unwrap();
+    let env = Envelope { payload: STANDARD.encode(&bytes), signature: STANDARD.encode(key.sign(&bytes).to_bytes()) };
+    State { public_key: STANDARD.encode(key.verifying_key().as_bytes()), shadow_policy: Some(env), shadow_revision: 1, ..State::default() }
+}
+#[test]
+fn blocked_platforms_are_held_to_the_catalogue_grammar() {
+    assert!(cached(&with_blocked(json!([{"id":"mammouth","domains":["mammouth.ai"]},{"id":"github-copilot","domains":["github.com"],"paths":["/copilot*"]}]))).is_ok());
+    for bad in [
+        json!("mammouth.ai"),
+        json!([{"id":"Mammouth","domains":["mammouth.ai"]}]),
+        json!([{"id":"mammouth","domains":[]}]),
+        json!([{"id":"mammouth","domains":["not a host"]}]),
+        json!([{"id":"mammouth","domains":["mammouth.ai"],"paths":["copilot"]}]),
+        json!([{"id":"mammouth","domains":["mammouth.ai"],"regex":".*"}]),
+    ] {
+        assert!(cached(&with_blocked(bad.clone())).is_err(), "accepted {bad}");
+    }
+}
+#[test]
+fn a_presence_record_may_say_the_visit_was_blocked() {
+    let mut state = prepared(false);
+    let presence = json!({"kind":"navigation","provider":"mammouth.ai","source":"browser","tool":"chrome","action":"blocked","characters":0,"labels":[],"detector":"presence"});
+    assert!(enqueue_browser(&mut state, presence).is_ok());
+    let redirected = json!({"kind":"navigation","provider":"mammouth.ai","source":"browser","tool":"chrome","action":"redirected","characters":0,"labels":[],"detector":"presence"});
+    assert!(enqueue_browser(&mut state, redirected).is_err());
+}
 fn input() -> serde_json::Value {
     json!({"kind":"prompt","provider":"chatgpt.com","source":"browser","tool":"chrome","action":"observed","characters":12,"labels":[],"prompt":"synthetic local text"})
 }

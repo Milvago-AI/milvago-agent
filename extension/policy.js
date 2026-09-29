@@ -1,6 +1,7 @@
 import {factoryCatalog} from './detection-factory.js';
 import './adapters.js';
 import {apiHosts,modelRulesValid} from './model-access.js';
+import {platformBlockRules} from './model-rules.js';
 export const providers=[...globalThis.MilvagoAdapters.adapters.map(a=>a.domain),...Object.keys(globalThis.MilvagoAdapters.aliases)];
 // Which browser runs the extension, as carried by every event and by the agent's
 // liveness map. Sniffing the `browser` namespace is not a Firefox test any more:
@@ -28,7 +29,9 @@ export function networkRules(policy,now=Date.now()){
  const rules=policy.version===1?policy.rules:policy.config.services.flatMap(s=>(s.domains||[]).map(domain=>({...s,domain,action:s.mode})));
  const apiRules=policy.version===1?[]:policy.config.services.filter(s=>s.enabled&&['block','redirect'].includes(s.mode)).flatMap(s=>Object.entries(apiHosts).filter(([,platform])=>platform===s.id).map(([domain],index)=>({id:5000+policy.config.services.indexOf(s)*10+index,priority:2,action:{type:'block'},condition:{requestDomains:[domain]}})));
  const unknownRules=policy.version===1?[]:(policy.config.model_access||[]).filter(r=>r.channel==='browser'&&r.mode!=='off'&&!factoryCatalog.providers.some(p=>p.id===r.platform_id)).flatMap((r,i)=>(policy.config.services||[]).filter(s=>s.id===r.platform_id).flatMap(s=>[{id:30000+i*2,priority:200,action:{type:'block'},condition:{requestDomains:s.domains}},{id:30001+i*2,priority:200,action:{type:'block'},condition:{initiatorDomains:s.domains}}]));
- return [...apiRules,...unknownRules,...rules.filter(r=>r.enabled&&r.action==='block'&&(policy.version!==1||providers.includes(r.domain))&&typeof r.domain==='string'&&/^[a-z0-9.-]{1,253}$/.test(r.domain)).map((r,index)=>({id:index+1,priority:1,action:{type:'block'},condition:{requestDomains:[r.domain],resourceTypes:['main_frame','sub_frame','xmlhttprequest','websocket']}}))];
+ // Known platforms the organization blocks: an Enterprise rule set, empty in Community.
+ const platformRules=policy.version===1?[]:platformBlockRules(policy);
+ return [...apiRules,...unknownRules,...platformRules,...rules.filter(r=>r.enabled&&r.action==='block'&&(policy.version!==1||providers.includes(r.domain))&&typeof r.domain==='string'&&/^[a-z0-9.-]{1,253}$/.test(r.domain)).map((r,index)=>({id:index+1,priority:1,action:{type:'block'},condition:{requestDomains:[r.domain],resourceTypes:['main_frame','sub_frame','xmlhttprequest','websocket']}}))];
 }
 function validObservedEvent(input){
  return ['navigation','prompt','response'].includes(input?.kind)&&

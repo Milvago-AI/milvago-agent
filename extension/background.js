@@ -3,7 +3,7 @@ import {detectionRuntime} from './detection-runtime.js';
 import {trustedProvider,networkRules,validPolicy,eventForPolicy,detectTool} from './policy.js';
 import {apiHosts,hostOf,networkPlatform,ownedPlatform,requestDecision,requestModel,modelDecision,contentControl,ruleFor} from './model-access.js';
 import {wireFacts} from './detection.js';
-import {modelObservation} from './model-rules.js';
+import {modelObservation,keptWhenSealed,blockedTab} from './model-rules.js';
 const api=globalThis.browser||chrome,host='app.milvago.browser';
 const tool=detectTool(globalThis.navigator);
 // Product decision of 2026-09-22: two consecutive refreshes lost to
@@ -94,8 +94,8 @@ async function flagSeal(failed){if(sealFlagged===failed){return;}try{await api.s
 // replayed on every refresh. The removal names both the rules already in place AND the ones being
 // set: a set replayed against itself has nothing to contest. A failure does not block the queue.
 let dnrQueue=Promise.resolve();
-function replaceDynamicRules(rules){
- const run=dnrQueue.then(async()=>{const previous=await api.declarativeNetRequest.getDynamicRules();await api.declarativeNetRequest.updateDynamicRules({removeRuleIds:[...new Set([...previous.map(r=>r.id),...rules.map(r=>r.id)])],addRules:rules});});
+function replaceDynamicRules(rules,keep=()=>false){
+ const run=dnrQueue.then(async()=>{const previous=await api.declarativeNetRequest.getDynamicRules();const kept=previous.filter(keep).filter(r=>!rules.some(x=>x.id===r.id));await api.declarativeNetRequest.updateDynamicRules({removeRuleIds:[...new Set([...previous.map(r=>r.id),...rules.map(r=>r.id)])],addRules:[...rules,...kept]});});
  dnrQueue=run.catch(()=>{});
  return run;
 }
@@ -104,7 +104,7 @@ function replaceDynamicRules(rules){
 let sealing=null;
 function sealDnr(){
  if(sealing){return sealing;}
- sealing=replaceDynamicRules(closedRules()).then(()=>flagSeal(false),()=>flagSeal(true)).finally(()=>{sealing=null;});
+ sealing=replaceDynamicRules(closedRules(),keptWhenSealed).then(()=>flagSeal(false),()=>flagSeal(true)).finally(()=>{sealing=null;});
  return sealing;
 }
 // `managed` follows the last adopted response: the managed pin is the only proof that
@@ -305,6 +305,10 @@ async function updatePolicy(){
  if(mode==='blocked'){throw new Error('Broker blocked');}
  await replaceDynamicRules([...networkRules(policy),...fallbackRules(policy)]);
  await flagSeal(false);
+ // A tab already open on a platform blocked by this revision keeps its page until reloaded.
+ if(JSON.stringify(previousPolicy?.config?.blocked_platforms)!==JSON.stringify(policy.config.blocked_platforms)&&api.tabs){
+  for(const tab of await api.tabs.query({})){if(blockedTab(policy,tab.url)){await closeBlockedTab(tab.id);}}
+ }
  const changed=JSON.stringify(previousPolicy?.config?.model_access)!==JSON.stringify(policy.config.model_access);
  const contentChanged=contentControl(policy)&&JSON.stringify([previousPolicy?.config?.privacy,previousPolicy?.config?.protection])!==JSON.stringify([policy.config.privacy,policy.config.protection]);
  // Reload closes page-owned streams; service-worker/persistent transports are
@@ -338,6 +342,13 @@ async function currentPolicy(){if(!(performance.now()-refreshedAt<REUSE_MS&&auth
 api.runtime.onInstalled.addListener(details=>{api.alarms.create('policy',{periodInMinutes:0.5});void (async()=>{await refresh();if(details?.reason==='update'){await reloadCovered(()=>true);}})();});
 api.runtime.onStartup.addListener(()=>{api.alarms.create('policy',{periodInMinutes:0.5});void refresh();});
 api.alarms.onAlarm.addListener(alarm=>{if(alarm.name==='policy'){void refresh();}});
+// A single-page app moves to a blocked path with pushState, which no request rule sees.
+// Chrome replaces the page with its error page when the reload is blocked. Firefox
+// treats a blocked navigation as cancelled and keeps the page on screen, so the tab is
+// sent to about:blank, which is what Firefox shows for any blocked navigation (measured).
+// Neither keeps a blocked URL that would fire this again.
+function closeBlockedTab(tabId){return (tool==='firefox'?api.tabs.update(tabId,{url:'about:blank'}):api.tabs.reload(tabId)).catch(()=>{});}
+api.tabs?.onUpdated?.addListener((tabId,change)=>{if(change.url&&policy&&blockedTab(policy,change.url)){void closeBlockedTab(tabId);}});
 async function inspectMessage(message,sender,provider,active){
     if(typeof message.text!=='string'||new TextEncoder().encode(message.text).length>32768||typeof message.upload!=='boolean'){return {ok:false};}
     // Without a managed pin, NEVER send text to the agent: nothing proves it is

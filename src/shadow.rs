@@ -240,11 +240,28 @@ fn verify_cached(
             return Err("invalid discovery policy".into());
         }
     }
+    // Known platforms the Enterprise extension blocks: catalogue ids, hosts and path
+    // prefixes, held to the catalogue's own grammar. A malformed list refuses the policy.
+    if let Some(blocked)=p.config.get("blocked_platforms") {
+        if !blocked.as_array().is_some_and(|list|list.len()<=256 && list.iter().all(valid_blocked_platform)) {
+            return Err("invalid blocked platforms policy".into());
+        }
+    }
     let model_rules = crate::model_access::rules(&p.config)?;
     if p.version < 3 && model_rules.iter().any(|r| r.mode != "off") {
         return Err("model restrictions require policy version 3".into());
     }
     Ok(p)
+}
+fn valid_blocked_platform(item: &Value) -> bool {
+    let strings = |value: &Value, limit: usize, ok: fn(&str) -> bool| {
+        value.as_array().is_some_and(|list| list.len() <= limit && list.iter().all(|v| v.as_str().is_some_and(ok)))
+    };
+    item.as_object().is_some_and(|o| o.keys().all(|k| matches!(k.as_str(), "id" | "domains" | "paths")))
+        && item["id"].as_str().is_some_and(crate::detection::identifier)
+        && item["domains"].as_array().is_some_and(|d| !d.is_empty())
+        && strings(&item["domains"], 8, crate::domain_ok)
+        && item.get("paths").is_none_or(|paths| strings(paths, 8, |s| !s.is_empty() && crate::detection::path(s)))
 }
 pub fn cached(state: &State) -> Result<ShadowPolicy> {
     verify_cached(
@@ -751,8 +768,9 @@ pub(crate) fn browser_event(p: &ShadowPolicy, catalog_revision: u64, mut input: 
     // the server's decision, against the signed catalogue it holds -- a record naming
     // anything else is reduced there, not trusted from here.
     if event.detector.as_deref() == Some("presence") {
+        // "blocked": the visit an Enterprise platform block stopped, still reported.
         if event.kind != "navigation"
-            || event.action != "observed"
+            || !matches!(event.action.as_str(), "observed" | "blocked")
             || event.characters != 0
             || !crate::domain_ok(&event.provider)
             || event.provider.len() > 253

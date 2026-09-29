@@ -7,6 +7,8 @@ All notable changes to this repository are recorded here. The format follows
 ## [Unreleased]
 
 First public release of the Milvago Community endpoint agent and browser extension.
+The release pipeline is prepared for shared agent and extension version `0.6.3`; `v0.6.3` has
+not been published.
 
 ### Added
 
