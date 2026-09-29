@@ -67,7 +67,7 @@ function approvalFor(details,platform){
  if(entry.platform!==platform||(entry.documentId&&entry.documentId!==details.documentId)){return null;}
  return entry;
 }
-const detection=detectionRuntime(api,brokerBridge,tool,()=>policy);
+const detection=detectionRuntime(api,brokerBridge,tool,()=>policy,async()=>{try{return await currentPolicy();}catch{return null;}});
 // Only the local service may authorize this worker. Server connectivity is
 // reported separately by the service, which applies its encrypted signed cache.
 async function bridge(message){const answer=await api.runtime.sendNativeMessage(host,message);if(!answer?.ok){throw Object.assign(new Error('Agent unavailable'),{code:answer?.error});}return answer;}

@@ -86,7 +86,9 @@ test('the two chatgpt rules never match the same request', () => {
   assert.deepEqual(rules.filter(n => (n.kind || 'prompt') === 'prompt').map(n => n.path), ['/backend-api/f/conversation', '/unauth-mweb/conversation/updates']);
   // Upload routes live in the same list and observe nothing: they
   // would render a request event with zero characters.
-  assert.deepEqual(rules.filter(n => n.kind === 'file').map(n => n.path), ['/unauth-mweb/image-uploads', '/file-*', '/unauth-mweb/image-uploads/process']);
+  // The last two were measured on 2026-09-29: signed-out uploads now go through the
+  // page's image-normalization worker.
+  assert.deepEqual(rules.filter(n => n.kind === 'file').map(n => n.path), ['/unauth-mweb/image-uploads', '/file-*', '/unauth-mweb/image-uploads/process', '/backend-anon/files', '/backend-anon/files/process_upload_stream']);
   // `observeRequest` drops all observation when two rules match: two
   // disjoint paths, so there is never ambiguity on the same request.
   assert.equal(rule.text_path, 'prompt');

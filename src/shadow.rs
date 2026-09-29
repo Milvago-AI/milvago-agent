@@ -46,12 +46,16 @@ fn quarantine_reasons(state: &mut State, entries: &[(Uuid, String)]) {
 fn clean_metadata(value: &str) -> bool {
     value.len() <= 200 && value.trim() == value && !value.chars().any(char::is_control)
 }
+fn valid_session(value: &str) -> bool {
+    matches!(value, "signed_in" | "signed_out")
+}
 
 /// Intrinsic transport validation only. Clock skew and age are left to the server;
 /// a transient local clock change must not discard an offline queue.
 fn valid_queued_event(event: &ShadowEvent) -> bool {
     [&event.model, &event.effort, &event.conversation_id, &event.correlation_id]
         .iter().all(|v| v.as_deref().is_none_or(clean_metadata))
+        && event.session.as_deref().is_none_or(valid_session)
         && event.user.as_deref().is_none_or(|u| u.len() <= 128 && u.trim() == u && !u.chars().any(char::is_control))
         && event.policy_revision > 0
         && event.files.len() <= 20
@@ -136,6 +140,11 @@ pub struct ShadowEvent {
     /// model label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// "signed_in" or "signed_out", as the catalogue states for the observed send route.
+    /// Signed-out ChatGPT names no model at all, so this is what tells a free anonymous
+    /// exchange apart from an account whose model is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -691,6 +700,7 @@ pub fn enqueue_refusal(state: &mut State, tool: &str, text: &str, characters: u3
         tool: tool.into(),
         model: None,
         effort: None,
+        session: None,
         platform_id: None,
         decision_reason: None,
         conversation_id: None,
@@ -751,6 +761,7 @@ pub(crate) fn browser_event(p: &ShadowPolicy, catalog_revision: u64, mut input: 
             || event.correlation_id.is_some()
             || event.model.is_some()
             || event.effort.is_some()
+            || event.session.is_some()
             || event.platform_id.is_some()
             || event.decision_reason.is_some()
             || event.prompt.is_some()
@@ -783,6 +794,7 @@ pub(crate) fn browser_event(p: &ShadowPolicy, catalog_revision: u64, mut input: 
     if [&event.model, &event.effort, &event.conversation_id, &event.correlation_id]
         .iter()
         .any(|s| s.as_ref().is_some_and(|s| !clean_metadata(s)))
+        || event.session.as_deref().is_some_and(|s| !valid_session(s))
         || event.user.is_some()
     {
         return Err("invalid browser event metadata".into());
@@ -894,6 +906,8 @@ pub struct ShadowCompletion {
     pub conversation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 /// Completions waiting for the server are few and short-lived: one follows each send,
 /// and it leaves on the next pass. The bound only keeps a long outage from growing
@@ -930,6 +944,7 @@ impl ShadowCompletion {
         ]
         .iter()
         .any(|s| s.as_ref().is_some_and(|s| s.is_empty() || !clean_metadata(s)))
+            || completion.session.as_deref().is_some_and(|s| !valid_session(s))
         {
             return Err("invalid completion metadata".into());
         }
@@ -937,6 +952,7 @@ impl ShadowCompletion {
             && completion.effort.is_none()
             && completion.conversation_id.is_none()
             && completion.body_bytes.is_none()
+            && completion.session.is_none()
         {
             return Err("empty completion".into());
         }
@@ -950,6 +966,7 @@ impl ShadowCompletion {
             (&mut event.model, &self.model),
             (&mut event.effort, &self.effort),
             (&mut event.conversation_id, &self.conversation_id),
+            (&mut event.session, &self.session),
         ] {
             if target.is_none() {
                 target.clone_from(value);
@@ -983,6 +1000,7 @@ pub fn complete(state: &mut State, completion: ShadowCompletion) -> Result<bool>
             (&mut queued.model, &completion.model),
             (&mut queued.effort, &completion.effort),
             (&mut queued.conversation_id, &completion.conversation_id),
+            (&mut queued.session, &completion.session),
         ] {
             if target.is_none() {
                 target.clone_from(value);

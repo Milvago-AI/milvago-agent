@@ -1,6 +1,6 @@
 import {currentAuthority} from './broker.js';
 import {factoryCatalog,coveredProviders} from './detection-factory.js';
-import {observeRequest,candidateSignals,glob,Fusion} from './detection.js';
+import {observeRequest,candidateSignals,glob,Fusion,SESSIONS} from './detection.js';
 import {modelObservation} from './model-rules.js';
 function appendMeasurement(event,output,key){
   if(event[key]===undefined){return;}
@@ -20,6 +20,7 @@ function enrichResponse(event,observed){
    // carry the identifier because the document reports its live URL.
   if(observed.model){event.model=observed.model;}
   if(observed.effort){event.effort=observed.effort;}
+  if(observed.session){event.session=observed.session;}
   if(!event.conversation_id&&observed.conversation_id){event.conversation_id=observed.conversation_id;}
  }
 function metricFor(kind){
@@ -32,6 +33,7 @@ function completionOf(event){
   if(modelObservation&&typeof event.model==='string'&&/^[A-Za-z0-9._:/-]{1,200}$/.test(event.model)){out.model=event.model;}
   if(modelObservation&&typeof event.effort==='string'&&/^[a-z0-9_-]{1,40}$/.test(event.effort)){out.effort=event.effort;}
   if(typeof event.conversation_id==='string'&&/^[A-Za-z0-9_-]{1,200}$/.test(event.conversation_id)){out.conversation_id=event.conversation_id;}
+  if(SESSIONS.includes(event.session)){out.session=event.session;}
   if(Number.isSafeInteger(event.body_bytes)&&event.body_bytes>=0&&event.body_bytes<=16*1024*1024){out.body_bytes=event.body_bytes;}
   return Object.keys(out).length?out:null;
  }
@@ -80,7 +82,8 @@ function platformCandidates(index, hostname){
  }
  return candidates;
 }
-export function detectionRuntime(api,bridge,tool,getPolicy){
+// `waitPolicy` resolves to the current valid policy, refreshing it if needed, or to null.
+export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>getPolicy()){
  const A=globalThis.MilvagoAdapters;
  let catalog=factoryCatalog,revision=0,catalogState='missing',expires=0,registeredRevision=-1,excludedDomains=[];
  const DAY=86400000,validAuthority=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
@@ -118,6 +121,8 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   // The reasoning effort the request asked for, in its own field: the provider names
   // it separately, and the page only ever shows it fused into a translated label.
   if(modelObservation&&event.effort!==undefined){if(typeof event.effort!=='string'||!/^[a-z0-9_-]{1,40}$/.test(event.effort)){throw new Error('Invalid detection effort');}output.effort=event.effort;}
+  // The account state is inventory in both editions, like the observed model.
+  if(event.session!==undefined){if(!SESSIONS.includes(event.session)){throw new Error('Invalid detection session');}output.session=event.session;}
   return output;
  }
  // What an outgoing request said about an exchange that is already durable. The
@@ -215,9 +220,10 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
  const seenByTab=new Map();
  function remember(tabId,provider,hit){
   if(typeof tabId!=='number'||tabId<0){return;}
-  if(!hit.model&&!hit.effort&&!hit.conversation_id){return;}
+  if(!hit.model&&!hit.effort&&!hit.conversation_id&&!hit.session){return;}
   const held=seenByTab.get(tabId);
   const entry=held&&held.provider===provider?held:{provider};
+  if(hit.session){entry.session=hit.session;}
   // Model and effort describe the same request and are replaced together, never
   // merged: a mode change can name a model without naming an effort, and keeping the
   // previous one would attribute it to an exchange that never asked for it.
@@ -266,6 +272,7 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   if(hit.body_bytes!==null){event.body_bytes=hit.body_bytes;}
   if(hit.model){event.model=hit.model;}
   if(hit.effort){event.effort=hit.effort;}
+  if(hit.session){event.session=hit.session;}
   if(hit.conversation_id){event.conversation_id=hit.conversation_id;}
   // Attached file names only travel when the signed policy asks for them.
   if(hit.files?.length&&policy.config.collection.store_file_names){event.files=hit.files;}
@@ -296,12 +303,16 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   }
   await deliverNetworkHit(hit,entry,authority);
  }
+ const collecting=policy=>!!policy&&Date.parse(policy.expires_at)>Date.now()&&!!policy.config.collection.enabled;
  try{api.webRequest?.onBeforeRequest?.addListener(details=>{
-  const policy=getPolicy();if(!policy||Date.parse(policy.expires_at)<=Date.now()||!policy.config.collection.enabled||details.tabId<0){return;}
+  if(details.tabId<0){return;}
   // A single `onBeforeRequest` registration for both paths: presence does not
   // need the body and reads none, but a second listener would make the network
-  // path depend on registration order.
-  if(details.type==='main_frame'){presence(details,policy);}
+  // path depend on registration order. Presence is matched before the policy is
+  // read: a visit made while the worker is still fetching its first policy (browser
+  // start, extension update) used to be dropped here without a trace.
+  if(details.type==='main_frame'){presence(details);}
+  const policy=getPolicy();if(!collecting(policy)){return;}
   if(!['POST','PUT'].includes(details.method)){return;}
   if(expires&&expires<=Date.now()){catalog=factoryCatalog;revision=0;catalogState='stale';A.applyCatalog(null);}
   const work=(async()=>{
@@ -382,9 +393,12 @@ export function detectionRuntime(api,bridge,tool,getPolicy){
   try{await api.storage.local.set({presence:kept});}catch{}
  };
  let presenceSerial=Promise.resolve();
- function presence(details,policy){
+ function presence(details){
   const match=knownPlatform(details.url);if(!match){return;}
   const operation=presenceSerial.then(async()=>{
+   // ponytail: one policy wait per visit; a visit made while the agent stays
+   // unreachable is still lost. Queue matches across refreshes if that matters.
+   const policy=getPolicy()||await waitPolicy();if(!collecting(policy)){return;}
    await ready;await pendingReady;
    const eventIdentity=identity({tabId:details.tabId,documentId:details.documentId,frameId:details.frameId},match.id);
    const now=Date.now();

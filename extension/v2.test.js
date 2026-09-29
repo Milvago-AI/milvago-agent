@@ -146,6 +146,42 @@ test('Enter refuses to resume when the send control is ambiguous',async()=>{
   assert.ok(f.dialog(),'un envoi non reprenable doit être signalé, pas parti en silence');
  }finally{f.close();}
 });
+// Measured on chatgpt.com signed out, Chrome and Firefox, 2026-09-29: the mobile composer
+// page cancels the first submit, fetches its sentinel tokens, then calls
+// form.requestSubmit() itself 32 ms later. That second, trusted submit was taken for a
+// new send, so every first message of a conversation was recorded twice.
+test('a page that resubmits the approved form itself records one prompt',async()=>{
+ const dom=new JSDOM('<form><textarea id="mobile-composer-prompt"></textarea><button type="submit">Send</button></form>',{url:'https://chatgpt.com/'});
+ const doc=dom.window.document;Object.defineProperty(dom.window.crypto,'subtle',{value:webcrypto.subtle});
+ const form=doc.querySelector('form');let sent=0,deferred=false;
+ form.addEventListener('submit',event=>{event.preventDefault();if(!deferred){deferred=true;setTimeout(()=>form.requestSubmit(),30);return;}sent++;});
+ const messages=[];const config=policy();
+ const controller=globalThis.MilvagoCapture.start(doc,dom.window.location,async msg=>{messages.push(msg);if(msg.type==='policy'){return {ok:true,policy:config};}if(msg.type==='inspect'){return {ok:true,action:'observe',text:msg.text,labels:[]};}if(msg.type==='submit'){return {ok:true,action:'observe',text:msg.text,durable:true,recording_required:true,authority:null,delivery_id:'00000000-0000-4000-8000-000000000001'};}return {ok:true};});
+ try{
+  await delay(0);
+  const editor=doc.querySelector('#mobile-composer-prompt');A.write(editor,'Salut');
+  await controller.handle(trusted('keydown',editor,{key:'Enter'}));
+  await delay(120);
+  assert.equal(messages.filter(m=>m.type==='submit').length,1);
+  assert.equal(sent,1,'the page send goes through once');
+ }finally{controller.dispose();dom.window.close();}
+});
+test('a later submit of the same text is a new send once the window has passed',async()=>{
+ const dom=new JSDOM('<form><textarea id="mobile-composer-prompt"></textarea><button type="submit">Send</button></form>',{url:'https://chatgpt.com/'});
+ const doc=dom.window.document;Object.defineProperty(dom.window.crypto,'subtle',{value:webcrypto.subtle});
+ const form=doc.querySelector('form');form.addEventListener('submit',event=>event.preventDefault());
+ const messages=[];const config=policy();
+ const controller=globalThis.MilvagoCapture.start(doc,dom.window.location,async msg=>{messages.push(msg);if(msg.type==='policy'){return {ok:true,policy:config};}if(msg.type==='inspect'){return {ok:true,action:'observe',text:msg.text,labels:[]};}if(msg.type==='submit'){return {ok:true,action:'observe',text:msg.text,durable:true,recording_required:true,authority:null,delivery_id:'00000000-0000-4000-8000-000000000001'};}return {ok:true};});
+ const realNow=Date.now;
+ try{
+  await delay(0);
+  const editor=doc.querySelector('#mobile-composer-prompt');A.write(editor,'Salut');
+  await controller.handle(trusted('keydown',editor,{key:'Enter'}));
+  Date.now=()=>realNow()+2500;
+  await controller.handle(trusted('submit',form));
+  assert.equal(messages.filter(m=>m.type==='submit').length,2);
+ }finally{Date.now=realNow;controller.dispose();dom.window.close();}
+});
 test('concurrent clicks cannot start a second inspection or replay',async()=>{
  let finish;const gate=new Promise(resolve=>finish=resolve);const f=await fixture('chatgpt',()=>gate);try{
   const first=f.controller.handle(trusted('click',f.button));await f.controller.handle(trusted('click',f.button));

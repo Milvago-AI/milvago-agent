@@ -28,7 +28,7 @@
   const win=document.defaultView;
   const language=()=>{const value=(document.documentElement.lang||win.navigator.language||'fr').toLowerCase();if(value.startsWith('en')){return 1;}if(value.startsWith('es')){return 2;}if(value.startsWith('pt')){return 3;}return 0;};
   const t=value=>TEXT.find(row=>row[0]===value)?.[language()]||value;
-  let policy,overlay,pending=false,correlation,lastUrl='',replay,disposed=false,draftEpoch=0,attempt=0;
+  let policy,overlay,pending=false,correlation,lastUrl='',replay,continuation=null,disposed=false,draftEpoch=0,attempt=0;
   // The correlation of the exchange **currently being composed**. A file goes to the
   // provider as soon as it is attached, so it is recorded at that moment, before
   // the text is sent: without this key, its event only carried the correlation of
@@ -164,6 +164,12 @@
     correlation=deliveryCorrelation;draftCorrelation=null;resetResponses();attached.clear();close();
     replay={editor,text,target,form,clicked:false,submitted:false};
     try{if(control){control.click();}else {form.requestSubmit();}}finally{replay=null;}
+    // Anonymous ChatGPT answers the resubmission by calling form.requestSubmit() itself
+    // once its sentinel tokens are ready (measured 32 ms later on 2026-09-29). That
+    // trusted submit carries the text just approved and recorded: it is the same send,
+    // not a new one, and recording it again counted every first message twice.
+    const resubmitted=form||control?.form;
+    continuation=resubmitted?{form:resubmitted,editor,text,until:Date.now()+2000}:null;
    }finally{pending=false;}
   }
   function onBlockedInspection(answer,text,labels){emit('prompt',text,'blocked',labels,win.crypto.randomUUID());const found=typeof answer.evidence==='string'&&answer.evidence.length<=200?`\n\nDétecté : ${answer.evidence}`:'';notice('Envoi bloqué',(answer.reason||'La politique locale bloque cet envoi.')+found);}
@@ -191,6 +197,10 @@
    if(replay&&A.read(replay.editor)===replay.text){
     if(event.type==='click'&&event.target===replay.target&&!replay.clicked){replay.clicked=true;return;}
     if(event.type==='submit'&&event.target===replay.form&&!replay.submitted){replay.submitted=true;return;}
+   }
+   if(continuation&&event.type==='submit'){
+    const next=continuation;continuation=null;
+    if(event.target===next.form&&Date.now()<next.until&&A.read(next.editor)===next.text){return;}
    }
    const editor=A.submission(adapter,event,document,draftCorrelation!==null);if(!editor){return;}const text=A.read(editor);
    stop(event);if(pending){return;}

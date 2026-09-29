@@ -97,6 +97,13 @@ pub struct Network {
     /// a request event of zero characters.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
+    /// The account state the route itself implies: "signed_out" for a send route only
+    /// reachable without an account (anonymous ChatGPT's `/unauth-mweb/`), "signed_in"
+    /// for one that requires it. A property of the measured route, never inferred from a
+    /// page. Declared before any catalog carries it, for the reason `effort_path`
+    /// records above.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,6 +117,11 @@ pub struct Provider {
     pub conversation_path: String,
     #[serde(default)]
     pub conversation_segment: usize,
+    /// Further page paths of a conversation, same segment: signed-out ChatGPT moves to
+    /// `/uc/<id>` where a signed-in account uses `/c/<id>`. Declared before any catalog
+    /// carries it, for the reason `effort_path` records above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conversation_paths: Vec<String>,
     pub dom: Dom,
     #[serde(default)]
     pub network: Vec<Network>,
@@ -311,6 +323,8 @@ pub fn validate(c: &Content) -> Result<()> {
             || p.domains.is_empty()
             || p.domains.len() + p.aliases.len() > 32
             || !path(&p.conversation_path)
+            || p.conversation_paths.len() > 4
+            || !p.conversation_paths.iter().all(|s| path(s) && !s.is_empty())
             || p.conversation_segment > 16
             || p.network.len() > 32
             || p.asset_hosts.len() > 8
@@ -359,6 +373,7 @@ pub fn validate(c: &Content) -> Result<()> {
                 || n.conversation_url_segment.is_some_and(|s| s > 16)
                 || !json_path(&n.files_path)
                 || !matches!(n.kind.as_str(), "" | "prompt" | "file")
+                || !matches!(n.session.as_str(), "" | "signed_in" | "signed_out")
                 // A field name, not a path: unwrapping only ever applies at the root of
                 // the body, where a form puts its fields. The reserved names are refused
                 // here as the engine refuses them.
@@ -784,6 +799,7 @@ mod tests {
             json_fields: vec![],
             files_path: "".into(),
             kind: "".into(),
+            session: "".into(),
         });
         // providers[0] now carries its own measured network rule: targeting index 0
         // would mutate THAT ONE instead of the rule added here, and the test would
@@ -840,6 +856,22 @@ mod tests {
         c.providers[0].network[ajoutee].kind = "upload".into();
         assert!(validate(&c).is_err());
         c.providers[0].network[ajoutee].kind = "".into();
+        // The account state a route implies is a closed vocabulary, never a free label.
+        c.providers[0].network[ajoutee].session = "signed_out".into();
+        assert!(validate(&c).is_ok());
+        c.providers[0].network[ajoutee].session = "anonymous".into();
+        assert!(validate(&c).is_err());
+        c.providers[0].network[ajoutee].session = "".into();
+        // Further conversation paths are page paths like the first, bounded and never empty.
+        c.providers[0].conversation_paths = vec!["/uc/*".into()];
+        assert!(validate(&c).is_ok());
+        c.providers[0].conversation_paths = vec!["".into()];
+        assert!(validate(&c).is_err());
+        c.providers[0].conversation_paths = vec!["uc/(a+)+".into()];
+        assert!(validate(&c).is_err());
+        c.providers[0].conversation_paths = (0..5).map(|i| format!("/p{i}/*")).collect();
+        assert!(validate(&c).is_err());
+        c.providers[0].conversation_paths = vec![];
         // A positional path is accepted: a provider answering with nested arrays is
         // addressed by index, `0.0.0` reaching the first element of the first element
         // of the first. What the grammar refuses is the bracket syntax `[0]`, not

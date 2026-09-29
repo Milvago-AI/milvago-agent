@@ -174,6 +174,26 @@ test('blocking file sends seals the file routes, and only them', async () => {
   } finally { state.close(); }
 });
 
+// Measured on signed-out chatgpt.com in Chrome, 2026-09-29: the page's
+// `image-normalization-worker` reserves the file with `POST /backend-anon/files`, puts the
+// bytes to `files08.oaiusercontent.com/file-…` with the signed address it got back, then
+// calls `POST /backend-anon/files/process_upload_stream`. The routes measured on 2026-09-15
+// were no longer used: under upload blocking the image went through.
+test('blocking file sends seals the signed-out upload the worker makes today', async () => {
+  const state = await worker(uploads);
+  try {
+    const fromWorker = over => post({ tabId: 1, type: 'xmlhttprequest', initiator: 'https://chatgpt.com', requestBody: json({}), ...over });
+    assert.equal(allowed(state, fromWorker({ url: 'https://chatgpt.com/backend-anon/files' })), false, 'the reservation carries the file name and yields the upload address');
+    assert.equal(allowed(state, fromWorker({ url: 'https://chatgpt.com/backend-anon/files/process_upload_stream' })), false);
+    // The send that only references an attachment still goes out: its text is not a file.
+    assert.equal(allowed(state, post({ requestBody: form('Test image') })), true);
+  } finally { state.close(); }
+  const open = await worker(policyFor({ protection: { block_uploads: false } }));
+  try {
+    assert.equal(allowed(open, post({ url: 'https://chatgpt.com/backend-anon/files', initiator: 'https://chatgpt.com', requestBody: json({}) })), true, 'without the setting, an upload is only observed');
+  } finally { open.close(); }
+});
+
 // `new URL('https://api.anthropic.com./').hostname` keeps the trailing dot, which DNS and TLS
 // ignore: without a single canonical form, these hosts had neither a platform, nor a decision, nor a trace.
 test('a trailing-dot hostname is the same covered host, not a way around the guard', async () => {

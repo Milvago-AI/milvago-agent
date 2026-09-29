@@ -51,6 +51,7 @@ fn catalog(key: &SigningKey) -> Envelope {
             aliases: vec![],
             conversation_path: String::new(),
             conversation_segment: 0,
+            conversation_paths: vec![],
             dom: detection::Dom {
                 editor: String::new(),
                 send: String::new(),
@@ -881,7 +882,7 @@ fn a_completion_fills_its_own_event_and_never_another_account_s() {
 
     let named = broker::parse(&completion_request(
         delivery,
-        json!({"model":"observed-model","effort":"high","conversation_id":"observed-conversation","body_bytes":4096}),
+        json!({"model":"observed-model","effort":"high","conversation_id":"observed-conversation","body_bytes":4096,"session":"signed_out"}),
         "S-1-5-21-501",
     ))
     .unwrap();
@@ -898,8 +899,11 @@ fn a_completion_fills_its_own_event_and_never_another_account_s() {
     assert_eq!(event.conversation_id.as_deref(), Some("observed-conversation"));
     assert_eq!(event.effort.as_deref(), Some("high"));
     assert_eq!(event.body_bytes, Some(4096));
+    assert_eq!(event.session.as_deref(), Some("signed_out"));
     assert_eq!(event.detector.as_deref(), Some("both"));
     assert_eq!(queue.pending.len(), 1, "a completion created an event");
+    // The account state is a closed vocabulary: anything else refuses the completion.
+    assert!(shadow::ShadowCompletion::parse_for(uuid::Uuid::nil(), &json!({"session":"anonymous"})).is_err());
 
     // The delivery key binds the calling account: the same delivery identity from
     // another principal designates nothing at all.

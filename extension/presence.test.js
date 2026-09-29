@@ -29,7 +29,7 @@ const orderedCatalog={
  ],
 };
 
-function fixture({storage={},failPresenceWrites=false,served=catalog}={}){
+function fixture({storage={},failPresenceWrites=false,served=catalog,current=()=>policy,wait}={}){
  const listeners={},calls=[];
  // resolve() is how the adapters recognize a covered provider; only the covered domain
  // answers, exactly as in the packaged extension.
@@ -51,7 +51,7 @@ function fixture({storage={},failPresenceWrites=false,served=catalog}={}){
   if(request.op==='detector_health'){return {accepted_health_ids:[request.batch.id]};}
   throw new Error('unexpected bridge operation '+request.op);
  };
- return {runtime:detectionRuntime(api,bridge,'firefox',()=>policy),listeners,calls,storage};
+ return {runtime:detectionRuntime(api,bridge,'firefox',current,wait),listeners,calls,storage};
 }
 
 // A top-level navigation, then long enough for the queue to settle. The queue is what the
@@ -81,6 +81,26 @@ test('a known platform is reported as reached, and nothing of the page is', asyn
  assert.equal(event.url,undefined);
  assert.equal(event.conversation_id,undefined);
  assert.equal(JSON.stringify(f.storage).includes('secret'),false);
+});
+
+// Measured on 2026-09-29: a visit 38 s after an extension restart left no trace while
+// the same visit later was reported. The worker had no policy yet when it navigated.
+test('a visit made before the first policy is recorded once the policy arrives', async()=>{
+ let loaded,waits=0;
+ const f=fixture({current:()=>loaded,wait:async()=>{waits++;await new Promise(resolve=>setTimeout(resolve,20));loaded=policy;return loaded;}});
+ await f.runtime.refresh();
+ await visit(f,'https://aggregator.example.invalid/');
+ for(let n=0;n<20&&!queued(f);n++){await new Promise(resolve=>setTimeout(resolve,10));}
+ assert.equal(waits,1);
+ assert.equal(queued(f),1);
+});
+
+test('a visit is dropped when no policy can be obtained', async()=>{
+ const f=fixture({current:()=>undefined,wait:async()=>null});
+ await f.runtime.refresh();
+ await visit(f,'https://aggregator.example.invalid/');
+ assert.equal(queued(f),0);
+ assert.equal(f.storage.presence,undefined,'no half-hour window is spent on a visit that was not recorded');
 });
 
 test('a subdomain of a named platform counts, and one visit per half hour', async()=>{

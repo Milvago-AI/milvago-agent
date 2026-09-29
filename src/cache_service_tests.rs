@@ -34,7 +34,7 @@ fn live_catalog(key: &SigningKey) -> Envelope {
     let content = detection::Content {
         providers: vec![detection::Provider {
             id: "chatgpt".into(), label: "Synthetic provider".into(), domains: vec!["chatgpt.com".into()],
-            aliases: vec![], conversation_path: String::new(), conversation_segment: 0,
+            aliases: vec![], conversation_path: String::new(), conversation_segment: 0, conversation_paths: vec![],
             dom: detection::Dom { editor:String::new(), send:String::new(), response:String::new() },
             network: vec![], qualified_at: now.to_rfc3339(), asset_hosts: vec![],
         }],

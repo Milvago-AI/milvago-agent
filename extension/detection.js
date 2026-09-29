@@ -6,6 +6,8 @@ export const BODY_LIMIT=128*1024;
 // are MCP tool definitions rather than prompt. A workstation with a few more connectors would
 // cross 128 KiB and silently lose the model column again.
 export const INFLATED_LIMIT=1024*1024;
+// The account states a catalogue rule may state for its route.
+export const SESSIONS=['signed_in','signed_out'];
 // Providers compress their request body client-side. `TextDecoder` then fails on the
 // second byte and the whole observation is lost: this is what emptied Claude's model
 // column from the start, even though its network rule was correct.
@@ -223,7 +225,11 @@ export async function observeRequest(details,catalog,modelEnabled=false){
  // legitimate here, as with text: it is not an ambiguity. Never their
  // content, and the policy decides afterward whether they are kept.
  const files=(rule.files_path?valuesAt(body,rule.files_path):[]).filter(name=>typeof name==='string'&&name.length>0&&name.length<=200&&![...name].some(c=>c.codePointAt(0)<32||c.codePointAt(0)===127)).slice(0,20);
- return {provider,characters:texts.length?Array.from(text).length:0,characters_known:!!texts.length,body_bytes,model,effort,conversation_id:conversation,files,fingerprint:texts.length?await fingerprint(text):null};
+ // The account state is a property of the measured route, stated by the signed rule,
+ // never read from the body: signed-out ChatGPT sends through `/unauth-mweb/` and names
+ // no model, and this is what tells that exchange apart from an unknown model.
+ const session=SESSIONS.includes(rule.session)?rule.session:undefined;
+ return {provider,characters:texts.length?Array.from(text).length:0,characters_known:!!texts.length,body_bytes,model,effort,session,conversation_id:conversation,files,fingerprint:texts.length?await fingerprint(text):null};
 }
 export async function candidateSignals(details,catalog){
  const {body}=await decodeBody(details);if(!body||Array.isArray(body)||typeof body!=='object'){return [];}

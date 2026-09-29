@@ -130,11 +130,15 @@
   adapters.splice(0,adapters.length,...factoryAdapters.map(a=>({...a})));for(const k of Object.keys(aliases)){delete aliases[k];}Object.assign(aliases,factoryAliases);
   if(!content){return;}
   const next=content.providers.map(p=>{
-   const match=path=>{const pieces=path.split('/').filter(Boolean),pattern=p.conversation_path?.split('/').filter(Boolean)||[];if(!pattern.length||pattern.length!==pieces.length||!pattern.every((v,i)=>v==='*'||v===pieces[i])){return null;}const id=pieces[p.conversation_segment];return /^[A-Za-z0-9_-]{8,128}$/.test(id||'')?[path,id]:null;};
-   // The canonical path is derived from the pattern: its literal segments, the id in its
-   // place. Recognized and canonical differ wherever the URL carries a summary of the question.
-   const pattern=p.conversation_path?.split('/').filter(Boolean)||[];
-   const path=pattern.length?id=>'/'+pattern.map((v,i)=>i===p.conversation_segment?id:v).join('/'):null;
+   // `conversation_paths` adds page shapes of the same thread, same segment: signed-out
+   // ChatGPT moves to `/uc/<id>` where an account uses `/c/<id>`.
+   const patterns=[p.conversation_path,...(Array.isArray(p.conversation_paths)?p.conversation_paths:[])].filter(v=>typeof v==='string'&&v).map(v=>v.split('/').filter(Boolean));
+   // The canonical path is derived from the pattern that recognized the page: its literal
+   // segments, the id in its place. Recognized and canonical differ wherever the URL
+   // carries a summary of the question.
+   const canonical=(pattern,id)=>'/'+pattern.map((v,i)=>i===p.conversation_segment?id:v).join('/');
+   const match=path=>{const pieces=path.split('/').filter(Boolean);for(const pattern of patterns){if(pattern.length!==pieces.length||!pattern.every((v,i)=>v==='*'||v===pieces[i])){continue;}const id=pieces[p.conversation_segment];if(/^[A-Za-z0-9_-]{8,128}$/.test(id||'')){return [canonical(pattern,id),id];}}return null;};
+   const path=null;
    // Assets hosts are the UNION of the same provider's factory list and what the
    // served catalog names (`asset_hosts`). Measured on 2026-09-16 in a live 0.5.29 worker:
    // the served catalog (revision 9) did not carry `asset_hosts`, so this reconstruction produced
