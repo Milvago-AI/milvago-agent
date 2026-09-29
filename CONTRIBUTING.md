@@ -58,7 +58,7 @@ and what you expected. For anything with a security dimension, follow `SECURITY.
 
 ## Release version
 
-The release pipeline is prepared but has not published `v0.6.3`. Agent and browser extension
-artifacts share version `0.6.3` across both editions and all supported browsers. The pipeline
+The release pipeline is prepared but has not published `v0.6.4`. Agent and browser extension
+artifacts share version `0.6.4` across both editions and all supported browsers. The pipeline
 signs the Windows and Linux packages with Ed25519; the Windows MSI has no Authenticode publisher
 signature yet.

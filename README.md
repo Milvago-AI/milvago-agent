@@ -69,7 +69,7 @@ The agent then carries no extension of its own.
 
 Signed packages (CRX, Mozilla-signed XPI) and installers (MSI, Linux archives) are produced by
 the release pipeline and are not built from this repository. The prepared release uses common
-agent and extension version `0.6.3` across both editions and all supported browsers; it has not
+agent and extension version `0.6.4` across both editions and all supported browsers; it has not
 been published yet.
 
 ## Repository layout

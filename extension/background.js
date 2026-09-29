@@ -291,6 +291,21 @@ async function reloadCovered(match){
  if(!api.tabs){return;}
  for(const tab of await api.tabs.query({})){const platform=networkPlatform(tab.url);if(platform&&match(platform)){await api.tabs.reload(tab.id,{bypassCache:true}).catch(()=>{});}}
 }
+async function reconcileOpenTabs(previousPolicy,active){
+ // A tab already open on a newly blocked platform keeps its page until reloaded.
+ if(JSON.stringify(previousPolicy?.config?.blocked_platforms)!==JSON.stringify(active.config.blocked_platforms)&&api.tabs){
+  for(const tab of await api.tabs.query({})){if(blockedTab(active,tab.url)){await closeBlockedTab(tab.id);}}
+ }
+ const changed=JSON.stringify(previousPolicy?.config?.model_access)!==JSON.stringify(active.config.model_access);
+ const contentChanged=contentControl(active)&&JSON.stringify([previousPolicy?.config?.privacy,previousPolicy?.config?.protection])!==JSON.stringify([active.config.privacy,active.config.protection]);
+ // Reload closes page-owned streams; service-worker/persistent transports are
+ // still unqualified, so content_control must never report complete coverage.
+ if(contentChanged){await reloadCovered(()=>true);}
+ else if(changed&&(active.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')){await reloadCovered(a=>!!ruleFor(active,a.id));}
+}
+function policyStatus(active,online){
+ return {status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online,managed,revision:active.revision,expires_at:active.expires_at,content_control:contentControl(active)?'unavailable':'off',content_control_reason:(()=>{if(!contentControl(active)){return null;}if(blocking){return 'unverified_web_transport';}return 'managed_extension_required';})(),model_control:(active.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}};
+}
 async function updatePolicy(){
  // The browser travels with the poll so the agent knows which extensions are still
  // running: a user who disables one must not simply vanish from the console.
@@ -305,18 +320,9 @@ async function updatePolicy(){
  if(mode==='blocked'){throw new Error('Broker blocked');}
  await replaceDynamicRules([...networkRules(policy),...fallbackRules(policy)]);
  await flagSeal(false);
- // A tab already open on a platform blocked by this revision keeps its page until reloaded.
- if(JSON.stringify(previousPolicy?.config?.blocked_platforms)!==JSON.stringify(policy.config.blocked_platforms)&&api.tabs){
-  for(const tab of await api.tabs.query({})){if(blockedTab(policy,tab.url)){await closeBlockedTab(tab.id);}}
- }
- const changed=JSON.stringify(previousPolicy?.config?.model_access)!==JSON.stringify(policy.config.model_access);
- const contentChanged=contentControl(policy)&&JSON.stringify([previousPolicy?.config?.privacy,previousPolicy?.config?.protection])!==JSON.stringify([policy.config.privacy,policy.config.protection]);
- // Reload closes page-owned streams; service-worker/persistent transports are
- // still unqualified, so content_control must never report complete coverage.
- if(contentChanged){await reloadCovered(()=>true);}
- else if(changed&&(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')){await reloadCovered(a=>!!ruleFor(policy,a.id));}
+ await reconcileOpenTabs(previousPolicy,policy);
  await report(policy).catch(()=>{});
- await api.storage.local.set({status:{connected:mode!=='blocked',mode,remaining_ms:mode==='grace'?Math.floor(remaining()):0,online:answer.online,managed,revision:policy.revision,expires_at:policy.expires_at,content_control:contentControl(policy)?'unavailable':'off',content_control_reason:(()=>{if(!contentControl(policy)){return null;}if(blocking){return 'unverified_web_transport';}return 'managed_extension_required';})(),model_control:(policy.config.model_access||[]).some(r=>r.channel==='browser'&&r.mode!=='off')?'unavailable':'off',updated_at:new Date().toISOString()}});
+ await api.storage.local.set(policyStatus(policy,answer.online));
  refreshedAt=performance.now();
   }
 async function handleRefreshFailure(error){

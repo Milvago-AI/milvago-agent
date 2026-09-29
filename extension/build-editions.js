@@ -26,7 +26,7 @@ const factory = JSON.parse(await readFile(join(here, 'detection-factory.json'), 
 await writeFile(join(here, 'detection-factory.js'), factoryModule(factory, null));
 
 const editions = {
-  community: { rules: 'model-rules-community.js', key: 'extension-key.txt', id: 'extension-id.txt', gecko: 'browser-community@milvago.app' },
+  community: { rules: 'model-rules.js', key: 'extension-key.txt', id: 'extension-id.txt', gecko: 'browser-community@milvago.app' },
 };
 
 async function read(name) {
