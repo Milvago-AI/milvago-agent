@@ -128,7 +128,7 @@ pub fn prepare(home: &Path) -> Result<serde_json::Value> {
     crate::atomic_private(&home.join("identity.bin"), &encrypted?)?;
     crate::atomic_private(&home.join("extension-ca.cer"), &identity.ca)?;
     Ok(serde_json::json!({"ok":true,"expires":identity.expires,
-        "ca_sha256": format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(&identity.ca))}))
+        "ca_sha256": crate::sha256_hex(&identity.ca)}))
 }
 
 pub fn server_config(home: &Path) -> Result<Arc<ServerConfig>> {

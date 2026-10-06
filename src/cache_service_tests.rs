@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+
 use std::{cell::{Cell, RefCell}, fs, fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
 fn signed<T: Serialize>(key: &SigningKey, value: &T) -> Envelope {
@@ -47,7 +47,7 @@ fn live_catalog(key: &SigningKey) -> Envelope {
         kind:"detection_catalog".into(), schema:1, revision:1, issued_at:now,
         expires_at:now+Duration::minutes(10),
         min_engine:detection::Engines { extension:detection::ENGINE_VERSION.into(), bridge:detection::ENGINE_VERSION.into() },
-        content_hash:format!("{:x}",Sha256::digest(&raw)), content:STANDARD.encode(raw),
+        content_hash:crate::sha256_hex(&raw), content:STANDARD.encode(raw),
     })
 }
 

@@ -1,6 +1,6 @@
 use chrono::Utc;
 use milvago_browser_agent::update::{Release, install};
-use sha2::{Digest, Sha256};
+
 #[test]
 fn installs_a_real_binary_and_checks_its_reported_version() {
     let bytes = std::fs::read(env!("CARGO_BIN_EXE_milvago-browser-agent")).unwrap();
@@ -9,7 +9,7 @@ fn installs_a_real_binary_and_checks_its_reported_version() {
         .path()
         .join(if cfg!(windows) { "agent.exe" } else { "agent" });
     std::fs::write(&target, b"synthetic previous executable").unwrap();
-    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let hash = milvago_browser_agent::sha256_hex(&bytes);
     let release = Release {
         format: "binary".into(),
         version: env!("CARGO_PKG_VERSION").into(),

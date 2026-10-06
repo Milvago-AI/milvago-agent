@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use fs2::FileExt;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -18,6 +18,23 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// Never continue with unfilled key or nonce bytes if OS randomness is unavailable.
+pub(crate) fn fill_random(bytes: &mut [u8]) {
+    SysRng.try_fill_bytes(bytes).expect("OS randomness unavailable");
+}
+
+pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 15) as usize] as char);
+    }
+    output
+}
+
 pub mod bootstrap;
 pub mod config;
  pub mod detection;
@@ -497,7 +514,7 @@ impl Store {
                 return Err("state key missing; refusing data loss".into());
             }
             let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
+            fill_random(&mut key);
             let encrypted = os_wrap(&key, true)?;
             let mut file = private_file(&keypath, true)?;
             file.write_all(&encrypted)?;
@@ -539,7 +556,7 @@ impl Store {
             return Err("state is full".into());
         }
         let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        fill_random(&mut nonce);
         let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| "invalid encryption key")?;
         let encrypted = cipher
             .encrypt(
@@ -738,6 +755,16 @@ pub fn write_frame<W: Write>(out: &mut W, value: &serde_json::Value) -> Result<(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    #[test]
+    fn sha256_hex_preserves_wire_format() {
+        for (bytes, expected) in [
+            (b"".as_slice(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (b"abc".as_slice(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            (b"s".as_slice(), "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"),
+        ] {
+            assert_eq!(sha256_hex(bytes), expected);
+        }
+    }
     // The root applier reads the agent's state: a FIFO or a link to /dev/zero planted
     // there must be refused at once, never block it nor exhaust its memory.
     #[cfg(unix)]

@@ -6,8 +6,15 @@ All notable changes to this repository are recorded here. The format follows
 
 ## [Unreleased]
 
-First public release of the Milvago Community endpoint agent and browser extension.
-The release pipeline is prepared for shared agent and extension version `0.6.4`; `v0.6.4` has
+### Changed
+
+- Upgrade rand to 0.10.2 and sha2 to 0.11.0 while preserving system randomness and lowercase SHA-256 formats.
+- Keep the agent and browser extension on common version 0.6.5.
+- Pin source-map-js to the patched version 1.2.2 for development tools.
+- Stage dependency update pull requests on dev.
+
+Changes staged for the next Community endpoint release.
+The release pipeline is prepared for shared agent and extension version `0.6.5`; `v0.6.5` has
 not been published.
 
 ### Added
