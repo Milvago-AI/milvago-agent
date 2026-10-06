@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+
 use std::{collections::BTreeSet, io::Read, path::Path};
 pub const ENGINE_VERSION: &str = "0.5.0";
 #[derive(Default, Serialize, Deserialize)]
@@ -445,7 +445,7 @@ pub fn verify(
         return Err("catalog requires newer engine".into());
     }
     let raw = STANDARD.decode(&h.content)?;
-    let hash = format!("{:x}", Sha256::digest(&raw));
+    let hash = crate::sha256_hex(&raw);
     if raw.len() > 512 * 1024
         || hash != h.content_hash
         || (h.revision == minimum && !held_hash.is_empty() && hash != held_hash)
@@ -731,7 +731,7 @@ mod tests {
                 extension: "0.5.0".into(),
                 bridge: "0.5.0".into(),
             },
-            content_hash: format!("{:x}", Sha256::digest(&raw)),
+            content_hash: crate::sha256_hex(&raw),
             content: STANDARD.encode(raw),
         };
         let bytes = serde_json::to_vec(&h).unwrap();
@@ -1031,8 +1031,8 @@ fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<
         token
     ]);
     Ok(Some((
-        format!("{:x}", Sha256::digest(serde_json::to_vec(&key)?)),
-        format!("{:x}", Sha256::digest(serde_json::to_vec(event)?)),
+        crate::sha256_hex(serde_json::to_vec(&key)?),
+        crate::sha256_hex(serde_json::to_vec(event)?),
     )))
 }
 pub fn delivery_receipt(

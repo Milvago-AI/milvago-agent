@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -403,7 +403,7 @@ pub fn verify(
     Ok(release)
 }
 fn check_hash(r: &Release, bytes: &[u8]) -> Result<()> {
-    if bytes.len() as u64 != r.size || format!("{:x}", Sha256::digest(bytes)) != r.sha256 {
+    if bytes.len() as u64 != r.size || crate::sha256_hex(bytes) != r.sha256 {
         return Err("release checksum rejected".into());
     }
     Ok(())
@@ -1538,10 +1538,10 @@ mod tests {
             edition: "community".into(),
             platform: std::env::consts::OS.into(),
             protocol: 2,
-            sha256: format!("{:x}", Sha256::digest(b"candidate")),
+            sha256: crate::sha256_hex(b"candidate"),
             size: 9,
             expires_at: Utc::now() + chrono::Duration::hours(1),
-            artifact: format!("/v2/update/artifact/{:x}", Sha256::digest(b"candidate")),
+            artifact: format!("/v2/update/artifact/{}", crate::sha256_hex(b"candidate")),
             rollback_from: vec![],
         };
         let key = SigningKey::from_bytes(&[47; 32]);

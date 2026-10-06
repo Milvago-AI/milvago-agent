@@ -5,14 +5,14 @@ use crate::{Envelope, State, browser_broker as broker, browser_cache as cache, d
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use rand::{RngCore, rngs::OsRng};
+
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+
 
 fn authority() -> SigningKey {
     let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
+    crate::fill_random(&mut seed);
     SigningKey::from_bytes(&seed)
 }
 
@@ -79,7 +79,7 @@ fn catalog(key: &SigningKey) -> Envelope {
             extension: detection::ENGINE_VERSION.into(),
             bridge: detection::ENGINE_VERSION.into(),
         },
-        content_hash: format!("{:x}", Sha256::digest(&raw)),
+        content_hash: crate::sha256_hex(&raw),
         content: STANDARD.encode(raw),
     };
     signed(key, &header)

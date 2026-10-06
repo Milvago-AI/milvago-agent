@@ -5,10 +5,10 @@ use crate::{Envelope, Result};
 use aes_gcm::{Aes256Gcm, Nonce, aead::{Aead, KeyInit, Payload}};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use ed25519_dalek::{Signer, SigningKey};
-use rand::{RngCore, rngs::OsRng};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+
 use zeroize::Zeroize;
 
 pub const PROTOCOL: u32 = 1;
@@ -111,7 +111,7 @@ pub struct Keys { signing: [u8;32], encryption: [u8;32] }
 impl Drop for Keys { fn drop(&mut self) { self.signing.zeroize(); self.encryption.zeroize(); } }
 impl Keys {
     pub fn generate() -> Self { let mut value=Self { signing:[0;32], encryption:[0;32] };
-        OsRng.fill_bytes(&mut value.signing); OsRng.fill_bytes(&mut value.encryption); value }
+        crate::fill_random(&mut value.signing); crate::fill_random(&mut value.encryption); value }
     pub fn public(&self) -> String { STANDARD.encode(SigningKey::from_bytes(&self.signing).verifying_key().as_bytes()) }
     pub(crate) fn sign(&self, value: &Value) -> Result<Envelope> {
         let payload=serde_json::to_vec(value)?;
@@ -119,7 +119,7 @@ impl Keys {
     }
 }
 
-pub fn hash(bytes: &[u8]) -> String { format!("{:x}",Sha256::digest(bytes)) }
+pub fn hash(bytes: &[u8]) -> String { crate::sha256_hex(bytes) }
 pub fn policy_content_hash(policy: &crate::shadow::ShadowPolicy) -> Result<String> {
     Ok(hash(&serde_json::to_vec(&json!({"version":policy.version,"config":policy.config,"capabilities":policy.capabilities}))?))
 }
@@ -189,7 +189,7 @@ pub fn prepare(journal: &mut Journal, keys: &Keys, policy: &Envelope, catalog: &
     let signed=keys.sign(&document)?;
     let mut plaintext=serde_json::to_vec(&signed)?;
     let aad=serde_json::to_vec(&metadata)?;
-    let mut nonce=[0u8;12];OsRng.fill_bytes(&mut nonce);
+    let mut nonce=[0u8;12];crate::fill_random(&mut nonce);
     let encrypted=Aes256Gcm::new_from_slice(&keys.encryption).map_err(|_|"cache key invalid")?
         .encrypt(Nonce::from_slice(&nonce),Payload{msg:&plaintext,aad:&aad});
     plaintext.zeroize();
