@@ -6,7 +6,11 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use std::{collections::BTreeSet, io::Read, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    path::Path,
+};
 pub const ENGINE_VERSION: &str = "0.5.0";
 #[derive(Default, Serialize, Deserialize)]
 pub struct Cache {
@@ -104,6 +108,19 @@ pub struct Network {
     /// records above.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session: String,
+    /// A form field carrying the whole message as one JSON document, which then becomes
+    /// the body every path of the rule reads: Gemini sends `f.req=<json>`. Its name may
+    /// hold a dot, which no path segment can name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub form_field: String,
+    /// A request header holding JSON from which `model_path` reads the model instead of
+    /// the body: Gemini states it only in `x-goog-ext-525001261-jspb`. Lower case.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_header: String,
+    /// Opaque model identifiers mapped to canonical names. An identifier the map does not
+    /// know is reported as `<provider>:<id>`, so the canonical names never hold `:`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_map: BTreeMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +226,28 @@ pub(crate) fn path(v: &str) -> bool {
             && v.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"/_.*-".contains(&b))
             && v.matches('*').count() <= 8)
+}
+// The form field, model header and model map of a network rule, bounded like the
+// engine and the server bound them. A header named without a path would read nothing.
+fn model_source_ok(n: &Network) -> bool {
+    let name = |v: &str, extra: &[u8]| {
+        !v.is_empty()
+            && v.len() <= 64
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    let reserved = |v: &str| matches!(v, "__proto__" | "constructor" | "prototype");
+    let header = |v: &str| v.bytes().all(|b| !b.is_ascii_uppercase());
+    (n.form_field.is_empty() || (name(&n.form_field, b"._-") && !reserved(&n.form_field)))
+        && (n.model_header.is_empty()
+            || (name(&n.model_header, b"-") && header(&n.model_header) && !n.model_path.is_empty()))
+        && n.model_map.len() <= 32
+        && n.model_map.iter().all(|(id, canonical)| {
+            name(id, b"._-")
+                && !reserved(id)
+                && name(canonical, b"._-")
+                && canonical.as_bytes()[0].is_ascii_alphanumeric()
+        })
 }
 fn json_path(v: &str) -> bool {
     if v.is_empty() {
@@ -384,6 +423,7 @@ pub fn validate(c: &Content) -> Result<()> {
                         || !f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                         || matches!(f.as_str(), "__proto__" | "constructor" | "prototype")
                 })
+                || !model_source_ok(n)
             {
                 return Err("invalid network rule".into());
             }
@@ -800,6 +840,9 @@ mod tests {
             files_path: "".into(),
             kind: "".into(),
             session: "".into(),
+            form_field: "".into(),
+            model_header: "".into(),
+            model_map: BTreeMap::new(),
         });
         // providers[0] now carries its own measured network rule: targeting index 0
         // would mutate THAT ONE instead of the rule added here, and the test would
@@ -888,6 +931,48 @@ mod tests {
         c.providers[0].network[ajoutee].conversation_url_segment = Some(17);
         assert!(validate(&c).is_err());
         c.providers[0].network[ajoutee].conversation_url_segment = None;
+        // A form field, a model header and a model map are bounded names, never paths or
+        // prototype keys, and a header is only accepted with the path that reads it.
+        c.providers[0].network[ajoutee].form_field = "f.req".into();
+        c.providers[0].network[ajoutee].model_header = "x-synthetic-ext-jspb".into();
+        c.providers[0].network[ajoutee].model_path = "4".into();
+        c.providers[0].network[ajoutee].model_map =
+            BTreeMap::from([("0123456789abcdef".into(), "synthetic-fast".into())]);
+        assert!(validate(&c).is_ok());
+        for bad in ["__proto__", "f req", "f[req]", &"f".repeat(65)] {
+            c.providers[0].network[ajoutee].form_field = bad.into();
+            assert!(validate(&c).is_err(), "form field {bad}");
+        }
+        c.providers[0].network[ajoutee].form_field = "f.req".into();
+        for bad in ["X-Upper", "x_ext", "x ext", &"x".repeat(65)] {
+            c.providers[0].network[ajoutee].model_header = bad.into();
+            assert!(validate(&c).is_err(), "model header {bad}");
+        }
+        c.providers[0].network[ajoutee].model_header = "x-synthetic-ext-jspb".into();
+        c.providers[0].network[ajoutee].model_path = "".into();
+        assert!(validate(&c).is_err(), "a header with no path reads nothing");
+        c.providers[0].network[ajoutee].model_path = "4".into();
+        for (id, name) in [
+            ("__proto__", "x"),
+            ("", "x"),
+            ("a b", "x"),
+            ("k", "bad:name"),
+            ("k", ""),
+            ("k", "-lead"),
+            ("k", &"n".repeat(65)),
+        ] {
+            c.providers[0].network[ajoutee].model_map =
+                BTreeMap::from([(id.to_string(), name.to_string())]);
+            assert!(validate(&c).is_err(), "model map {id} -> {name}");
+        }
+        c.providers[0].network[ajoutee].model_map = (0..33)
+            .map(|i| (format!("id{i}"), "n".to_string()))
+            .collect();
+        assert!(validate(&c).is_err());
+        c.providers[0].network[ajoutee].model_map = BTreeMap::new();
+        c.providers[0].network[ajoutee].model_header = "".into();
+        c.providers[0].network[ajoutee].form_field = "".into();
+        c.providers[0].network[ajoutee].model_path = "".into();
         let duplicate = c.providers[1].domains[0].clone();
         c.providers[0].aliases.push(duplicate);
         assert!(validate(&c).is_err());

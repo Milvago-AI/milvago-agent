@@ -315,21 +315,31 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
   const policy=getPolicy();if(!collecting(policy)){return;}
   if(!['POST','PUT'].includes(details.method)){return;}
   if(expires&&expires<=Date.now()){catalog=factoryCatalog;revision=0;catalogState='stale';A.applyCatalog(null);}
+  // Settled by `onBeforeSendHeaders`, or with null once the request ends without it.
+  let gotHeaders;const headers=new Promise(resolve=>{gotHeaders=resolve;});
   const work=(async()=>{
-   const hit=await observeRequest(details,catalog,modelObservation);if(hit){return hit;}
+   const hit=await observeRequest(details,catalog,modelObservation,headers);if(hit){return hit;}
    if(!policy.config.discovery?.enabled){return null;}
    let u;try{u=new URL(details.url);if(u.protocol!=='https:'||A.resolve(details.url)){return null;}}catch{return null;}
    return {candidate:u.hostname,signals:await candidateSignals(details,catalog)};
   })();
-  if(requests.size<128){requests.set(details.requestId,{work,details:{tabId:details.tabId,documentId:details.documentId,frameId:details.frameId},policyRevision:policy.revision,catalogRevision:revision,catalogState,authority:currentAuthority(api).then(value=>({value}),()=>({failed:true}))});}
+  if(requests.size>=128){gotHeaders(null);}
+  else {requests.set(details.requestId,{work,headers:gotHeaders,details:{tabId:details.tabId,documentId:details.documentId,frameId:details.frameId},policyRevision:policy.revision,catalogRevision:revision,catalogState,authority:currentAuthority(api).then(value=>({value}),()=>({failed:true}))});}
  },{urls:['<all_urls>']},['requestBody']);
  api.webRequest?.onHeadersReceived?.addListener(details=>{
   const entry=requests.get(details.requestId);if(!entry){return;}
+  // Request headers always precede the response: a request that showed none never will.
+  entry.headers(null);
   if(details.statusCode<200||details.statusCode>=300){requests.delete(details.requestId);return;}
   const mime=(details.responseHeaders||[]).find(h=>h.name.toLowerCase()==='content-type')?.value?.split(';')[0]?.trim().toLowerCase();
   void entry.work.then(hit=>deliverObserved(hit,entry,mime)).catch(()=>{});
   requests.delete(details.requestId);
  },{urls:['<all_urls>']},['responseHeaders']);
+ // Read-only and non-blocking: a rule may take the model from a request header
+ // (Gemini, `x-goog-ext-525001261-jspb`). A custom header is visible without
+ // `extraHeaders`, which Firefox would refuse as an unknown option. Registered apart so
+ // that a browser refusing it keeps every other observation.
+ try{api.webRequest?.onBeforeSendHeaders?.addListener(details=>{requests.get(details.requestId)?.headers(Array.isArray(details.requestHeaders)?details.requestHeaders:null);},{urls:['<all_urls>']},['requestHeaders']);}catch{/* the model of a header rule stays unknown */}
  // Presence: a platform the catalogue NAMES without covering it. The worker compares
  // the hostname of the top-level navigation, and never enters the page — no
  // content script registered, no selector, no body read. `known_platforms` never
@@ -429,6 +439,6 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
    schedule();
   });presenceSerial=operation.catch(()=>{});
  }
- api.webRequest?.onErrorOccurred?.addListener(d=>requests.delete(d.requestId),{urls:['<all_urls>']});}catch{catalogState='missing';}
+ api.webRequest?.onErrorOccurred?.addListener(d=>{requests.get(d.requestId)?.headers(null);requests.delete(d.requestId);},{urls:['<all_urls>']});}catch{catalogState='missing';}
  return {refresh,dom,prepareSubmit,confirmSubmit,releaseSubmit,replay,catalog:()=>catalog};
 }

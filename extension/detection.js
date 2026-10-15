@@ -73,8 +73,10 @@ export function decodeForm(form){
 // problem it solves: a prompt that happens to be JSON would become an object, and its
 // text would silently disappear.
 export function unwrapFields(body,fields){
- if(!body||typeof body!=='object'||Array.isArray(body)||!Array.isArray(fields)||!fields.length){return body;}
- const out={...body};
+ if(!body||typeof body!=='object'||!Array.isArray(fields)||!fields.length){return body;}
+ // An array root is unwrapped by position: Gemini's form document is `[null,"<json>"]`,
+ // its prompt sitting inside the string at index 1 (measured on 2026-10-15).
+ const out=Array.isArray(body)?[...body]:{...body};
  for(const field of fields.slice(0,4)){
   // `out[field]=…` on `__proto__` would write the object's prototype, not a field:
   // the catalogue is signed, but an engine does not rely on that alone.
@@ -83,6 +85,63 @@ export function unwrapFields(body,fields){
   try{const parsed=strictJSON(value,BODY_LIMIT);if(parsed&&typeof parsed==='object'){out[field]=parsed;}}catch{/* the field stays the string it is */}
  }
  return out;
+}
+const RESERVED=['__proto__','constructor','prototype'];
+// The text of a raw body, or null: bounded, uncompressed, strict UTF-8.
+function rawText(raw){
+ let bytes=0;
+ for(const part of raw){if(!part?.bytes||part.file){return {text:null,body_bytes:null};}bytes+=part.bytes.byteLength;if(bytes>16*1024*1024){return {text:null,body_bytes:null};}}
+ if(bytes>BODY_LIMIT){return {text:null,body_bytes:bytes};}
+ const joined=new Uint8Array(bytes);let at=0;for(const part of raw){joined.set(new Uint8Array(part.bytes),at);at+=part.bytes.byteLength;}
+ if(compressionOf(joined)){return {text:null,body_bytes:bytes};}
+ try{return {text:new TextDecoder('utf-8',{fatal:true}).decode(joined),body_bytes:bytes};}catch{return {text:null,body_bytes:bytes};}
+}
+// A form route whose whole message travels as ONE JSON document in one field: Gemini
+// sends `f.req=<json>` as `application/x-www-form-urlencoded` (measured on 2026-10-15).
+// That field becomes the body every path of the rule reads from. Its name carries a dot,
+// which `decodeForm` cannot expose (a path segment cannot name it), hence a field of
+// the rule rather than a path. Exactly one value, or nothing: two would be ambiguous.
+export function decodeFormField(details,field){
+ const none={body:null,body_bytes:null};
+ if(typeof field!=='string'||!/^[A-Za-z0-9._-]{1,64}$/.test(field)||RESERVED.includes(field)){return none;}
+ const request=details?.requestBody;
+ if(!request||typeof request!=='object'||request.error){return none;}
+ let values,body_bytes=null;
+ if(request.formData&&typeof request.formData==='object'&&!Array.isArray(request.formData)){
+  values=Object.hasOwn(request.formData,field)?request.formData[field]:undefined;
+ }else if(Array.isArray(request.raw)){
+  // Chrome only fills `formData` when the request declared a form type: the same
+  // fields sent without it arrive as bytes.
+  const read=rawText(request.raw);body_bytes=read.body_bytes;
+  if(read.text===null){return {body:null,body_bytes};}
+  try{values=new URLSearchParams(read.text).getAll(field);}catch{return {body:null,body_bytes};}
+ }
+ if(!Array.isArray(values)||values.length!==1||typeof values[0]!=='string'){return {body:null,body_bytes};}
+ try{return {body:strictJSON(values[0],BODY_LIMIT),body_bytes};}catch{return {body:null,body_bytes};}
+}
+// Ceiling of a header value read as JSON: Gemini's model header is about 300 bytes.
+export const HEADER_LIMIT=4096;
+// The JSON document a request header carries, or undefined. Exactly one header of that
+// name, or nothing: a repeated header is ambiguous.
+export function headerJSON(headers,name){
+ if(!Array.isArray(headers)||typeof name!=='string'||!/^[a-z0-9-]{1,64}$/.test(name)){return undefined;}
+ const found=headers.slice(0,256).filter(h=>h&&typeof h==='object'&&typeof h.name==='string'&&h.name.toLowerCase()===name);
+ if(found.length!==1||typeof found[0].value!=='string'){return undefined;}
+ try{return strictJSON(found[0].value,HEADER_LIMIT);}catch{return undefined;}
+}
+export const MODEL_SHAPE=/^[A-Za-z0-9._:/-]{1,200}$/;
+const CANONICAL_MODEL=/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// A provider that names its models with opaque identifiers (Gemini: `e051ce1aa80aa576`)
+// gets them translated by the rule's `model_map`. An identifier the map does not know is
+// still reported, prefixed with the provider (`gemini:<id>`), so a new model shows up in
+// the console instead of disappearing; a mapped name never carries `:`, so the two forms
+// cannot collide.
+export function canonicalModel(raw,rule,providerId){
+ if(typeof raw!=='string'||!MODEL_SHAPE.test(raw)){return undefined;}
+ const map=rule?.model_map;
+ if(!map||typeof map!=='object'||Array.isArray(map)){return raw;}
+ if(Object.hasOwn(map,raw)){const value=map[raw];return typeof value==='string'&&CANONICAL_MODEL.test(value)?value:undefined;}
+ return raw.length<=64&&typeof providerId==='string'&&/^[a-z0-9][a-z0-9._-]{0,63}$/.test(providerId)?providerId+':'+raw:undefined;
 }
 export async function decodeBody(details){
  let bytes=0;const raw=details.requestBody?.raw;
@@ -178,7 +237,12 @@ export function bodyTextSync(details,rule){
 export function wireFacts(details,catalog,url){
  const file=!!matchRule(catalog,details,url,'file');
  if(file){return {file:true,readable:false,texts:[],body:null};}
- const match=matchRule(catalog,details,url);
+ const found=matchRule(catalog,details,url);
+ // A `form_field` route is read by observation only. Holding Gemini's send to the
+ // approved text was never qualified (the form copy of the prompt has not been compared
+ // with what the composer approves), so the guard treats it exactly as it did before
+ // the route was catalogued, rather than risk sealing every send under masking.
+ const match=found&&!found.rule.form_field?found:null;
  const read=bodyTextSync(details,match?.rule);
  // `route`: the request is a PROMPT route of the catalogue. Under masking, this — and a
  // body shaped like a prompt — is what the decision keeps, and nothing else.
@@ -194,11 +258,13 @@ function textsAt(body,rule){
  }
  return [];
 }
-export async function observeRequest(details,catalog,modelEnabled=false){
+// `headers`: the request headers, or a promise of them. `webRequest` only states them in
+// `onBeforeSendHeaders`, after the body; it is awaited only by a rule that reads one.
+export async function observeRequest(details,catalog,modelEnabled=false,headers=null){
  let url;try{url=new URL(details.url);if(url.protocol!=='https:'||url.username||url.password||url.port){return null;}}catch{return null;}
  const match=matchRule(catalog,details,url);
  if(!match){return null;}
- const {provider,rule}=match,{body:decoded,body_bytes}=await decodeBody(details);
+ const {provider,rule}=match,{body:decoded,body_bytes}=rule.form_field?decodeFormField(details,rule.form_field):await decodeBody(details);
  const body=unwrapFields(decoded,rule.json_fields);
  // One route can carry two body shapes: Le Chat names the text `content[*].text` when
  // it opens a thread and `messageInput[*].text` afterwards. Two rules cannot settle
@@ -208,7 +274,15 @@ export async function observeRequest(details,catalog,modelEnabled=false){
  // versions of its interface.
  const texts=textsAt(body,rule);
  const text=texts.join('');
- const model=modelEnabled?only(body,rule.model_path,/^[A-Za-z0-9._:/-]{1,200}$/):undefined;
+ // Gemini states its model only in a request header holding JSON
+ // (`x-goog-ext-525001261-jspb`, measured on 2026-10-15); `model_path` then walks that
+ // document instead of the body.
+ let model;
+ if(modelEnabled){
+  let source=body;
+  if(rule.model_header){try{source=headerJSON(await headers,rule.model_header);}catch{source=undefined;}}
+  model=canonicalModel(only(source,rule.model_path,MODEL_SHAPE),rule,provider.id);
+ }
  // The reasoning effort the request asked for. Providers name it differently
  // (`effort`, `thinking_effort`), hence its own path in the rule; the page only ever
  // shows it fused into a translated model label.
