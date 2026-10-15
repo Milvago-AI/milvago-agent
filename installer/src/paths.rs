@@ -1136,7 +1136,9 @@ mod tests {
         let dir = tempfile_dir();
         // Created under ProgramData, it inherits Users' write grant: refused as it should be.
         assert_eq!(assert_path(&dir, &[me.as_str()], true).unwrap_err().step, "Installer ancestor is writable by an untrusted principal");
-        set_acl(&dir, &format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"), true).unwrap();
+        // The owner is set explicitly: under an elevated administrator (a CI runner) new
+        // objects default to Administrators as owner, which would make the tree trusted.
+        set_acl(&dir, &format!("O:{me}D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"), true).unwrap();
         let file = dir.join("state.bin");
         std::fs::write(&file, b"x").unwrap();
         // A user-owned temporary tree passes when that user is an allowed owner...
