@@ -146,20 +146,30 @@
   const state=()=>({url:location.href,policy:policyState(),epoch:draftEpoch,attempt});
   const unchanged=s=>!disposed&&s.url===location.href&&s.policy===policyState()&&s.epoch===draftEpoch&&s.attempt===attempt;
   function invalidSubmit(final,text,snapshot,editor,target,control){return !final.ok||final.action!=='observe'||final.text!==text||(final.recording_required!==false&&(final.durable!==true||!validReceipt(final.delivery_id)||(final.authority!==null&&!(typeof final.authority==='string'&&/^[0-9a-f]{64}$/.test(final.authority)))))||!unchanged(snapshot)||!editor.isConnected||!target.isConnected||A.read(editor)!==text||control?.disabled||control?.getAttribute('aria-disabled')==='true';}
+  // Hashing is optional (no SubtleCrypto in some contexts) but a hashing failure must stop the send.
+  async function receiptDigest(text){
+   try{return {digest:win.crypto.subtle?await win.crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)):undefined};}catch{return null;}
+  }
+  const receiptRequired=final=>final.recording_required!==false&&final.durable===true&&validReceipt(final.delivery_id);
+  function storeReceipt(final,digest){
+   if(receipts.length>=128){receipts.shift();}
+   receipts.push({fingerprint:Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join(''),delivery_id:final.delivery_id,authority:final.authority});
+  }
+  const submitEvent=(text,deliveryCorrelation)=>({kind:'prompt',action:'observed',characters:Array.from(text).length,labels:[],url:location.href,correlation_id:deliveryCorrelation,...(policy?.config.collection.store_file_names&&attached.size?{files:[...attached]}:{})});
   async function submit(editor,text,intent,snapshot){
    const {control,form,target}=intent;
    if(!unchanged(snapshot)||!editor.isConnected||!target.isConnected||A.read(editor)!==text){return;}
    const deliveryCorrelation=draftCorrelation||win.crypto.randomUUID();pending=true;
    try{
-    let submitDigest;
-    try{if(win.crypto.subtle){submitDigest=await win.crypto.subtle.digest('SHA-256',new TextEncoder().encode(text));}}catch{notice('Envoi en attente','Le lien avec le reçu durable est indisponible.');return;}
+    const hashed=await receiptDigest(text);
+    if(!hashed){notice('Envoi en attente','Le lien avec le reçu durable est indisponible.');return;}
+    const submitDigest=hashed.digest;
     if(!unchanged(snapshot)||A.read(editor)!==text){return;}
-    const final=await message({type:'submit',text,upload:false,event:{kind:'prompt',action:'observed',characters:Array.from(text).length,labels:[],url:location.href,correlation_id:deliveryCorrelation,...(policy?.config.collection.store_file_names&&attached.size?{files:[...attached]}:{})}});
+    const final=await message({type:'submit',text,upload:false,event:submitEvent(text,deliveryCorrelation)});
     if(invalidSubmit(final,text,snapshot,editor,target,control)){notice('Envoi en attente',final.reason||'La validation finale ou l’enregistrement durable a échoué.');return;}
-    if(final.recording_required!==false&&final.durable===true&&validReceipt(final.delivery_id)){
+    if(receiptRequired(final)){
      if(!submitDigest){notice('Envoi en attente','Le lien avec le reçu durable est indisponible.');return;}
-     if(receipts.length>=128){receipts.shift();}
-     receipts.push({fingerprint:Array.from(new Uint8Array(submitDigest),b=>b.toString(16).padStart(2,'0')).join(''),delivery_id:final.delivery_id,authority:final.authority});
+     storeReceipt(final,submitDigest);
     }
     correlation=deliveryCorrelation;draftCorrelation=null;resetResponses();attached.clear();close();
     replay={editor,text,target,form,clicked:false,submitted:false};
@@ -193,15 +203,21 @@
    if(answer.action==='review'||answer.text!==text){notice('Informations confidentielles','Les informations que vous avez fournies contiennent des informations confidentielles, merci de vérifier les éléments que nous avons masqués ci-dessous avant envoi.',answer.text,allow,'Valider et envoyer');}
    else {await allow();}
   }
-  async function handle(event){
+  // True when the event is our own replayed click/submit or the page's follow-up submit of it.
+  function isOwnReplay(event){
    if(replay&&A.read(replay.editor)===replay.text){
-    if(event.type==='click'&&event.target===replay.target&&!replay.clicked){replay.clicked=true;return;}
-    if(event.type==='submit'&&event.target===replay.form&&!replay.submitted){replay.submitted=true;return;}
+    if(event.type==='click'&&event.target===replay.target&&!replay.clicked){replay.clicked=true;return true;}
+    if(event.type==='submit'&&event.target===replay.form&&!replay.submitted){replay.submitted=true;return true;}
    }
    if(continuation&&event.type==='submit'){
     const next=continuation;continuation=null;
-    if(event.target===next.form&&Date.now()<next.until&&A.read(next.editor)===next.text){return;}
+    if(event.target===next.form&&Date.now()<next.until&&A.read(next.editor)===next.text){return true;}
    }
+   return false;
+  }
+  const validInspection=answer=>['observe','review','block','redirect'].includes(answer.action)&&typeof answer.text==='string'&&withinLimit(answer.text);
+  async function handle(event){
+   if(isOwnReplay(event)){return;}
    const editor=A.submission(adapter,event,document,draftCorrelation!==null);if(!editor){return;}const text=A.read(editor);
    stop(event);if(pending){return;}
    attempt++;const intent=A.submissionTarget(adapter,event,editor,document);
@@ -210,7 +226,7 @@
    const snapshot=state();pending=true;const answer=await message({type:'inspect',text,upload:false});pending=false;
    if(!unchanged(snapshot)||!editor.isConnected||A.read(editor)!==text){return;}
    if(!answer.ok){notice('Envoi en attente',answer.reason||'Connectez l’agent local puis réessayez.');return;}
-   if(!['observe','review','block','redirect'].includes(answer.action)||typeof answer.text!=='string'||!withinLimit(answer.text)){notice('Envoi en attente','Réponse de contrôle non valide.');return;}
+   if(!validInspection(answer)){notice('Envoi en attente','Réponse de contrôle non valide.');return;}
    await completeInspection(answer,editor,text,intent,snapshot);
   }
   // Opening a local picker transmits nothing. Intercept its change event instead,
