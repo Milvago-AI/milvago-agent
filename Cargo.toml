@@ -1,6 +1,6 @@
 [package]
 name = "milvago-browser-agent"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
@@ -30,7 +30,7 @@ regex = "=1.13.1"
 unicode-normalization = "=0.1.25"
 sha2 = "=0.11.0"
 unicode-security = "=0.1.2"
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
 time = "=0.3.55"
 

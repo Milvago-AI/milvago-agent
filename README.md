@@ -61,6 +61,9 @@ cargo test
 cd extension && npm ci && npm test && cd ..
 node extension/build-editions.js        # -> extension-community/, extension-firefox-community/
 node scripts/verify-community-package.mjs
+
+# Windows MSI custom actions (Windows only; elsewhere it builds a stub)
+cd installer && cargo build --release --locked && cargo test --release --locked
 ```
 
 On Windows, a release build embeds the signed extension packages it distributes, and fails if
@@ -69,7 +72,7 @@ The agent then carries no extension of its own.
 
 Signed packages (CRX, Mozilla-signed XPI) and installers (MSI, Linux archives) are produced by
 the release pipeline and are not built from this repository. The prepared release uses common
-agent and extension version `0.6.5` across both editions and all supported browsers; it has not
+agent and extension version `0.7.0` across both editions and all supported browsers; it has not
 been published yet.
 
 ## Repository layout
@@ -81,6 +84,7 @@ been published yet.
 | `extension/` | The browser extension (Chromium and Firefox from one source tree) |
 | `tests/` | Integration tests |
 | `fuzz/` | Fuzz targets (nightly toolchain, see `fuzz/README.md`) |
+| `installer/` | Native custom actions of the Windows MSI (`milvago-installer`, Windows only) |
 
 ## Community and Enterprise
 

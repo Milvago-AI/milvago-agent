@@ -41,6 +41,13 @@ jobs:
       - run: cargo build --release --locked
         env:
           MILVAGO_EMBED_EXTENSION: '0'
+      # The MSI's native custom actions are Windows code; elsewhere the crate is a stub that
+      # must still build.
+      - run: cargo build --release --locked
+        working-directory: installer
+      - run: cargo test --release --locked
+        if: runner.os == 'Windows'
+        working-directory: installer
 
   # cargo-audit reads the RustSec advisories against both lock files. A non-zero exit fails.
   audit:
@@ -55,6 +62,7 @@ jobs:
       - run: cargo install cargo-audit --version =0.22.2 --locked
       - run: cargo audit
       - run: cargo audit --file browser-engine/Cargo.lock
+      - run: cargo audit --file installer/Cargo.lock
 
   extension:
     runs-on: ubuntu-24.04
