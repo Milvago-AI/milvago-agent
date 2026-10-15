@@ -325,22 +325,36 @@ fn set_aside_if_planted(path: &Path, fresh: bool) -> Result<()> {
     Ok(())
 }
 
-/// m5: whether Chrome treats this machine as managed — joined to an AD domain, or
-/// enrolled in an MDM (Intune). Otherwise it may ignore a force-installed extension
-/// hosted outside the Chrome Web Store.
+/// m5: whether Chrome and Edge treat this machine as managed — joined to an AD domain,
+/// joined to Microsoft Entra ID, or enrolled in an MDM (Intune). Otherwise they refuse a
+/// force-installed extension hosted outside their store. Entra join alone was measured
+/// sufficient for both browsers on 2026-10-15; an Entra *registered* (workplace) device
+/// is not.
 fn managed_machine() -> bool {
     #[link(name = "netapi32")]
     unsafe extern "system" {
         fn NetGetJoinInformation(server: *const u16, name: *mut *mut u16, status: *mut u32) -> u32;
         fn NetApiBufferFree(buffer: *mut std::ffi::c_void) -> u32;
+        fn NetGetAadJoinInformation(tenant: *const u16, info: *mut *mut u32) -> i32;
+        fn NetFreeAadJoinInformation(info: *mut u32);
     }
     let (mut name, mut status) = (std::ptr::null_mut(), 0u32);
     let joined = unsafe { NetGetJoinInformation(std::ptr::null(), &mut name, &mut status) } == 0 && status == 3; // NetSetupDomainName
     if !name.is_null() {
         unsafe { NetApiBufferFree(name.cast()) };
     }
-    joined || reg::subkey_names(r"SOFTWARE\Microsoft\Enrollments").unwrap_or_default().iter()
+    // DSREG_JOIN_INFO starts with its DSREG_JOIN_TYPE; 1 is DSREG_DEVICE_JOIN.
+    let mut info = std::ptr::null_mut();
+    let entra = unsafe { NetGetAadJoinInformation(std::ptr::null(), &mut info) } == 0 && !info.is_null() && entra_device_join(unsafe { *info });
+    if !info.is_null() {
+        unsafe { NetFreeAadJoinInformation(info) };
+    }
+    joined || entra || reg::subkey_names(r"SOFTWARE\Microsoft\Enrollments").unwrap_or_default().iter()
         .any(|id| win::reg_string(&format!(r"SOFTWARE\Microsoft\Enrollments\{id}"), "ProviderID").as_deref() == Some("MS DM Server"))
+}
+
+fn entra_device_join(join_type: u32) -> bool {
+    join_type == 1
 }
 
 /// The explicit proxy of `MILVAGO_PROXY`: http(s)://host[:port], no credentials, nothing
@@ -565,7 +579,7 @@ pub fn install(l: &Layout, options: &Install) -> Result<String> {
     set_firefox_extension(&gecko, local["firefox_install_url"].as_str().unwrap_or_default(),
         &format!("{}/ext/updates.json", local["firefox_origin"].as_str().unwrap_or_default()))?;
     if !managed_machine() {
-        win::event(1002, false, &format!("Extension policy written for {id} but this computer is neither joined to an Active Directory domain nor enrolled in an MDM. Chrome may refuse to install an extension hosted outside the Chrome Web Store on such a machine."));
+        win::event(1002, false, &format!("Extension policy written for {id} but this computer is not joined to an Active Directory domain or to Microsoft Entra ID, nor enrolled in an MDM. Chrome and Edge may refuse to install an extension hosted outside the Chrome Web Store on such a machine."));
     }
     // Agent service: NetworkService, automatic, restart on failure.
     services::write_configuration(l.agent_service, &Configuration {
@@ -727,6 +741,13 @@ pub fn remove(l: &Layout) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_an_entra_device_join_counts_as_managed() {
+        assert!(super::entra_device_join(1), "DSREG_DEVICE_JOIN");
+        assert!(!super::entra_device_join(2), "a workplace-registered device is not managed");
+        assert!(!super::entra_device_join(0));
+    }
+
 
     #[test]
     fn proxy_values_are_strict() {
