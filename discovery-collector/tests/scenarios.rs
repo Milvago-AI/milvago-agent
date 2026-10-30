@@ -1369,6 +1369,9 @@ fn custom_routes_after_the_factory_are_really_probed_with_bounded_requests() {
             while !end.load(Ordering::Acquire) && Instant::now() < deadline && requests < count {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets may inherit the listener's nonblocking
+                        // mode on Windows; the fixture reads bounded HTTP headers.
+                        stream.set_nonblocking(false).unwrap();
                         stream
                             .set_read_timeout(Some(Duration::from_secs(1)))
                             .unwrap();
