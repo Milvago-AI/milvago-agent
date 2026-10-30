@@ -13,13 +13,13 @@ const catalog={providers:[{id:'synthetic',label:'Synthetic',domains:['ai.example
 const bytes=value=>new TextEncoder().encode(JSON.stringify(value)).buffer;
 const tick=()=>new Promise(resolve=>setTimeout(resolve,0));
 
-function fixture({storage={},receipt=null,durableReceipt=false,failCompletion=false}={}){
+function fixture({storage={},receipt=null,durableReceipt=false,failCompletion=false,correlation=null}={}){
  const listeners={},calls=[];let currentReceipt=receipt;
  globalThis.MilvagoAdapters={resolve:()=>({id:'synthetic'}),applyCatalog:()=>{}};
  const api={
   runtime:{getManifest:()=>({version:'0.5.8',content_scripts:[]})},
   storage:{managed:{async get(){return {milvago_pin:JSON.stringify(pin)}}},local:{async get(){return structuredClone(storage);},async set(value){Object.assign(storage,structuredClone(value));}}},
-  tabs:{async sendMessage(){return {ok:true,delivery_id:currentReceipt,authority};}},
+  tabs:{async sendMessage(){return {ok:true,delivery_id:currentReceipt,authority,...(correlation?{correlation_id:correlation}:{})};}},
   webRequest:{
    onBeforeRequest:{addListener(listener){listeners.before=listener;}},
    onHeadersReceived:{addListener(listener){listeners.headers=listener;}},
@@ -123,4 +123,15 @@ test('an unplaceable completion never costs the event its receipt',async()=>{
  assert.equal(f.calls.filter(call=>call.op==='event_complete').length,1);
  assert.equal(f.calls.filter(call=>call.op==='event_v2').length,0,'a refused completion produced a second prompt');
  assert.equal(f.storage.detectorPending?.length??0,0,'a refused completion kept the delivery pending');
+});
+
+// Real campaign 0.7.8: a pasted chip sent with an empty draft reached the network with a body the DOM
+// never saw. The page names the exchange its send opened; the network record carries it, nothing more.
+test('a network prompt the DOM did not see takes the exchange its page names, never a malformed one',async()=>{
+ for(const [correlation,expected] of [['00000000-0000-4000-8000-0000000000c1','00000000-0000-4000-8000-0000000000c1'],['not-a-uuid',undefined]]){
+  const f=fixture({receipt:null,correlation});await f.runtime.refresh();await network(f,null,'chip-'+expected);
+  await new Promise(resolve=>setTimeout(resolve,3100));await f.runtime.replay();
+  const sent=f.calls.filter(call=>call.op==='event_v2');
+  assert.equal(sent.length,1);assert.equal(sent[0].event.correlation_id,expected);
+ }
 });

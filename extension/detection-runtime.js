@@ -83,7 +83,7 @@ function platformCandidates(index, hostname){
  return candidates;
 }
 // `waitPolicy` resolves to the current valid policy, refreshing it if needed, or to null.
-export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>getPolicy()){
+export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>getPolicy(),pasteLabels=()=>[]){
  const A=globalThis.MilvagoAdapters;
  let catalog=factoryCatalog,revision=0,catalogState='missing',expires=0,registeredRevision=-1,excludedDomains=[];
  const DAY=86400000,validAuthority=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
@@ -183,12 +183,17 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
  }
  async function syncContentScripts(){
   if(api.scripting&&registeredRevision!==revision){
+   // A worker the browser stopped and started again forgets this; executing the scripts again replaced the capture
+   // of every open tab, losing the send it held and its answer (measured 2026-10-17). The session keeps it.
+   let injected;try{injected=(await api.storage.session?.get('detectionScripts'))?.detectionScripts;}catch{/* unavailable: inject */}
+   if(injected===revision){registeredRevision=revision;return;}
    const ids=(await api.scripting.getRegisteredContentScripts()).filter(s=>s.id.startsWith('milvago-detection-')).map(s=>s.id);
    if(ids.length){await api.scripting.unregisterContentScripts({ids});}
    const builtins=new Set(api.runtime.getManifest().content_scripts.flatMap(s=>s.matches));
    const matches=catalog?.providers.flatMap(p=>[...p.domains,...p.aliases].map(d=>'https://'+d+'/*')).filter(m=>!builtins.has(m))||[];
    if(matches.length){await api.scripting.registerContentScripts([{id:'milvago-detection-catalog',matches,js:['adapters.js','capture.js'],runAt:'document_start',allFrames:false,persistAcrossSessions:false}]);}
    registeredRevision=revision;for(const tab of await api.tabs.query({})){if(A.resolve(tab.url)){await api.scripting.executeScript({target:{tabId:tab.id},files:['adapters.js','capture.js']}).catch(()=>{});}}
+   try{await api.storage.session?.set({detectionScripts:revision});}catch{/* unavailable: the next start injects again */}
   }
  }
  async function refresh(){
@@ -216,8 +221,21 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
  // needs no fingerprint pairing and no time window, only the tab they were seen in.
  // Kept here rather than read from the page, so a compromised document cannot name the
  // model its own traffic is attributed to.
- const TAB_TTL=30*60*1000,TABS=64;
+ const TAB_TTL=30*60*1000,TABS=64,SAME_EXCHANGE_MS=60*1000;
  const seenByTab=new Map();
+ // A worker the browser stopped (idle about 30 s) forgot this, and a provider may name its model only on a
+ // conversation's first message (real campaign 0.7.12): the session keeps it, out of reach of content scripts.
+ // Attribution only, no decision reads it. A restored entry names a model only to its own conversation.
+ const seenStore=api.storage?.session,SEEN_FIELDS=['model','effort','conversation_id'];
+ const seenValid=e=>!!e&&typeof e==='object'&&Number.isSafeInteger(e.tab)&&e.tab>=0&&typeof e.provider==='string'&&e.provider.length<=253
+  &&typeof e.at==='number'&&e.at<=Date.now()+60000&&Date.now()-e.at<=TAB_TTL&&(e.session===undefined||SESSIONS.includes(e.session))
+  &&SEEN_FIELDS.every(k=>e[k]===undefined||(typeof e[k]==='string'&&e[k].length<=512))&&Object.keys(e).every(k=>['tab','provider','at','session',...SEEN_FIELDS].includes(k));
+ // Read on first use, not at start: a worker woken for anything else touches no session state.
+ let seenLoad;const seenReady=()=>seenLoad||=(async()=>{try{const stored=(await seenStore?.get('detectionSeen'))?.detectionSeen;
+  if(Array.isArray(stored)){for(const {tab,...entry} of stored.slice(-TABS).filter(seenValid)){seenByTab.set(tab,{...entry,restored:true});}}}catch{/* unavailable: this worker's memory only */}})();
+ let seenSaving=Promise.resolve();
+ function saveSeen(){if(seenStore){seenSaving=seenSaving.then(()=>seenStore.set({detectionSeen:[...seenByTab].map(([tab,entry])=>({tab,...Object.fromEntries(Object.entries(entry).filter(([key,value])=>value!==undefined&&key!=='restored'))}))})).catch(()=>{});}}
+ try{api.tabs?.onRemoved?.addListener(tabId=>{void seenReady().then(()=>{if(seenByTab.delete(tabId)){saveSeen();}});});}catch{/* no tab events: entries expire */}
  function remember(tabId,provider,hit){
   if(typeof tabId!=='number'||tabId<0){return;}
   if(!hit.model&&!hit.effort&&!hit.conversation_id&&!hit.session){return;}
@@ -230,10 +248,14 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
   if(hit.model||hit.effort){entry.model=hit.model;entry.effort=hit.effort;}
   // The conversation identifier belongs to the thread rather than to one request, and
   // a provider may only state it from the second message onwards, so it persists.
+  // Another conversation naming no model does not inherit the previous one's (follow-up messages take it).
+  if(hit.conversation_id&&entry.conversation_id&&hit.conversation_id!==entry.conversation_id&&!hit.model){entry.model=undefined;entry.effort=undefined;}
   if(hit.conversation_id){entry.conversation_id=hit.conversation_id;}
+  if(hit.model||hit.conversation_id){delete entry.restored;}
   entry.at=Date.now();
   seenByTab.delete(tabId);seenByTab.set(tabId,entry);
   while(seenByTab.size>TABS){seenByTab.delete(seenByTab.keys().next().value);}
+  saveSeen();
  }
  function recall(tabId,provider){
   const entry=seenByTab.get(tabId);
@@ -244,8 +266,9 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
 
 
  async function dom(event,sender,input){
-  await ready;await pendingReady;const id=A.resolve(sender.url)?.id;if(!id){return {ok:false};}
-  enrichResponse(event,recall(sender.tab?.id,event.provider));
+  await ready;await pendingReady;await seenReady();const id=A.resolve(sender.url)?.id;if(!id){return {ok:false};}
+  const seen=recall(sender.tab?.id,event.provider);
+  enrichResponse(event,seen?.restored&&!(event.conversation_id&&event.conversation_id===seen.conversation_id)?null:seen);
   const authority=await currentAuthority(api);
   await count(id,metricFor(event.kind),revision,catalogState,authority);
   event.catalog_revision=revision;
@@ -256,13 +279,16 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
   const delivery_id=await fusion.add(event,senderIdentity(sender),digest,'dom',!paired,authority,captureId);
   schedule();return {ok:true,delivery_id};
  }
- async function resumeNetworkReceipt(event,hit,entry,provider){
+ async function resumeNetworkReceipt(event,hit,entry,provider,labelled){
   if(!hit.fingerprint){return false;}
   const options={frameId:entry.details.frameId||0};
   if(entry.details.documentId){options.documentId=entry.details.documentId;}
   const receipt=await api.tabs.sendMessage(entry.details.tabId,{type:'detection-receipt',fingerprint:hit.fingerprint},options);
   if(receipt?.ok!==true||!(receipt.delivery_id===null||receiptID(receipt.delivery_id))){throw new Error('Document receipt unavailable');}
-  if(!receipt.delivery_id){return false;}
+  if(!receipt.delivery_id){if(receiptID(receipt.correlation_id)){event.correlation_id=receipt.correlation_id;}return false;}
+  // A send named through a chip its record read as a preview carried the labels of the reviewed paste, which a
+  // completion cannot add (it never revises a record): kept as its own prompt of the same exchange, never lost.
+  if(labelled&&receipt.chip===true&&receiptID(receipt.correlation_id)){event.correlation_id=receipt.correlation_id;return false;}
   if(!validAuthority(receipt.authority)){throw new Error('Document receipt authority unavailable');}
   await fusion.resume(event,identity(entry.details,provider.id),receipt.delivery_id,receipt.authority);
   return true;
@@ -279,13 +305,22 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
   return event;
  }
  async function deliverNetworkHit(hit,entry,authority){
-  const policy=getPolicy(),provider=hit.provider;
+  await seenReady();const policy=getPolicy(),provider=hit.provider;
   if(policy?.revision!==entry.policyRevision||!policy.config.collection.enabled||!policy.config.services.some(s=>s.enabled&&s.domains.includes(provider.domains[0]))){return;}
+  // No prompt in it: only what it names is kept for the exchange (`observeRequest`).
+  if(hit.silent){remember(entry.details.tabId,provider.domains[0],hit);return;}
   await count(provider.id,'prompts_network',entry.catalogRevision,entry.catalogState,authority);
   const event=networkEvent(hit,provider,policy,entry);
+  // A follow-up message may name no model while its conversation did (claude.ai's next prompt, a session
+  // opening sent just before its message; real campaign 0.7.8): it is the request's own exchange, so the
+  // model its conversation last named holds, never one from another conversation or a stale one.
+  if(!hit.model){const seen=recall(entry.details.tabId,provider.domains[0]);if(seen?.model&&(hit.conversation_id?seen.conversation_id===hit.conversation_id:!seen.restored&&Date.now()-seen.at<=SAME_EXCHANGE_MS)){event.model=seen.model;if(seen.effort&&!hit.effort){event.effort=seen.effort;}}}
   // The exchange named itself; the response of this tab will carry it too.
   remember(entry.details.tabId,provider.domains[0],hit);
-  if(await resumeNetworkReceipt(event,hit,entry,provider)){return;}
+  // Taken even when the send's own record absorbs this one, never left for a later prompt.
+  const labels=pasteLabels(entry.details,provider.id);
+  if(await resumeNetworkReceipt(event,hit,entry,provider,labels.length>0)){return;}
+  if(labels.length){event.labels=labels;}
   await fusion.add(event,identity(entry.details,provider.id),hit.fingerprint,'network',false,authority);
   schedule();
  }
@@ -336,7 +371,7 @@ export function detectionRuntime(api,bridge,tool,getPolicy,waitPolicy=async()=>g
   requests.delete(details.requestId);
  },{urls:['<all_urls>']},['responseHeaders']);
  // Read-only and non-blocking: a rule may take the model from a request header
- // (Gemini, `x-goog-ext-525001261-jspb`). A custom header is visible without
+ // (`model_header`). A custom header is visible without
  // `extraHeaders`, which Firefox would refuse as an unknown option. Registered apart so
  // that a browser refusing it keeps every other observation.
  try{api.webRequest?.onBeforeSendHeaders?.addListener(details=>{requests.get(details.requestId)?.headers(Array.isArray(details.requestHeaders)?details.requestHeaders:null);},{urls:['<all_urls>']},['requestHeaders']);}catch{/* the model of a header rule stays unknown */}

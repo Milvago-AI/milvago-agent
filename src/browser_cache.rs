@@ -129,7 +129,7 @@ pub fn envelope_hash(envelope: &Envelope) -> Result<String> { Ok(hash(&STANDARD.
 /// tokens and server secrets never enter the signed browser document.
 fn browser_config(config: &Value, edition: &str) -> Result<Value> {
     let mut out = json!({});
-    for key in ["services", "protection", "privacy", "collection", "discovery"] {
+    for key in ["services", "protection", "privacy", "collection", "discovery", "dlp", "dlp_context", "dlp_fingerprint", "dlp_legacy_disabled"] {
         if let Some(value)=config.get(key) { out[key]=value.clone(); }
     }
     if let Some(classification)=config.get("classification") {

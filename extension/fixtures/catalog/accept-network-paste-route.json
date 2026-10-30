@@ -1,0 +1,57 @@
+{
+  "case": "network-paste-route",
+  "reason": "A rule may say that a route uploads pasted text at paste time (a long paste turned into a file): under masking a text file there leaves only as a paste the agent approved, matched on its content or its declared size; any other file keeps the file behaviour. Observation ignores the route. Omitted when empty, so a catalogue that declares none still reaches an agent that predates the value.",
+  "server": "accept",
+  "engine": "accept",
+  "content": {
+    "providers": [
+      {
+        "id": "acme-assistant",
+        "label": "Acme Assistant",
+        "domains": [
+          "assistant.example-corp.test"
+        ],
+        "aliases": [
+          "assistant-alias.example-corp.test"
+        ],
+        "conversation_path": "/session/*",
+        "conversation_segment": 1,
+        "dom": {
+          "editor": "textarea.prompt",
+          "send": "button.send",
+          "response": ".response"
+        },
+        "network": [
+          {
+            "method": "POST",
+            "host": "assistant.example-corp.test",
+            "path": "/api/v1/complete",
+            "text_path": "messages[*].content",
+            "model_path": "model",
+            "conversation_path": "session_id"
+          },
+          {
+            "method": "POST",
+            "host": "assistant.example-corp.test",
+            "path": "/api/v1/files",
+            "kind": "paste"
+          }
+        ],
+        "qualified_at": "2026-09-11T00:00:00Z"
+      }
+    ],
+    "native_tools": [],
+    "heuristics": {
+      "keys": [
+        "messages",
+        "prompt",
+        "model",
+        "input"
+      ],
+      "mime_types": [
+        "text/event-stream",
+        "application/json"
+      ]
+    }
+  }
+}

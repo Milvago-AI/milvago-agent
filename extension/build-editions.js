@@ -20,7 +20,7 @@ const root = join(here, '..');
 const firefoxVersion = (await readFile(join(here, 'firefox-version.txt'), 'utf8')).trim();
 if (!/^\d+\.\d+\.\d+$/.test(firefoxVersion)) {throw new Error('Invalid Firefox release version');}
 const ports = JSON.parse(await readFile(join(root, 'extension-ports.json'), 'utf8'));
-const shared = ['milvago-symbol-256.png', 'managed-schema.json', 'adapters.js', 'detection.js', 'detection-factory.js', 'detection-runtime.js', 'model-access.js', 'background.js', 'broker.js', 'capture.js', 'policy.js', 'popup.html', 'popup.css', 'popup.js'];
+const shared = ['milvago-symbol-256.png', 'managed-schema.json', 'adapters.js', 'detection.js', 'detection-factory.js', 'detection-runtime.js', 'model-access.js', 'background.js', 'broker.js', 'capture.js', 'policy.js', 'popup.html', 'popup.css', 'popup.js', 'blocked.html', 'blocked.js'];
 
 const factory = JSON.parse(await readFile(join(here, 'detection-factory.json'), 'utf8'));
 await writeFile(join(here, 'detection-factory.js'), factoryModule(factory, null));
@@ -74,6 +74,8 @@ for (const [edition, spec] of Object.entries(editions)) {
   // The Mozilla-signed package is served by the agent's independent TLS listener.
   delete gecko.update_url;
   gecko.background = { scripts: ['background.js'], type: 'module' };
+  // Firefox already serves extension pages under a random per-install id: the key adds nothing there.
+  for (const resource of gecko.web_accessible_resources || []) {delete resource.use_dynamic_url;}
   gecko.browser_specific_settings = {
     gecko: {
       id: spec.gecko,

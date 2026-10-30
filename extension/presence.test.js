@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {pinAuthority} from './broker.js';
 import {detectionRuntime} from './detection-runtime.js';
+import {readFile} from 'node:fs/promises';
+import './adapters.js';
+const shippedAdapters=globalThis.MilvagoAdapters;
 
 const pin={installation:'00000000-0000-4000-8000-000000000001',edition:'community',origin:'https://instance.example.invalid',organization_anchor:'synthetic-anchor',signing_key:'synthetic-key'};
 await pinAuthority(pin);
@@ -29,11 +32,11 @@ const orderedCatalog={
  ],
 };
 
-function fixture({storage={},failPresenceWrites=false,served=catalog,current=()=>policy,wait}={}){
+function fixture({storage={},failPresenceWrites=false,served=catalog,current=()=>policy,wait,adapters}={}){
  const listeners={},calls=[];
  // resolve() is how the adapters recognize a covered provider; only the covered domain
  // answers, exactly as in the packaged extension.
- globalThis.MilvagoAdapters={resolve:url=>String(url).includes('ai.example.invalid')?{id:'synthetic'}:null,applyCatalog:()=>{}};
+ globalThis.MilvagoAdapters=adapters??{resolve:url=>String(url).includes('ai.example.invalid')?{id:'synthetic'}:null,applyCatalog:()=>{}};
  const api={
   runtime:{getManifest:()=>({version:'0.5.8',content_scripts:[]})},
   storage:{managed:{async get(){return {milvago_pin:JSON.stringify(pin)}}},local:{async get(){return structuredClone(storage);},async set(value){if(failPresenceWrites&&Object.hasOwn(value,'presence')){throw new Error('synthetic presence write failure');}Object.assign(storage,structuredClone(value));}}},
@@ -192,4 +195,31 @@ test('a subframe is not a visit, and neither is a port or a plain-text host', as
  assert.equal(queued(f),0);
  await visit(f,'http://aggregator.example.invalid/','nav-plain');
  assert.equal(queued(f),0);
+});
+
+// Community captures conversations on ChatGPT and Claude only, with the catalogue and the
+// adapters it ships. Every other assistant that catalogue names is still reported when
+// reached: one visit, its hostname, nothing of the page.
+test('the shipped catalogue reports a visit to an assistant it does not capture', async()=>{
+ const factory=JSON.parse(await readFile(new URL('./detection-factory.json',import.meta.url)));
+ const f=fixture({served:factory,adapters:shippedAdapters});await f.runtime.refresh();
+ await visit(f,'https://gemini.google.com/app/abcdefgh12345678?q=secret','nav-gemini');
+ await visit(f,'https://www.perplexity.ai/search/private-question-00000000-0000-4000-8000-000000000000','nav-perplexity');
+ await visit(f,'https://notebook.google.com/notebook/00000000-0000-4000-8000-000000000000','nav-notebook');
+ // copilot.microsoft.com answers 301 to copilot.com (measured 2026-10-16): still a visit.
+ await visit(f,'https://copilot.com/chat/conversation/00000000-0000-4000-8000-000000000000','nav-copilot');
+ // A captured provider is not a presence: its content script reports it.
+ await visit(f,'https://chatgpt.com/c/abcdefgh','nav-covered');
+ // Four visits take longer than the three-second delivery delay: the delivered events,
+ // not the queue length, are what this test reads.
+ await new Promise(resolve=>setTimeout(resolve,3100));
+ await f.runtime.replay();
+ const events=f.calls.filter(call=>call.op==='event_v2').map(call=>call.event);
+ assert.deepEqual(events.map(event=>event.provider).sort(),['copilot.microsoft.com','gemini.google.com','notebooklm.google.com','perplexity.ai']);
+ for(const event of events){
+  assert.equal(event.detector,'presence');assert.equal(event.kind,'navigation');assert.equal(event.characters,0);
+  for(const field of ['prompt','response','model','effort','conversation_id','url']){assert.equal(event[field],undefined,field);}
+ }
+ assert.ok(!JSON.stringify(f.storage).includes('secret'));
+ globalThis.MilvagoAdapters=shippedAdapters;
 });

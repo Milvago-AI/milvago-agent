@@ -6,6 +6,8 @@ publish = false
 license = "Apache-2.0"
 
 [features]
+systemd-qualification = []
+windows-qualification = ["windows-sys/Win32_NetworkManagement_Dns", "windows-sys/Win32_Storage_FileSystem"]
 # Enterprise builds only: per-model control. Its implementation is not part of this
 # repository, so the feature cannot be enabled from here.
 model-control = []
@@ -13,6 +15,8 @@ model-control = []
 enterprise-extension = []
 
 [dependencies]
+milvago-discovery-engine = { path = "discovery-engine" }
+milvago-discovery-collector = { path = "discovery-collector" }
 aes-gcm = "=0.11.1"
 milvago-browser-engine = { path = "browser-engine", default-features = false }
 base64 = "=0.23.1"
@@ -39,7 +43,7 @@ time = "=0.3.55"
 libc = "=0.2.190"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_RemoteDesktop"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Etw", "Win32_System_Time", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security"] }
 windows-service = "=0.8.1"
 
 [build-dependencies]

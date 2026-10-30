@@ -78,7 +78,7 @@ pub fn refuse_community_over_enterprise(edition: &str) -> Result<()> {
         return Ok(());
     }
     let programs = paths::program_files()?;
-    for name in ["Milvago Agent Logger", "MilvagoCommercialAgent", COLLECTOR_SERVICE, "MilvagoModelFilter"] {
+    for name in ["Milvago Agent Logger", "MilvagoCommercialAgent", COLLECTOR_SERVICE, "MilvagoModelFilter", "Milvago Discovery"] {
         if services::exists(name)? {
             return fail("Enterprise is installed; Community configuration refused");
         }
@@ -94,7 +94,7 @@ fn agent(step: &'static str, executable: &Path, arguments: &[&str]) -> Result<St
 }
 /// `Assert-OwnedService` outside Health: an installed service of that name runs one of
 /// this product's executables.
-fn assert_owned(l: &Layout, name: &str) -> Result<()> {
+pub(crate) fn assert_owned(l: &Layout, name: &str) -> Result<()> {
     let key = format!(r"SYSTEM\CurrentControlSet\Services\{name}");
     if !win::reg_key_exists(&key) {
         return Ok(());
@@ -303,7 +303,7 @@ fn authorization_cache_registry(edition: &str) -> Result<()> {
 /// lets any user create one) used to make the installation refuse forever. On a first
 /// installation only, SYSTEM moves it aside and starts clean; the rename never follows a
 /// redirection (the entry itself is renamed, not its target).
-fn set_aside_if_planted(path: &Path, fresh: bool) -> Result<()> {
+pub(crate) fn set_aside_if_planted(path: &Path, fresh: bool) -> Result<()> {
     // The entry itself, never what it points to: a dangling link does not "exist", and a
     // junction to a SYSTEM directory reports its target's owner. Either left the planted
     // entry in place, and every installation then refused it.
@@ -618,12 +618,14 @@ pub fn install(l: &Layout, options: &Install) -> Result<String> {
         reset_period: 86400, reboot_message: String::new(), command: String::new(), non_crash_failures: true,
         actions: [1000, 5000, 60000].into_iter().map(|delay| RecoveryAction { kind: 1, delay }).collect(),
     })?;
+    crate::discovery::install(l, options.fresh)?;
     // The private copy has served every provisioning read; only the caller-supplied
     // original is left once the installation is configured.
     let _ = std::fs::remove_dir_all(&package_root);
     // Already running when the applier itself started this installation: then a no-op.
     let _ = services::start(l.applier_service, STEP);
     services::start(l.agent_service, STEP).map_err(|failure| Failure { step: "Agent service did not start", detail: failure.step.into() })?;
+    crate::discovery::start_configured(l)?;
     Ok("Agent configured".into())
 }
 
@@ -693,6 +695,7 @@ fn stage_provision(package: &str, package_root: &Path) -> Result<Option<PathBuf>
 /// RemoveAgent: services, registrations and the files this action wrote go; the
 /// encrypted identity and queue stay for repair and rollback.
 pub fn remove(l: &Layout) -> Result<String> {
+    crate::discovery::remove(l)?;
     assert_owned(l, l.agent_service)?;
     services::remove_owned(l.agent_service, l.agent.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default().as_str())?;
     // Uninstall wins over an in-flight update.

@@ -17,8 +17,9 @@ export function managedBridge(handlers={},{mode='connected',remaining_ms=60000}=
   if(message.op!=='browser_request'){calls.push({host,op:message.op,message});return handlers[message.op]?await handlers[message.op](message):{ok:true};}
   const raw=Buffer.from(message.body,'base64'),parsed=JSON.parse(raw);
   calls.push({host,op:parsed.op,message:parsed});
-  const reply=handlers[parsed.op]?await handlers[parsed.op](parsed):{ok:true};
-  const body=Buffer.from(JSON.stringify({kind:'milvago.browser-response.v2',protocol:2,pin,challenge:parsed.challenge,request_hash:createHash('sha256').update(raw).digest('hex'),generation:++generation,mode,...(mode==='grace'?{remaining_ms}:{}),reply}));
+  // A handler may answer as the broker answers a refusal: `{brokerMode:'blocked',reply:{...}}`.
+  const answer=handlers[parsed.op]?await handlers[parsed.op](parsed):{ok:true},signedMode=answer?.brokerMode||mode,reply=answer?.brokerMode?answer.reply:answer;
+  const body=Buffer.from(JSON.stringify({kind:'milvago.browser-response.v2',protocol:2,pin,challenge:parsed.challenge,request_hash:createHash('sha256').update(raw).digest('hex'),generation:++generation,mode:signedMode,...(signedMode==='grace'?{remaining_ms}:{}),reply}));
   return {ok:true,protocol:2,signed:{payload:body.toString('base64'),signature:sign(null,body,privateKey).toString('base64')}};
  };
  return {pin,calls,sendNativeMessage,setUnavailable(value){unavailable=value;}};

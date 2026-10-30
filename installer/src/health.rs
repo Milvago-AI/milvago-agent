@@ -59,6 +59,15 @@ pub fn run(edition: &str) -> Result<String> {
     owned(l.applier_service, &l.runtime.join("milvago-updater.exe"))?;
     // The applier runs from boot and holds its pipe names: started and checked too.
     let mut started = vec![l.agent_service, l.applier_service];
+    let discovery_name = crate::discovery::service_name(l.edition)?;
+    owned(discovery_name, &l.runtime.join("milvago-discovery-system.exe"))?;
+    let discovery = Service::open(discovery_name)?.ok_or(Failure { step: "Discovery service missing", detail: String::new() })?;
+    let discovery_config = discovery.config()?;
+    let discovery_bound = crate::discovery::home(&l).join("anchor.json").try_exists().map_err(|_| Failure { step: "Discovery binding unavailable", detail: String::new() })?;
+    if !discovery_config.account.eq_ignore_ascii_case("LocalSystem") || discovery_config.start != if discovery_bound {2} else {3} {
+        return fail("Discovery service configuration invalid");
+    }
+    if discovery_bound { started.push(discovery_name); }
     if l.commercial {
         owned("Milvago Native Collector", &l.runtime.join("milvago-collector.exe"))?;
         owned("MilvagoModelFilter", &l.runtime.join("milvago-model-filter.exe"))?;

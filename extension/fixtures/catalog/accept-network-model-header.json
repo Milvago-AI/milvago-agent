@@ -1,6 +1,6 @@
 {
   "case": "network-model-header",
-  "reason": "A rule may read its prompt from one JSON form field (whose name may hold a dot) and its model from a JSON request header, mapped from opaque identifiers to canonical names: Gemini sends f.req=<json> and names its model only in a x-goog-ext-*-jspb header. The three fields are omitted when empty, so a catalogue that does not use them still reaches an agent that predates them.",
+  "reason": "A rule may read its prompt from one JSON form field (whose name may hold a dot) and its model from a JSON request header, mapped from opaque identifiers to canonical names, as a provider sending <field>=<json> and naming its model only in a custom header does. The three fields are omitted when empty, so a catalogue that does not use them still reaches an agent that predates them.",
   "server": "accept",
   "engine": "accept",
   "content": {
@@ -25,8 +25,8 @@
           {
             "method": "POST",
             "host": "assistant.example-corp.test",
-            "path": "/*_/rpc/Generate",
-            "form_field": "f.req",
+            "path": "/*api/generate",
+            "form_field": "msg.body",
             "json_fields": [
               "1"
             ],

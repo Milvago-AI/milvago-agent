@@ -1,10 +1,10 @@
 // A selector keyed only on a translated label is broken for everyone who does not use
 // the interface in that language.
 //
-// Found the hard way on 2026-09-14: Gemini's send selector was
+// Found the hard way on 2026-09-14: a send selector was
 // `button.send-button,button[aria-label="Send message"]`. The class sat on the wrapper
 // rather than on the button, and the other branch was English — so on a French
-// interface it matched nothing, and Gemini reported neither prompt nor response since
+// interface it matched nothing, and that provider reported neither prompt nor response since
 // the beginning. Worse, the failure is silent and total: `capture.js` gates response
 // capture on a correlation, which only exists once a submission was intercepted, so one
 // dead send selector switches off the whole provider.
@@ -25,16 +25,12 @@ const independent = selector => selector.split(',').some(branch => !localized(br
 // Known gaps, each with its reason. This list may shrink, never grow: a new provider
 // must ship at least one language-independent branch, measured on the real page.
 // None is corrected here: no replacement has been measured on the real page, and
-// guessing one is exactly what produced the Gemini bug.
+// guessing one is exactly what produced the bug above.
 // Empty since 2026-09-14: every send selector was measured on its real page, composer
 // filled, and replaced by a structural one — `button[data-testid="chat-input-send"]` for
-// claude, `button[type="submit"]` for notebooklm, `button[data-testid="chat-submit"]` for
-// grok. Perplexity was the one provider with no structural handle at all — no test
-// identifier, no type="submit", no stable class — and its interface language follows the
-// browser across dozens of languages, so enumerating labels could never hold. Its three
-// DOM selectors are neutralised together instead (`:not(*)`), and it is observed through
-// its network rule alone; a neutralised selector is language-independent by construction,
-// so it does not belong here either.
+// claude. A provider with no structural handle at all gets its three DOM selectors
+// neutralised together (`:not(*)`) and is observed through its network rule alone; a
+// neutralised selector is language-independent by construction, so it does not belong here.
 const gaps = {};
 
 test('every send selector holds whatever the interface language is', () => {
@@ -54,12 +50,4 @@ test('the editor and response selectors hold too', () => {
     assert.ok(independent(adapter.editor), `${adapter.id}: editor selector depends on the interface language`);
     assert.ok(independent(adapter.response), `${adapter.id}: response selector depends on the interface language`);
   }
-});
-
-test("Gemini's send selector reaches the button inside its wrapper", () => {
-  // The exact shape that was measured on the page, and the exact mistake to guard:
-  // the class belongs to the wrapper, so `button.send-button` matches nothing.
-  const gemini = A.adapters.find(a => a.id === 'gemini');
-  assert.equal(gemini.send, '.send-button button');
-  assert.ok(!/button\.send-button/.test(gemini.send), 'the class sits on the wrapper, not on the button');
 });

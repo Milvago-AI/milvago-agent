@@ -437,11 +437,28 @@ pub fn write_metadata(name: &str, display: &str, description: &str) -> Result<()
 
 /// `sc sidtype <name> unrestricted`.
 pub fn set_sid_unrestricted(name: &str) -> Result<()> {
+    set_sid_type(name, 1)
+}
+
+pub(crate) fn sid_type(name: &str) -> Result<u32> {
+    let service = open_existing(name, 1)?;
+    let mut kind = 0u32;
+    let mut needed = 0u32;
+    if unsafe { QueryServiceConfig2W(service.0, 5, std::ptr::from_mut(&mut kind).cast(), 4, &mut needed) } == 0 {
+        return Err(error("Service SID type unavailable"));
+    }
+    if !matches!(kind, 0 | 1 | 3) { return fail("Unsupported service SID type"); }
+    Ok(kind)
+}
+
+pub(crate) fn set_sid_type(name: &str, kind: u32) -> Result<()> {
+    if !matches!(kind, 0 | 1 | 3) { return fail("Unsupported service SID type"); }
     let service = open_existing(name, 2)?;
-    let kind = 1u32; // SERVICE_SID_TYPE_UNRESTRICTED
     if unsafe { ChangeServiceConfig2W(service.0, 5, std::ptr::from_ref(&kind).cast()) } == 0 {
         return Err(error("Service SID type could not be changed"));
     }
+    drop(service);
+    if sid_type(name)? != kind { return fail("Service SID type readback differs"); }
     Ok(())
 }
 

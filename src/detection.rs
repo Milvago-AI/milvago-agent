@@ -57,13 +57,19 @@ pub struct Network {
     #[serde(default)]
     pub text_path: String,
     /// Candidate paths for the prompt text, tried in order, the first that yields text
-    /// winning. One route can carry two body shapes - Le Chat names it
+    /// winning. One route can carry two body shapes - a provider may name it
     /// `content[*].text` when a thread opens and `messageInput[*].text` afterwards -
     /// and two rules cannot settle that: they match on method, host and path alone,
     /// and two matches make the observation ambiguous rather than picking one. When
     /// this list is not empty it supersedes `text_path` entirely.
     #[serde(default)]
     pub text_paths: Vec<String>,
+    /// The text paths that hold an attachment or a pasted block rather than the typed
+    /// draft (claude.ai's `2.15.4`). Content control lets a confirmed paste cover these,
+    /// and only these: the draft is covered by the send just approved. Each one is also
+    /// one of `text_paths`. Omitted when empty, for the reason `effort_path` records below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_paths: Vec<String>,
     #[serde(default)]
     pub model_path: String,
     /// Where the request states the reasoning effort it asked for. Providers name it
@@ -99,6 +105,8 @@ pub struct Network {
     /// which content control holds to the approved text. "file": an upload, which the
     /// file-send block seals and which observation ignores — observing it would produce
     /// a request event of zero characters.
+    /// "paste": the upload a provider makes at paste time for a long paste, which content
+    /// control holds to a paste the agent approved and which observation ignores too.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
     /// The account state the route itself implies: "signed_out" for a send route only
@@ -109,18 +117,23 @@ pub struct Network {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session: String,
     /// A form field carrying the whole message as one JSON document, which then becomes
-    /// the body every path of the rule reads: Gemini sends `f.req=<json>`. Its name may
+    /// the body every path of the rule reads, as in `<field>=<json>`. Its name may
     /// hold a dot, which no path segment can name.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub form_field: String,
     /// A request header holding JSON from which `model_path` reads the model instead of
-    /// the body: Gemini states it only in `x-goog-ext-525001261-jspb`. Lower case.
+    /// the body, for a provider that states it nowhere else. Lower case.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model_header: String,
     /// Opaque model identifiers mapped to canonical names. An identifier the map does not
     /// know is reported as `<provider>:<id>`, so the canonical names never hold `:`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_map: BTreeMap<String, String>,
+    /// "protobuf" for a route that sends one binary protobuf message (claude.ai's
+    /// `PerformAction`): its paths then name field numbers, every field read as a list.
+    /// Omitted when empty, for the reason `effort_path` records above.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body_format: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -409,10 +422,13 @@ pub fn validate(c: &Content) -> Result<()> {
                 // skipped: it would shorten the list without saying so.
                 || n.text_paths.len() > 4
                 || n.text_paths.iter().any(String::is_empty)
+                || n.attachment_paths.len() > 4
+                || n.attachment_paths.iter().any(|a| !n.text_paths.contains(a))
                 || n.conversation_url_segment.is_some_and(|s| s > 16)
                 || !json_path(&n.files_path)
-                || !matches!(n.kind.as_str(), "" | "prompt" | "file")
+                || !matches!(n.kind.as_str(), "" | "prompt" | "file" | "paste")
                 || !matches!(n.session.as_str(), "" | "signed_in" | "signed_out")
+                || !matches!(n.body_format.as_str(), "" | "protobuf")
                 // A field name, not a path: unwrapping only ever applies at the root of
                 // the body, where a form puts its fields. The reserved names are refused
                 // here as the engine refuses them.
@@ -792,7 +808,7 @@ mod tests {
         let now = Utc::now();
         let (env, key, h) = signed(factory(), 3, now);
         let c = verify(&env, &key, 3, &h.content_hash, now).unwrap();
-        assert_eq!(c.content.providers.len(), 9);
+        assert_eq!(c.content.providers.len(), 2);
         assert!(verify(&env, &key, 4, "", now).is_err());
         assert!(verify(&env, &key, 3, "wrong", now).is_err());
         assert!(
@@ -832,6 +848,7 @@ mod tests {
             path: "/(a+)+".into(),
             text_path: "input".into(),
             text_paths: vec![],
+            attachment_paths: vec![],
             model_path: "".into(),
             effort_path: "".into(),
             conversation_path: "".into(),
@@ -842,6 +859,7 @@ mod tests {
             session: "".into(),
             form_field: "".into(),
             model_header: "".into(),
+            body_format: "".into(),
             model_map: BTreeMap::new(),
         });
         // providers[0] now carries its own measured network rule: targeting index 0
@@ -873,6 +891,13 @@ mod tests {
         // without saying so, and the server refuses it at publication too.
         c.providers[0].network[ajoutee].text_paths = vec!["content[*].text".into(), "".into()];
         assert!(validate(&c).is_err());
+        // An attachment path is one of the text paths, never a path of its own.
+        c.providers[0].network[ajoutee].text_paths = vec!["msg.body".into(), "chip.text".into()];
+        c.providers[0].network[ajoutee].attachment_paths = vec!["chip.text".into()];
+        assert!(validate(&c).is_ok());
+        c.providers[0].network[ajoutee].attachment_paths = vec!["other.text".into()];
+        assert!(validate(&c).is_err());
+        c.providers[0].network[ajoutee].attachment_paths = vec![];
         c.providers[0].network[ajoutee].text_paths = vec![];
         // The file-name path is a path like the others, and the fields to unwrap are
         // names, bounded and held away from the prototype. Both reach devices only
@@ -895,6 +920,8 @@ mod tests {
         // A route says what it carries, or says nothing and carries a prompt. Anything
         // else is refused rather than read as one of the two.
         c.providers[0].network[ajoutee].kind = "file".into();
+        assert!(validate(&c).is_ok());
+        c.providers[0].network[ajoutee].kind = "paste".into();
         assert!(validate(&c).is_ok());
         c.providers[0].network[ajoutee].kind = "upload".into();
         assert!(validate(&c).is_err());
@@ -933,17 +960,17 @@ mod tests {
         c.providers[0].network[ajoutee].conversation_url_segment = None;
         // A form field, a model header and a model map are bounded names, never paths or
         // prototype keys, and a header is only accepted with the path that reads it.
-        c.providers[0].network[ajoutee].form_field = "f.req".into();
+        c.providers[0].network[ajoutee].form_field = "msg.body".into();
         c.providers[0].network[ajoutee].model_header = "x-synthetic-ext-jspb".into();
         c.providers[0].network[ajoutee].model_path = "4".into();
         c.providers[0].network[ajoutee].model_map =
             BTreeMap::from([("0123456789abcdef".into(), "synthetic-fast".into())]);
         assert!(validate(&c).is_ok());
-        for bad in ["__proto__", "f req", "f[req]", &"f".repeat(65)] {
+        for bad in ["__proto__", "msg body", "msg[body]", &"f".repeat(65)] {
             c.providers[0].network[ajoutee].form_field = bad.into();
             assert!(validate(&c).is_err(), "form field {bad}");
         }
-        c.providers[0].network[ajoutee].form_field = "f.req".into();
+        c.providers[0].network[ajoutee].form_field = "msg.body".into();
         for bad in ["X-Upper", "x_ext", "x ext", &"x".repeat(65)] {
             c.providers[0].network[ajoutee].model_header = bad.into();
             assert!(validate(&c).is_err(), "model header {bad}");

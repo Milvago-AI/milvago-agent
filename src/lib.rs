@@ -38,6 +38,19 @@ pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
 pub mod bootstrap;
 pub mod config;
  pub mod detection;
+pub mod discovery;
+pub mod discovery_vmware;
+pub mod discovery_wsl;
+mod discovery_reservation;
+pub mod discovery_system_protocol;
+#[cfg(any(windows, test))]
+pub mod discovery_windows_system;
+#[cfg(target_os = "linux")]
+pub mod discovery_privileged;
+mod discovery_system;
+mod discovery_guests;
+mod discovery_network;
+mod discovery_runtime_channels;
 pub mod eventlog;
 pub mod ipc;
 pub mod health;
@@ -117,6 +130,8 @@ pub struct Provision {
 }
 #[derive(Serialize, Deserialize, Default)]
 pub struct State {
+    #[serde(default)]
+    pub discovery: discovery::Cache,
     #[serde(default)]
     pub browser_broker_receipt: Option<browser_broker::AgentReceipt>,
     #[serde(default)]

@@ -74,7 +74,30 @@ struct SecurityAttributes {
 }
 
 fn wide(path: &Path) -> Vec<u16> {
-    path.as_os_str().encode_wide().chain(Some(0)).collect()
+    let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+    // Win32 ACL and handle APIs do not share Rust's automatic long-path support.
+    // Prefix only ordinary absolute local names. Verbatim syntax disables DOS
+    // normalization, so dots, device aliases, streams and alternate separators
+    // must never acquire a different meaning through this conversion.
+    let mut out = if extended_local_name(&units) { r"\\?\".encode_utf16().collect() } else { Vec::new() };
+    out.extend(units);
+    out.push(0);
+    out
+}
+fn extended_local_name(units: &[u16]) -> bool {
+    if !(248..32763).contains(&units.len()) || !matches!(units[0], 65..=90 | 97..=122) || units[1..3] != [58, 92] {
+        return false;
+    }
+    units[3..].split(|u| *u == 92).all(|part| {
+        if part.is_empty() || matches!(part.last(), Some(32 | 46)) ||
+            part.iter().any(|u| *u < 32 || matches!(*u, 34 | 42 | 47 | 58 | 60 | 62 | 63 | 124)) { return false; }
+        let stem = String::from_utf16_lossy(part).split('.').next().unwrap_or_default().trim_end().to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") { return false; }
+        if let Some(number) = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT")) {
+            if matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³") { return false; }
+        }
+        true
+    })
 }
 fn sid_text(sid: *const c_void) -> Option<String> {
     let mut text = std::ptr::null_mut();
@@ -550,6 +573,60 @@ pub fn copy(source: &Path, destination: &Path) -> Result<()> {
     std::io::copy(&mut input, &mut output).map_err(|error| Failure { step: "Snapshot copy failed", detail: error.to_string() })?;
     output.flush().and_then(|()| output.sync_all()).map_err(|error| Failure { step: "Snapshot copy failed", detail: error.to_string() })
 }
+#[derive(Debug)]
+pub(crate) struct SnapshotCopy {
+    pub hash: String,
+    pub sddl: String,
+}
+
+/// Capture a file from an already validated transaction tree. Keep the source
+/// locked and verify the durable copy through its exclusive handle: reopening
+/// every copied file causes antivirus to scan the entire snapshot again.
+pub(crate) fn copy_snapshot(source: &Path, destination: &Path) -> Result<SnapshotCopy> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    let mut input = open_plain(source)?;
+    let sddl = sddl_of(source)?;
+    plain(destination)?;
+    let mut output = std::fs::OpenOptions::new().read(true).write(true).create_new(true).share_mode(0).open(destination)
+        .map_err(|error| Failure { step: "Snapshot destination unavailable", detail: error.to_string() })?;
+    final_path_is(output.as_raw_handle() as isize, destination, "Snapshot destination redirected")?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = input.read(&mut buffer).map_err(|error| Failure { step: "Snapshot copy failed", detail: error.to_string() })?;
+        if count == 0 { break; }
+        digest.update(&buffer[..count]);
+        output.write_all(&buffer[..count]).map_err(|error| Failure { step: "Snapshot copy failed", detail: error.to_string() })?;
+    }
+    output.flush().and_then(|()| output.sync_all()).map_err(|error| Failure { step: "Snapshot copy failed", detail: error.to_string() })?;
+    let hash = format!("{:X}", digest.finalize());
+    verify_snapshot_copy(&mut output, destination, &hash)?;
+    Ok(SnapshotCopy { hash, sddl })
+}
+
+fn verify_snapshot_copy(output: &mut std::fs::File, destination: &Path, expected: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::windows::io::AsRawHandle;
+    output.seek(SeekFrom::Start(0)).map_err(|error| Failure { step: "Snapshot verification failed", detail: error.to_string() })?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = output.read(&mut buffer).map_err(|error| Failure { step: "Snapshot verification failed", detail: error.to_string() })?;
+        if count == 0 { break; }
+        digest.update(&buffer[..count]);
+    }
+    if format!("{:X}", digest.finalize()) != expected { return fail("Snapshot changed during capture"); }
+    let handle = output.as_raw_handle() as isize;
+    let mut info = FileInformation::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut info) } == 0 || info.attributes & 0x410 != 0 || info.links != 1 {
+        return fail("Snapshot destination redirected");
+    }
+    final_path_is(handle, destination, "Snapshot destination redirected")
+}
+
 /// The source side of `copy`: writers denied for the handle's whole life, and the
 /// opened object proved a plain single-link file at the asked path.
 fn open_plain(source: &Path) -> Result<std::fs::File> {
@@ -1054,12 +1131,87 @@ impl Drop for TestDir {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_copy_handles_empty_binary_and_multiple_buffers() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile_dir();
+        for (i, bytes) in [vec![], vec![137,80,78,71,13,10,26,10,0,255], (0..196613).map(|n| (n%251) as u8).collect()].iter().enumerate() {
+            let source = dir.join(format!("source-{i}"));
+            let target = dir.join(format!("target-{i}"));
+            std::fs::write(&source, bytes).unwrap();
+            let proof = copy_snapshot(&source, &target).unwrap();
+            assert_eq!(proof.hash, format!("{:X}", Sha256::digest(bytes)));
+            assert_eq!(proof.sddl, sddl_of(&source).unwrap());
+            assert_eq!(std::fs::read(target).unwrap(), *bytes);
+        }
+    }
+
+    #[test]
+    fn snapshot_copy_preserves_existing_targets_and_rejects_aliases() {
+        let dir = tempfile_dir();
+        let source = dir.join("source");
+        let target = dir.join("target");
+        std::fs::write(&source, b"synthetic original").unwrap();
+        std::fs::write(&target, b"preserve").unwrap();
+        assert!(copy_snapshot(&source, &target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"preserve");
+        std::fs::hard_link(&source, dir.join("alias")).unwrap();
+        let rejected = dir.join("rejected");
+        assert_eq!(copy_snapshot(&source, &rejected).unwrap_err().step, "Snapshot source is not a plain single-link file");
+        assert!(!rejected.exists());
+    }
+
+    #[test]
+    fn snapshot_copy_refuses_live_writers_and_missing_sources() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile_dir();
+        let source = dir.join("source");
+        let target = dir.join("target");
+        std::fs::write(&source, b"synthetic").unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).share_mode(7).open(&source).unwrap();
+        assert_eq!(copy_snapshot(&source, &target).unwrap_err().step, "Snapshot source cannot be locked");
+        assert!(!target.exists());
+        drop(writer);
+        assert!(copy_snapshot(&dir.join("missing"), &target).is_err());
+        assert!(!target.exists());
+        assert!(copy_snapshot(&dir, &target).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn snapshot_copy_verification_rejects_corrupted_output() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile_dir();
+        let path = dir.join("output");
+        std::fs::write(&path, b"corrupted").unwrap();
+        let mut output = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let expected = format!("{:X}", Sha256::digest(b"expected"));
+        assert_eq!(verify_snapshot_copy(&mut output, &path, &expected).unwrap_err().step, "Snapshot changed during capture");
+    }
+
     use super::*;
 
     fn current_user() -> String {
-        // The test process's own SID owns what it creates in a temporary directory.
-        let probe = TestDir::new("probe");
-        security(&probe, "null").unwrap().owner
+        // Elevated processes may create Administrators-owned directories. Query the
+        // process token so the foreign-owner check tests an actual user SID.
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn GetCurrentProcess() -> isize; }
+        #[link(name = "advapi32")]
+        unsafe extern "system" {
+            fn OpenProcessToken(process: isize, access: u32, token: *mut isize) -> i32;
+            fn GetTokenInformation(token: isize, class: u32, info: *mut c_void, size: u32, used: *mut u32) -> i32;
+        }
+        let mut token = 0isize;
+        assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), 0x8, &mut token) }, 0);
+        let mut buffer = [0usize; 128];
+        let mut used = 0u32;
+        let result = unsafe { GetTokenInformation(token, 1, buffer.as_mut_ptr().cast(),
+            std::mem::size_of_val(&buffer) as u32, &mut used) };
+        unsafe { CloseHandle(token); }
+        assert_ne!(result, 0);
+        assert!(used as usize <= std::mem::size_of_val(&buffer));
+        let sid = unsafe { *buffer.as_ptr().cast::<*const c_void>() };
+        sid_text(sid).expect("process token user SID")
     }
     fn tempfile_dir() -> TestDir {
         TestDir::new("paths")
@@ -1135,7 +1287,7 @@ mod tests {
         let me = current_user();
         let dir = tempfile_dir();
         // Created under ProgramData, it inherits Users' write grant: refused as it should be.
-        assert_eq!(assert_path(&dir, &[me.as_str()], true).unwrap_err().step, "Installer ancestor is writable by an untrusted principal");
+        assert_eq!(assert_path(&dir, &[me.as_str(), SYSTEM, ADMINISTRATORS], true).unwrap_err().step, "Installer ancestor is writable by an untrusted principal");
         // The owner is set explicitly: under an elevated administrator (a CI runner) new
         // objects default to Administrators as owner, which would make the tree trusted.
         set_acl(&dir, &format!("O:{me}D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"), true).unwrap();
@@ -1236,6 +1388,44 @@ mod tests {
         std::fs::write(&file, vec![b'x'; 16]).unwrap();
         assert_eq!(read_plain(&file, 16, "too large").unwrap().len(), 16);
         assert_eq!(read_plain(&file, 15, "too large").unwrap_err().step, "too large");
+    }
+
+    #[test]
+    fn long_local_paths_keep_security_copy_and_acl_checks() {
+        let me = current_user();
+        let dir = tempfile_dir();
+        let sddl = format!("D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)");
+        set_acl(&dir, &sddl, true).unwrap();
+        let nested = dir.join("a".repeat(100)).join("b".repeat(100)).join("c".repeat(60));
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("payload.dat");
+        assert!(file.as_os_str().encode_wide().count() > 260);
+        std::fs::write(&file, b"synthetic").unwrap();
+        assert!(security(&file, "null").is_ok());
+        assert!(sddl_of(&file).unwrap().contains("D:"));
+        assert_eq!(links(&file).unwrap(), 1);
+        assert_eq!(read_plain(&file, 16, "too large").unwrap(), b"synthetic");
+        set_acl(&file, &sddl, false).unwrap();
+        assert_path(&dir, &[me.as_str(), SYSTEM, ADMINISTRATORS], true).unwrap();
+        std::fs::hard_link(&file, nested.join("alias.dat")).unwrap();
+        assert_eq!(set_acl(&file, &sddl, false).unwrap_err().step, "Permission target redirected");
+    }
+
+    #[test]
+    fn long_path_prefix_does_not_change_dos_alias_or_relative_meaning() {
+        let suffix = "x".repeat(250);
+        let ordinary = format!(r"C:\root\{suffix}");
+        assert!(extended_local_name(&ordinary.encode_utf16().collect::<Vec<_>>()));
+        let encoded = wide(Path::new(&ordinary));
+        assert_eq!(String::from_utf16(&encoded[..encoded.len()-1]).unwrap(), format!(r"\\?\{ordinary}"));
+        for prefix in [r"C:relative", r"\root", r"\\server\share", r"\\?\C:\root", r"C:/root", r"C:\..", r"C:\.",
+            r"C:\NUL", r"C:\con.txt", r"C:\LPT¹", r"C:\COM1 .txt", r"C:\tail.", r"C:\tail ", r"C:\stream:ads"] {
+            let path = format!("{prefix}\\{suffix}");
+            assert!(!extended_local_name(&path.encode_utf16().collect::<Vec<_>>()), "{prefix}");
+        }
+        assert!(!extended_local_name(&r"C:\short".encode_utf16().collect::<Vec<_>>()));
+        let with_nul = format!("C:\\root\0\\{suffix}");
+        assert!(!extended_local_name(&with_nul.encode_utf16().collect::<Vec<_>>()));
     }
 
     #[test]

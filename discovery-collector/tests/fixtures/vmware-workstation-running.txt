@@ -1,0 +1,2 @@
+Total running VMs: 1
+/fixture/guest.vmx

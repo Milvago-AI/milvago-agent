@@ -21,6 +21,15 @@ updates:
       engine:
         patterns: ["*"]
 
+  - package-ecosystem: cargo
+    directory: /dlp-engine
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      dlp:
+        patterns: ["*"]
+
   - package-ecosystem: npm
     directory: /extension
     target-branch: dev

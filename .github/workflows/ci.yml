@@ -33,10 +33,21 @@ jobs:
       # root in production: the integration tests that start a real agent need root as well.
       - run: sudo -E env "PATH=$PATH" cargo test --locked
         if: runner.os == 'Linux'
+      - run: sudo -E env "PATH=$PATH" cargo test --locked --lib discovery_privileged::files::tests::protected_files_reject_symlinks_hardlinks_fifos_permissions_and_oversized_state -- --ignored --exact
+        if: runner.os == 'Linux'
+      - run: sudo -E env "PATH=$PATH" cargo test --locked --lib discovery_privileged::service::tests::root_service_authenticates_real_peers_collects_and_cleans_up -- --ignored --exact
+        if: runner.os == 'Linux'
+      - run: sudo -E env "PATH=$PATH" cargo test --locked --lib discovery_privileged::enrollment::tests::protected_registration_retries_delivery_and_never_adopts_bridge_state -- --ignored --exact
+        if: runner.os == 'Linux'
+      - run: sudo python3 deploy/discovery/test-install-discovery.py
+        if: runner.os == 'Linux'
       # What that root run downloaded or built goes back to the runner user for the next steps.
       - run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo" target
         if: runner.os == 'Linux'
       - run: cargo test --locked --manifest-path browser-engine/Cargo.toml
+      - run: cargo test --locked --manifest-path dlp-engine/Cargo.toml
+      - run: cargo test --locked --manifest-path discovery-engine/Cargo.toml
+      - run: cargo test --locked --manifest-path discovery-collector/Cargo.toml
       # A release build without the signed extension packages, as a contributor would make it.
       - run: cargo build --release --locked
         env:
@@ -62,6 +73,9 @@ jobs:
       - run: cargo install cargo-audit --version =0.22.2 --locked
       - run: cargo audit
       - run: cargo audit --file browser-engine/Cargo.lock
+      - run: cargo audit --file dlp-engine/Cargo.lock
+      - run: cargo audit --file discovery-engine/Cargo.lock
+      - run: cargo audit --file discovery-collector/Cargo.lock
       - run: cargo audit --file installer/Cargo.lock
 
   extension:
@@ -72,7 +86,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.9.0'
+          node-version: '26.13.0'
           cache: npm
           cache-dependency-path: extension/package-lock.json
       - name: Require matching agent and extension versions

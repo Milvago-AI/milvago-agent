@@ -55,6 +55,13 @@ pub(crate) fn browser_policy(policy: &crate::shadow::ShadowPolicy) -> Value {
             out["blocked_platforms"] = value.clone();
         }
     }
+    // The browser learns only whether it must seal uncontrolled transports. The
+    // privileged broker keeps detector definitions and organization-specific terms.
+    if let Some(dlp) = config.get("dlp") {
+        let active = dlp["inspection"] == true && dlp["rules"].as_array().is_some_and(|rules|
+            rules.iter().any(|r|r["mode"]=="active" && (r["consequence"]["action"]!="observe" || r["review"]==true)));
+        out["dlp_control"] = json!({"enabled":active,"journal":dlp["journal"],"fingerprint":config["dlp_fingerprint"]});
+    }
     let protection = &config["protection"];
     let keywords = protection["keywords"].as_array().map_or(0, Vec::len);
     out["protection"] = json!({
@@ -65,6 +72,11 @@ pub(crate) fn browser_policy(policy: &crate::shadow::ShadowPolicy) -> Value {
         "keywords": vec![Value::Null; keywords],
     });
     out["privacy"] = json!({"enabled": config["privacy"]["enabled"].as_bool().unwrap_or(false)});
+    if config["dlp_legacy_disabled"]==true {
+        out["protection"]["keywords"]=json!([]);
+        out["protection"]["block_uploads"]=json!(false);
+        out["privacy"]["enabled"]=json!(false);
+    }
     json!({
         "version": policy.version,
         "revision": policy.revision,
@@ -146,9 +158,9 @@ pub fn native_message(home: &std::path::Path, request: Value) -> Result<Value> {
                 };
                 crate::shadow::ShadowCompletion::parse_for(id, fields)?
             };
-            crate::shadow::complete(&mut state, completion)?;
+            let applied = crate::shadow::complete(&mut state, completion)?;
             store.save(&state)?;
-            Ok(json!({"ok":true,"applied":true}))
+            Ok(json!({"ok":true,"applied":applied}))
         }
         "catalog" => {
             crate::shadow::cached(&state)?;
@@ -169,6 +181,15 @@ pub fn native_message(home: &std::path::Path, request: Value) -> Result<Value> {
                 "cache_authorization_generation":state.authorization_generation,
                 "cache_policy_content_hash":crate::browser_cache::policy_content_hash(&policy)?,
                 "cache_catalog_content_hash":state.detection.content_hash,"cache_catalog_revision":state.detection.revision}))
+        }
+        "dlp_enforcement" => {
+            let tool=request["tool"].as_str().filter(|t|crate::shadow::BROWSER_TOOLS.contains(t)).ok_or("invalid DLP browser")?;
+            let key=format!("dlp/{tool}");let now=chrono::Utc::now();
+            if state.enforcement_attempts.get(&key).is_some_and(|at|*at<=now&&now-*at<chrono::Duration::seconds(20)){return Err("DLP enforcement cooldown".into());}
+            state.enforcement_attempts.insert(key,now);store.save(&state)?;
+            drop(store);
+            crate::shadow::dlp_transport::report(&state,&request)?;
+            Ok(json!({"ok":true}))
         }
         "inspect" | "broker_inspect" => {
             // Saving only when the queue actually changed: an inspection is the
@@ -420,11 +441,17 @@ fn inspect_request_inner(policy: &crate::shadow::ShadowPolicy, request: &Value, 
             let text = request["text"].as_str().ok_or("missing inspection text")?;
             let provider = request["provider"].as_str().ok_or("missing provider")?;
             #[cfg_attr(not(feature = "model-control"), allow(unused_mut))]
-            let mut inspection = crate::shadow::inspect(
+            let mut facts=std::collections::BTreeMap::new();
+            if let Some(tool)=request["tool"].as_str().filter(|t|crate::shadow::BROWSER_TOOLS.contains(t)){facts.insert("tool".into(),tool.into());}
+            // Only the network guard's model check carries a request model.
+            #[cfg(feature="model-control")]
+            if request["check_model"]==true {if let Some(model)=request["model"].as_str().filter(|m|!m.is_empty()&&m.len()<=200){facts.insert("model".into(),model.into());}}
+            let mut inspection = crate::shadow::inspect_context(
                 policy,
                 text,
                 provider,
                 request["upload"].as_bool().unwrap_or(false),
+                "browser",facts,
             )?;
             // Per-model control is an Enterprise capability: the Community agent
             // contains no model decision, so it refuses to answer the question.

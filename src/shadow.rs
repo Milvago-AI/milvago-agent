@@ -8,6 +8,8 @@ use std::{collections::HashSet, io::Read};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+#[path = "shadow_dlp.rs"]
+pub mod dlp_transport;
 const TEXT_LIMIT: usize = 32 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RejectedEvent {
@@ -57,6 +59,7 @@ fn valid_queued_event(event: &ShadowEvent) -> bool {
         .iter().all(|v| v.as_deref().is_none_or(clean_metadata))
         && event.session.as_deref().is_none_or(valid_session)
         && event.user.as_deref().is_none_or(|u| u.len() <= 128 && u.trim() == u && !u.chars().any(char::is_control))
+        && event.dlp.as_ref().is_none_or(|t|t.valid())
         && event.policy_revision > 0
         && event.files.len() <= 20
         && (event.files.is_empty() || event.kind == "prompt")
@@ -115,6 +118,8 @@ pub struct ShadowPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShadowEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlp: Option<dlp_transport::Trace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -205,7 +210,7 @@ fn verify_cached(
     now: DateTime<Utc>,
     allow_expired: bool,
 ) -> Result<ShadowPolicy> {
-    if envelope.payload.len() > 128 * 1024 {
+    if envelope.payload.len() > 512 * 1024 {
         return Err("policy exceeds limit".into());
     }
     let public: [u8; 32] = STANDARD
@@ -218,7 +223,7 @@ fn verify_cached(
         &Signature::from_slice(&STANDARD.decode(&envelope.signature)?)?,
     )?;
     let p: ShadowPolicy = serde_json::from_slice(&bytes)?;
-    if !matches!(p.version, 2 | 3)
+    if !matches!(p.version, 2 | 3 | 4)
         || p.revision < minimum
         || (!allow_expired && p.expires_at <= now)
         || p.issued_at > now + chrono::Duration::seconds(60)
@@ -246,6 +251,17 @@ fn verify_cached(
         if !blocked.as_array().is_some_and(|list|list.len()<=256 && list.iter().all(valid_blocked_platform)) {
             return Err("invalid blocked platforms policy".into());
         }
+    }
+    if p.version >= 4 {
+        let dlp: milvago_browser_engine::dlp::Policy = serde_json::from_value(p.config["dlp"].clone())?;
+        milvago_browser_engine::dlp::validate(&dlp).map_err(std::io::Error::other)?;
+        if dlp.domain != milvago_browser_engine::dlp::Domain::Endpoint || p.config["dlp_legacy_disabled"] != true
+            || !p.config["dlp_fingerprint"].as_str().is_some_and(|s| s.len()==64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+            || !p.config["dlp_context"].as_object().is_some_and(|o| o.len()==3 && ["device_id","organization_id","group_id"].iter().all(|k| o.get(*k).and_then(Value::as_str).is_some_and(|s|s=="none" || Uuid::parse_str(s).is_ok()))) {
+            return Err("invalid signed DLP configuration".into());
+        }
+    } else if p.config.get("dlp").is_some() || p.config.get("dlp_legacy_disabled").is_some() {
+        return Err("DLP requires policy version 4".into());
     }
     let model_rules = crate::model_access::rules(&p.config)?;
     if p.version < 3 && model_rules.iter().any(|r| r.mode != "off") {
@@ -460,22 +476,29 @@ pub fn refresh(state: &mut State) -> Result<ShadowPolicy> {
 }
 fn synchronize(state: &mut State) -> Result<ShadowPolicy> {
     discard_unpermitted(state);
-    let response = crate::client()?
-        .get(crate::api_url(state, "/v3/policy")?)
+    let mut response = crate::client()?
+        .get(crate::api_url(state, "/v4/policy")?)
+        .header("X-Milvago-Native-Services", "1")
         .bearer_auth(&state.credential)
         .send()?;
+    if matches!(response.status().as_u16(),404|405) {
+        response = crate::client()?.get(crate::api_url(state,"/v3/policy")?).header("X-Milvago-Native-Services","1").bearer_auth(&state.credential).send()?;
+    }
     if matches!(response.status().as_u16(), 401 | 403) {
         revoke_authorization(state);
         return Err("installation authorization refused".into());
     }
     let response = response.error_for_status()?;
     let mut bytes = Vec::new();
-    response.take(160 * 1024 + 1).read_to_end(&mut bytes)?;
-    if bytes.len() > 160 * 1024 {
+    response.take(768 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 768 * 1024 {
         return Err("policy response exceeds limit".into());
     }
     let env: Envelope = serde_json::from_slice(&bytes)?;
     let p = verify(&env, &state.public_key, state.shadow_revision, Utc::now())?;
+    if cached(state).is_ok_and(|previous| previous.version >= 4) && p.version < 4 {
+        return Err("policy protocol downgrade refused".into());
+    }
     state.shadow_revision = p.revision;
     state.shadow_policy = Some(env);
     discard_unpermitted(state);
@@ -500,6 +523,9 @@ pub fn enroll(
         .decode(&provision.policy_public_key)?
         .try_into()
         .map_err(|_| "invalid trust anchor")?;
+    let mut capabilities = capabilities.to_vec();
+    if !capabilities.contains(&"dlp-v1") { capabilities.push("dlp-v1"); }
+    if !capabilities.contains(&"dlp-confirm-v1") {capabilities.push("dlp-confirm-v1");}
     let reply=crate::client()?.post(origin.join("/v2/enroll")?).json(&json!({"token":provision.token,"hostname":hostname,"platform":std::env::consts::OS,"version":env!("CARGO_PKG_VERSION"),"kind":kind,"capabilities":capabilities})).send()?.error_for_status()?;
     let reply: Value = crate::bounded_json(reply, 64 * 1024)?;
     state.device_id = reply["device_id"]
@@ -585,16 +611,25 @@ pub fn heartbeat(state: &State) -> Result<()> {
     };
     let collector_health: Vec<Value> = state.extension_data["health"].as_object()
         .map(|health| health.values().cloned().collect()).unwrap_or_default();
-    let mut body = json!({"os_user": user, "browsers": browsers, "version": env!("CARGO_PKG_VERSION")});
+    let mut body = json!({"os_user": user, "browsers": browsers, "version": env!("CARGO_PKG_VERSION"), "dlp_engine": 2, "discovery_engine": if crate::discovery::ready() {1} else {0}});
     // An empty collector_health still invokes the Enterprise-only server check.
     if !collector_health.is_empty() {
         body["collector_health"] = json!(collector_health);
     }
     let mut response = post(&body)?;
     if response.status() == reqwest::StatusCode::BAD_REQUEST {
+        // Discovery was added after DLP. An older server can still understand
+        // version, DLP and per-tool prevention: do not erase those reports just
+        // because it rejects this independent optional field.
+        body.as_object_mut().unwrap().remove("discovery_engine");
+        response = post(&body)?;
+    }
+    if response.status() == reqwest::StatusCode::BAD_REQUEST {
         // Strict older servers reject the new version field. Preserve presence
         // on that fallback; never retry transport or authorization failures.
         body.as_object_mut().unwrap().remove("version");
+        body.as_object_mut().unwrap().remove("dlp_engine");
+        body.as_object_mut().unwrap().remove("discovery_engine");
         response = post(&body)?;
         if response.status() == reqwest::StatusCode::BAD_REQUEST {
             response = post(&json!({"os_user": user}))?;
@@ -666,15 +701,18 @@ pub fn inspect_scope(
     upload: bool,
     scope: &str,
 ) -> Result<Inspection> {
+    inspect_context(policy,text,provider,upload,scope,std::collections::BTreeMap::new())
+}
+pub(crate) fn inspect_context(policy:&ShadowPolicy,text:&str,provider:&str,upload:bool,scope:&str,facts:std::collections::BTreeMap<String,String>)->Result<Inspection> {
     let service = service(policy, provider)?;
-    milvago_browser_engine::inspect(&milvago_browser_engine::InspectionInput {
+    milvago_browser_engine::inspect_with_context(&milvago_browser_engine::InspectionInput {
         config: policy.config.clone(),
         service: service.clone(),
         text: text.into(),
         provider: provider.into(),
         upload,
         scope: scope.into(),
-    })
+    },facts)
     .map_err(|error| std::io::Error::other(error).into())
 }
 
@@ -709,6 +747,7 @@ pub fn enqueue_refusal(state: &mut State, tool: &str, text: &str, characters: u3
     service(&p, provider)?;
     let id = Uuid::new_v4();
     let mut event = ShadowEvent {
+        dlp: None,
         id,
         kind: "prompt".into(),
         occurred_at: Utc::now(),
@@ -744,7 +783,7 @@ detector:None,catalog_revision:None,input_tokens:None,output_tokens:None,body_by
 pub(crate) fn browser_event(p: &ShadowPolicy, catalog_revision: u64, mut input: Value) -> Result<ShadowEvent> {
     if !p.config["collection"]["enabled"].as_bool().unwrap_or(false) { return Err("collection is disabled".into()); }
     let object = input.as_object_mut().ok_or("event must be an object")?;
-    if object.contains_key("id") || object.contains_key("occurred_at") {
+    if object.contains_key("dlp") || object.contains_key("id") || object.contains_key("occurred_at") {
         return Err("event identity is assigned locally".into());
     }
     let id = Uuid::new_v4();
@@ -805,8 +844,14 @@ pub(crate) fn browser_event(p: &ShadowPolicy, catalog_revision: u64, mut input: 
     // Community is the *decision* - `model-rules-community.js` carries no rule code
     // and the server strips `model_access` from its signed policy - not the fact.
     if event.platform_id.as_deref().is_some_and(|platform| crate::model_access::browser_platform(&event.provider) != Some(platform))
-        || event.decision_reason.as_deref().is_some_and(|reason| !matches!(reason, "model_denied" | "model_unknown" | "control_unavailable")
-            || event.action != "blocked" || event.kind != "prompt" || event.platform_id.is_none()) {
+        || event.decision_reason.as_deref().is_some_and(|reason| match reason {
+            "model_denied" | "model_unknown" | "control_unavailable" => event.action != "blocked" || event.kind != "prompt" || event.platform_id.is_none(),
+            // Not a model decision: each reason only on the event it explains.
+            "service_blocked" => event.kind != "navigation" || event.action != "blocked",
+            "service_redirected" => event.kind != "navigation" || event.action != "redirected",
+            "upload_blocked" | "keyword" => event.kind != "prompt" || event.action != "blocked",
+            _ => true,
+        }) {
         return Err("invalid model decision metadata".into());
     }
     if [&event.model, &event.effort, &event.conversation_id, &event.correlation_id]
@@ -926,6 +971,12 @@ pub struct ShadowCompletion {
     pub body_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The network guard sealed the send this event recorded: the send is then one
+    /// blocked event, not an observed one beside a second, blocked record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_id: Option<String>,
 }
 /// Completions waiting for the server are few and short-lived: one follows each send,
 /// and it leaves on the next pass. The bound only keeps a long outage from growing
@@ -966,11 +1017,20 @@ impl ShadowCompletion {
         {
             return Err("invalid completion metadata".into());
         }
+        // The only decision a completion carries here is a seal of the transport, with the
+        // platform it was taken for.
+        if (completion.decision_reason.is_some() || completion.platform_id.is_some())
+            && (completion.decision_reason.as_deref() != Some("control_unavailable")
+                || !completion.platform_id.as_deref().is_some_and(|p| crate::model_access::valid_platform(p, "browser")))
+        {
+            return Err("invalid completion decision".into());
+        }
         if completion.model.is_none()
             && completion.effort.is_none()
             && completion.conversation_id.is_none()
             && completion.body_bytes.is_none()
             && completion.session.is_none()
+            && completion.decision_reason.is_none()
         {
             return Err("empty completion".into());
         }
@@ -997,6 +1057,21 @@ impl ShadowCompletion {
         if event.detector.as_deref() == Some("dom") {
             event.detector = Some("both".into());
         }
+        if self.decision_reason.is_none() && event.kind == "prompt" && event.action == "observed" {
+            if let Some(trace) = &mut event.dlp { trace.observed(); }
+        }
+        // Only an observed prompt of the sealed platform becomes blocked.
+        if let (Some(reason), Some(platform)) = (&self.decision_reason, &self.platform_id) {
+            if event.kind == "prompt"
+                && event.action == "observed"
+                && event.decision_reason.is_none()
+                && crate::model_access::browser_platform(&event.provider) == Some(platform.as_str())
+            {
+                event.action = "blocked".into();
+                event.decision_reason = Some(reason.clone());
+                event.platform_id = Some(platform.clone());
+            }
+        }
     }
 }
 /// Route a completion to wherever its event still is. An event awaiting delivery is
@@ -1007,6 +1082,11 @@ pub fn complete(state: &mut State, completion: ShadowCompletion) -> Result<bool>
     if let Some(event) = state.shadow_queue.iter_mut().find(|e| e.id == completion.id) {
         completion.apply(event);
         return Ok(true);
+    }
+    // The server completes no decision: a seal whose event already left is not placed,
+    // and the browser records the refusal on its own.
+    if completion.decision_reason.is_some() {
+        return Ok(false);
     }
     if let Some(queued) = state
         .shadow_completions
@@ -1281,9 +1361,9 @@ mod delivery_tests {
         state.browsers.insert("edge".into(), Utc::now());
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = count.clone();
-        let (url, server) = http_many(2, move |body| {
+        let (url, server) = http_many(3, move |body| {
             assert_eq!(body["browsers"][0]["tool"], "edge");
-            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
                 assert!(body.get("version").is_some());
                 (400, json!({"error":"invalid_request"}))
             } else {
@@ -1294,7 +1374,54 @@ mod delivery_tests {
         state.server_url = url;
         heartbeat(&state).unwrap();
         server.join().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn heartbeat_discovery_fallback_preserves_existing_dlp_support() {
+        let mut state = authorized();
+        state.browsers.insert("edge".into(), Utc::now());
+
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = count.clone();
+        let (url, server) = http_many(2, move |body| {
+            assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(body["dlp_engine"], 2);
+            assert_eq!(body["browsers"][0]["tool"], "edge");
+
+            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(body.get("discovery_engine").is_some());
+                (400, json!({"error":"invalid_request"}))
+            } else {
+                assert!(body.get("discovery_engine").is_none());
+                (200, json!({"ok":true}))
+            }
+        });
+        state.server_url = url;
+        heartbeat(&state).unwrap();
+        server.join().unwrap();
         assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn heartbeat_discovery_retry_stops_on_authorization_and_server_failures() {
+        for status in [401, 403, 500] {
+            let mut state = authorized();
+            let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = count.clone();
+            let (url, server) = http_many(2, move |_| {
+                if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    (400, json!({"error":"invalid_request"}))
+                } else {
+                    (status, json!({"error":"unavailable"}))
+                }
+            });
+            state.server_url = url;
+            let error = heartbeat(&state).unwrap_err();
+            assert_eq!(error.downcast_ref::<reqwest::Error>().unwrap().status().unwrap().as_u16(), status);
+            server.join().unwrap();
+            assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        }
     }
 
     #[test]
@@ -1349,6 +1476,30 @@ mod delivery_tests {
         input["decision_reason"] = json!("model_denied");
         assert!(enqueue_browser(&mut state, input).is_err());
         assert!(state.shadow_queue.is_empty());
+    }
+
+    // Real campaign 0.7.3: a blocked service, a refused file and a protected word must say why,
+    // each reason only on the event it explains.
+    #[test]
+    fn policy_reasons_are_kept_on_the_event_they_explain() {
+        for (reason, kind, action, ok) in [
+            ("service_blocked", "navigation", "blocked", true),
+            ("service_redirected", "navigation", "redirected", true),
+            ("upload_blocked", "prompt", "blocked", true),
+            ("keyword", "prompt", "blocked", true),
+            ("keyword", "prompt", "observed", false),
+            ("service_blocked", "prompt", "blocked", false),
+            ("invented", "prompt", "blocked", false),
+        ] {
+            let mut state = authorized();
+            let mut input = event();
+            input["decision_reason"] = json!(reason);
+            input["kind"] = json!(kind);
+            input["action"] = json!(action);
+            if kind == "navigation" { input["characters"] = json!(0); input.as_object_mut().unwrap().remove("prompt"); }
+            assert_eq!(enqueue_browser(&mut state, input).is_ok(), ok, "{reason} {kind} {action}");
+            if ok { assert_eq!(state.shadow_queue[0].decision_reason.as_deref(), Some(reason)); }
+        }
     }
 
     #[test]

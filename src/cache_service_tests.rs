@@ -36,7 +36,7 @@ fn live_catalog(key: &SigningKey) -> Envelope {
             id: "chatgpt".into(), label: "Synthetic provider".into(), domains: vec!["chatgpt.com".into()],
             aliases: vec![], conversation_path: String::new(), conversation_segment: 0, conversation_paths: vec![],
             dom: detection::Dom { editor:String::new(), send:String::new(), response:String::new() },
-            network: vec![], qualified_at: now.to_rfc3339(), asset_hosts: vec![],
+            network: vec![], qualified_at: "2000-01-01T00:00:00Z".into(), asset_hosts: vec![],
         }],
         native_tools: vec![],
         heuristics: detection::Heuristics { keys: vec![], mime_types: vec![] },
@@ -75,7 +75,7 @@ fn memory_authority() -> (Authority, Value, shadow::ShadowPolicy, String) {
         "cache_catalog_revision":journal.catalog_revision,
     });
     let stored = Stored { journal, keys, queue:Default::default() };
-    (Authority { stored, storage:Storage::Memory, storage_failed:false }, response, policy, boot)
+    (Authority { stored, storage:Storage::Memory, storage_failed:false, masked:Vec::new() }, response, policy, boot)
 }
 
 fn wrapped(request: Value) -> crate::browser_broker::Parsed {
@@ -430,4 +430,251 @@ fn corrupt_snapshot_without_committed_copy_is_refused() {
     let dir=tempfile::tempdir().unwrap();let root=dir.path();let s=fixture();commit(root,&s).unwrap();
     fs::write(root.join("state.bin"),b"corrupt").unwrap();fs::write(root.join("pending.bin"),b"corrupt").unwrap();
     assert!(recover(root,&s.journal.pin).is_err());assert_eq!(fs::read(root.join("state.bin")).unwrap(),b"corrupt");
+}
+
+fn draft(op: &str, text: &str, sid: &str) -> crate::browser_broker::Parsed {
+    let mut request = json!({"protocol":broker::PROTOCOL,"op":op,"challenge":STANDARD.encode([13u8;32]),
+        "tool":"chrome","provider":"chatgpt.com","text":text,"upload":false});
+    if op == "browser_submit" {
+        request["delivery_id"]=json!(uuid::Uuid::new_v4().to_string());
+        request["event"]=json!({"tool":"chrome"});
+    }
+    broker::parse(&json!({"protocol":broker::PROTOCOL,"op":"browser_request",
+        "caller":{"user":"synthetic-user","sid":sid},
+        "body":STANDARD.encode(serde_json::to_vec(&request).unwrap())})).unwrap()
+}
+
+/// Inspects a draft carrying a custom-rule match, then submits `sent` from `sid`;
+/// returns the masked text and the queued event, serialized.
+fn masked_send(sent: Option<&str>, sid: &str) -> (String, String) {
+    let (mut authority, response, policy, boot) = memory_authority();
+    let mut exchange = |request: &Value| -> Result<Value> {
+        match request["op"].as_str().unwrap_or("") {
+            "policy_v3" => Ok(response.clone()),
+            "inspect" => crate::native::inspect_authorized_request(&policy, request),
+            "broker_inspect" => Ok(json!({"ok":true,"policy_content_hash":response["cache_policy_content_hash"],
+                "inspection":crate::native::inspect_authorized_request(&policy, request)?})),
+            "broker_prepare_event" => Ok(prepared_event(&policy, &response, request)),
+            other => Err(format!("unexpected operation {other}").into()),
+        }
+    };
+    let owner = "S-1-5-21-1-2-3-1001";
+    let (_, inspected) = authority.answer_with(&draft("browser_inspect", "reference ID-4242 synthetic", owner), &mut exchange, &boot, 400).unwrap();
+    let masked = inspected["text"].as_str().unwrap().to_string();
+    assert_ne!(masked, "reference ID-4242 synthetic", "the draft is masked: {inspected}");
+    assert_eq!(inspected["labels"], json!(["custom"]));
+    let sent = sent.unwrap_or(&masked);
+    let (_, reply) = authority.answer_with(&draft("browser_submit", sent, sid), &mut exchange, &boot, 401).unwrap();
+    assert_eq!(reply["recorded"], true, "{reply}");
+    assert_eq!(authority.stored.queue.pending.len(), 1);
+    (masked, serde_json::to_string(&authority.stored.queue.pending[0].event).unwrap())
+}
+
+#[test]
+fn masked_send_keeps_the_labels_of_the_unmasked_draft() {
+    let (masked, event) = masked_send(None, "S-1-5-21-1-2-3-1001");
+    let event: Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["labels"], json!(["custom"]));
+    assert_eq!(event["prompt"], json!(masked));
+    assert!(!event.to_string().contains("ID-4242"), "unmasked text never reaches the event: {event}");
+}
+
+#[test]
+fn another_draft_or_account_cannot_borrow_masked_labels() {
+    let (_, other_draft) = masked_send(Some("unrelated synthetic body"), "S-1-5-21-1-2-3-1001");
+    assert!(other_draft.contains("\"labels\":[]"), "{other_draft}");
+    // Same masked text, other OS account: the inspection was not its own.
+    let (_, other_account) = masked_send(None, "S-1-5-21-1-2-3-1002");
+    assert!(other_account.contains("\"labels\":[]"), "{other_account}");
+}
+
+/// Inspects `pasted` (a paste reviewed apart), then submits whatever `send` builds from its
+/// masked text, from `sid`; returns the queued event's labels.
+fn paste_then_send(pasted: &str, send: impl Fn(&str) -> String, sid: &str) -> Value {
+    let (mut authority, response, policy, boot) = memory_authority();
+    let mut exchange = |request: &Value| -> Result<Value> {
+        match request["op"].as_str().unwrap_or("") {
+            "policy_v3" => Ok(response.clone()),
+            "inspect" => crate::native::inspect_authorized_request(&policy, request),
+            "broker_inspect" => Ok(json!({"ok":true,"policy_content_hash":response["cache_policy_content_hash"],
+                "inspection":crate::native::inspect_authorized_request(&policy, request)?})),
+            "broker_prepare_event" => Ok(prepared_event(&policy, &response, request)),
+            other => Err(format!("unexpected operation {other}").into()),
+        }
+    };
+    let (_, inspected) = authority.answer_with(&draft("browser_inspect", pasted, "S-1-5-21-1-2-3-1001"), &mut exchange, &boot, 400).unwrap();
+    let masked = inspected["text"].as_str().unwrap().to_string();
+    assert!(!masked.contains("ID-4242"), "{inspected}");
+    let (_, reply) = authority.answer_with(&draft("browser_submit", &send(&masked), sid), &mut exchange, &boot, 401).unwrap();
+    assert_eq!(reply["recorded"], true, "{reply}");
+    let event = serde_json::to_value(&authority.stored.queue.pending[0].event).unwrap();
+    assert!(!event.to_string().contains("ID-4242"), "{event}");
+    // Single-use: the same draft sent again borrows nothing.
+    let (_, again) = authority.answer_with(&draft("browser_submit", &send(&masked), sid), &mut exchange, &boot, 402).unwrap();
+    assert_eq!(again["labels"], json!([]), "{again}");
+    event["labels"].clone()
+}
+
+// Real campaign 0.7.10: a masked paste of three lines, laid out by the editor with a doubled break
+// between paragraphs, was recorded with `labels=[]`.
+#[test]
+fn a_masked_paste_lends_its_labels_to_the_draft_that_carries_it() {
+    const PASTE: &str = "Ligne un ID-4242\nLigne deux synthetique\nReponds juste OK.";
+    let owner = "S-1-5-21-1-2-3-1001";
+    assert_eq!(paste_then_send(PASTE, |m| m.replace('\n', "\n\n"), owner), json!(["custom"]));
+    assert_eq!(paste_then_send(PASTE, |m| format!("Question avant\n{}\n  \nApres", m.replace('\n', "\n\n")), owner), json!(["custom"]));
+    assert_eq!(paste_then_send(PASTE, |m| m.replace(' ', "\u{a0}  "), owner), json!(["custom"]), "blanks collapsed");
+}
+
+#[test]
+fn a_partial_or_foreign_paste_lends_no_labels() {
+    const PASTE: &str = "Ligne un ID-4242\nLigne deux synthetique\nReponds juste OK.";
+    let owner = "S-1-5-21-1-2-3-1001";
+    assert_eq!(paste_then_send(PASTE, |m| m.lines().take(2).collect::<Vec<_>>().join("\n"), owner), json!([]), "a line missing");
+    assert_eq!(paste_then_send(PASTE, |m| m.replace("Ligne un", "Ligne une"), owner), json!([]), "a line changed");
+    assert_eq!(paste_then_send(PASTE, |m| m.replace('\n', " "), owner), json!([]), "lines merged into one");
+    assert_eq!(paste_then_send(PASTE, |m| m.to_string(), "S-1-5-21-1-2-3-1002"), json!([]), "another OS account");
+    assert_eq!(paste_then_send(PASTE, |_| "unrelated synthetic body".into(), owner), json!([]));
+}
+
+fn memory_dlp_authority() -> (Authority,Value,shadow::ShadowPolicy,String) {
+    let (mut authority,_,mut policy,boot)=memory_authority();
+    policy.version=4;
+    policy.config["collection"]=json!({"enabled":false,"store_content":false,"store_file_names":false});
+    policy.config["dlp_legacy_disabled"]=json!(true);
+    policy.config["dlp_fingerprint"]=json!("a".repeat(64));
+    policy.config["dlp_context"]=json!({"device_id":"dc93a18c-a541-40e4-a39b-46892967fc54","organization_id":"5ea5b3f3-17ad-4084-b092-28a019f9e1f3","group_id":"none"});
+    policy.config["dlp"]=json!({"schema_version":1,"domain":"endpoint","inspection":true,"native_inspection":false,"journal":true,"detectors":[],"rules":[{
+        "id":"replacement","revision":1,"name":"Frozen replacement","mode":"active","priority":1,"condition":{"op":"contains","field":"prompt","value":"Tomate","ignore_case":false,"whole_word":false},"scope":{"op":"true"},"consequence":{"action":"replace","value":"Tomate","replacement":"Carotte","ignore_case":false,"whole_word":false},"review":true,"message":""
+    }]});
+    // This is a different signed policy, not a renewal of the original bytes.
+    policy.revision+=1;
+    policy.issued_at+=Duration::milliseconds(1);
+    policy.expires_at+=Duration::milliseconds(1);
+    let key=SigningKey::from_bytes(&[73;32]);let envelope=signed(&key,&policy);
+    cache::prepare(&mut authority.stored.journal,&authority.stored.keys,&envelope,&live_catalog(&key)).unwrap();
+    let journal=&authority.stored.journal;
+    let response=json!({"ok":true,"online":true,"policy":crate::native::browser_policy(&policy),"cache_policy_hash":cache::envelope_hash(&envelope).unwrap(),"cache_authorization_generation":7,"cache_policy_content_hash":journal.policy_content_hash,"cache_catalog_content_hash":journal.catalog_content_hash,"cache_catalog_revision":journal.catalog_revision});
+    (authority,response,policy,boot)
+}
+fn dlp_exchange(response:&Value,policy:&shadow::ShadowPolicy,request:&Value)->Result<Value> {
+    match request["op"].as_str().unwrap_or("") {
+        "policy_v3"=>Ok(response.clone()),
+        "inspect"=>crate::native::inspect_authorized_request(policy,request),
+        "broker_inspect"=>Ok(json!({"ok":true,"policy_content_hash":response["cache_policy_content_hash"],"inspection":crate::native::inspect_authorized_request(policy,request)?})),
+        other=>Err(format!("unexpected fixture operation {other}").into()),
+    }
+}
+
+#[test]
+fn dlp_replacement_without_legacy_labels_keeps_single_use_custody_and_network_completion() {
+    let (mut authority,response,policy,boot)=memory_dlp_authority();
+    let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let owner="S-1-5-21-1-2-3-1001";
+    let (_,inspected)=authority.answer_with(&draft("browser_inspect","Tomate",owner),&mut exchange,&boot,400).unwrap();
+    assert_eq!(inspected["text"],"Carotte");assert_eq!(inspected["labels"],json!([]));assert!(inspected["dlp_receipt"].is_string());
+    let submit=draft("browser_submit","Carotte",owner);
+    let (_,sent)=authority.answer_with(&submit,&mut exchange,&boot,401).unwrap();
+    assert_eq!(sent["recording_required"],true);assert_eq!(sent["durable"],true);
+    let event=&authority.stored.queue.pending[0].event;
+    assert!(event.prompt.is_none());let trace=event.dlp.as_ref().unwrap();assert_eq!(trace.action,"transform");assert_eq!(trace.delivery,"prepared");assert_eq!(trace.decisions[0].rule_name,"Frozen replacement");
+    assert!(!serde_json::to_string(event).unwrap().contains("Tomate"));
+    let (_,again)=authority.answer_with(&draft("browser_submit","Carotte",owner),&mut exchange,&boot,402).unwrap();
+    assert_eq!(again["recording_required"],false);assert_eq!(authority.stored.queue.pending.len(),1);
+    let complete=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_complete","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":submit.request.delivery_id,"completion":{"model":"fixture-model"}}));
+    let (_,done)=authority.answer_with(&complete,&mut exchange,&boot,403).unwrap();assert_eq!(done["applied"],true);
+    assert_eq!(authority.stored.queue.pending[0].event.dlp.as_ref().unwrap().delivery,"observed");
+}
+
+#[test]
+fn dlp_cancel_receipt_is_bound_to_the_account_and_cannot_be_replayed() {
+    let (mut authority,response,policy,boot)=memory_dlp_authority();let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let (_,inspected)=authority.answer_with(&draft("browser_inspect","Tomate","S-1-5-21-1-2-3-1001"),&mut exchange,&boot,400).unwrap();
+    let cancel=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_cancelled","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":inspected["dlp_receipt"]}));
+    let mut foreign=cancel.clone();foreign.principal="S-1-5-21-1-2-3-1002".into();
+    assert_eq!(authority.answer_with(&foreign,&mut exchange,&boot,401).unwrap().1["applied"],false);
+    assert_eq!(authority.answer_with(&cancel,&mut exchange,&boot,402).unwrap().1["applied"],true);
+    assert_eq!(authority.answer_with(&cancel,&mut exchange,&boot,403).unwrap().1["applied"],false);
+    assert_eq!(authority.stored.queue.pending.len(),1);
+    let event=&authority.stored.queue.pending[0].event;assert!(event.prompt.is_none());assert_eq!(event.dlp.as_ref().unwrap().delivery,"cancelled");assert_eq!(event.dlp.as_ref().unwrap().decisions[0].outcome,"cancelled");
+}
+
+#[test]
+fn dlp_response_inspection_never_creates_a_prompt_receipt_or_attempt() {
+    let (mut authority,response,policy,boot)=memory_dlp_authority();let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let mut observation=draft("browser_inspect","Tomate","S-1-5-21-1-2-3-1001");observation.request.observation=Some(true);
+    let (_,reply)=authority.answer_with(&observation,&mut exchange,&boot,400).unwrap();assert_eq!(reply["text"],"Carotte");
+    assert!(reply["dlp_receipt"].is_null());assert!(authority.masked.is_empty());assert!(authority.stored.queue.pending.is_empty());
+}
+
+#[test]
+fn generated_numbered_masks_are_reused_only_with_exact_privileged_custody() {
+ for journal in [false,true] {
+    let (mut authority,mut response,mut policy,boot)=memory_dlp_authority();
+    policy.config["dlp"]["journal"]=json!(journal);
+    policy.config["dlp"]["detectors"]=json!([{"id":"digits","name":"Digits","definition":{"kind":"regex","pattern":"[0-9]+","ignore_case":false}}]);
+    policy.config["dlp"]["rules"][0]["condition"]=json!({"op":"matches","field":"prompt","detector":"digits","minimum":1});
+    policy.config["dlp"]["rules"][0]["consequence"]=json!({"action":"mask","detector":"digits","label":"NUMBER"});
+    response["policy"]=crate::native::browser_policy(&policy);
+    let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let owner="S-1-5-21-1-2-3-1001";
+    let (_,checked)=authority.answer_with(&draft("browser_inspect","12 34",owner),&mut exchange,&boot,400).unwrap();
+    assert_eq!(checked["text"],"[NUMBER1] [NUMBER2]");
+    let (_,sent)=authority.answer_with(&draft("browser_submit","[NUMBER1] [NUMBER2]",owner),&mut exchange,&boot,401).unwrap();
+    assert_eq!(sent["action"],"observe");assert_eq!(sent["text"],"[NUMBER1] [NUMBER2]");
+    let (_,foreign)=authority.answer_with(&draft("browser_submit","[NUMBER1] [NUMBER2]","S-1-5-21-1-2-3-1002"),&mut exchange,&boot,402).unwrap();
+    assert_ne!(foreign["text"],"[NUMBER1] [NUMBER2]");
+ }
+}
+
+#[test]
+fn dlp_confirmation_is_required_single_use_context_bound_and_independent_of_journaling(){
+ for journal in [false,true] {
+ let (mut authority,mut response,mut policy,boot)=memory_dlp_authority();
+ policy.config["dlp"]["journal"]=json!(journal);
+ policy.config["dlp"]["rules"][0]["consequence"]=json!({"action":"warn"});
+ policy.config["dlp"]["rules"][0]["review"]=json!(false);
+ policy.config["dlp"]["rules"][0]["message"]=json!("Confirm before sending.");
+ response["policy"]=crate::native::browser_policy(&policy);
+ let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+ let owner="S-1-5-21-1-2-3-1001";
+ let (_,checked)=authority.answer_with(&draft("browser_inspect","Tomate",owner),&mut exchange,&boot,400).unwrap();
+ assert_eq!(checked["confirmation"],true);assert_eq!(checked["text"],"Tomate");
+ let receipt=checked["dlp_receipt"].as_str().unwrap();
+ let submit=draft("browser_submit","Tomate",owner);
+ assert_eq!(authority.answer_with(&submit,&mut exchange,&boot,401).unwrap().1["action"],"review");
+ let confirm=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_confirm","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":receipt}));
+ let mut foreign=confirm.clone();foreign.principal="S-1-5-21-1-2-3-1002".into();
+ assert_eq!(authority.answer_with(&foreign,&mut exchange,&boot,402).unwrap().1["applied"],false);
+ assert_eq!(authority.answer_with(&confirm,&mut exchange,&boot,403).unwrap().1["applied"],true);
+ assert_eq!(authority.answer_with(&confirm,&mut exchange,&boot,404).unwrap().1["applied"],false);
+ let mut approved=submit.clone();approved.request.approval_id=Some(receipt.into());
+ let (_,sent)=authority.answer_with(&approved,&mut exchange,&boot,405).unwrap();assert_eq!(sent["action"],"observe");
+ assert_eq!(authority.answer_with(&approved,&mut exchange,&boot,406).unwrap().1["action"],"review");
+ assert_eq!(authority.stored.queue.pending.len(),if journal{1}else{0});
+ if journal{let trace=authority.stored.queue.pending[0].event.dlp.as_ref().unwrap();assert_eq!(trace.action,"observe");assert_eq!(trace.decisions[0].consequence,"warn");}
+ }
+}
+
+#[test]
+fn dlp_confirmation_requires_the_current_projected_fingerprint_and_browser() {
+ let (mut authority,mut response,mut policy,boot)=memory_dlp_authority();
+ policy.config["dlp"]["rules"][0]["consequence"]=json!({"action":"warn"});
+ policy.config["dlp"]["rules"][0]["review"]=json!(false);
+ policy.config["dlp"]["rules"][0]["message"]=json!("Confirm before sending.");
+ response["policy"]=crate::native::browser_policy(&policy);
+ let owner="S-1-5-21-1-2-3-1001";
+ let (_,checked)=authority.answer_with(&draft("browser_inspect","Tomate",owner),&mut |r|dlp_exchange(&response,&policy,r),&boot,400).unwrap();
+ let receipt=checked["dlp_receipt"].as_str().unwrap();
+ let confirm=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_confirm","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":receipt}));
+ let mut foreign=confirm.clone();foreign.request.tool="edge".into();
+ assert_eq!(authority.answer_with(&foreign,&mut |r|dlp_exchange(&response,&policy,r),&boot,401).unwrap().1["applied"],false);
+ let original=response["policy"]["config"]["dlp_control"]["fingerprint"].clone();
+ for fingerprint in [Value::Null,json!("b".repeat(64))] {
+  response["policy"]["config"]["dlp_control"]["fingerprint"]=fingerprint;
+  assert_eq!(authority.answer_with(&confirm,&mut |r|dlp_exchange(&response,&policy,r),&boot,402).unwrap().1["applied"],false);
+ }
+ response["policy"]["config"]["dlp_control"]["fingerprint"]=original;
+ assert_eq!(authority.answer_with(&confirm,&mut |r|dlp_exchange(&response,&policy,r),&boot,403).unwrap().1["applied"],true);
+ assert_eq!(authority.answer_with(&confirm,&mut |r|dlp_exchange(&response,&policy,r),&boot,404).unwrap().1["applied"],false);
 }

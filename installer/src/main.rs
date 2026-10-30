@@ -18,6 +18,8 @@ mod browser;
 #[cfg(windows)]
 mod configure;
 #[cfg(windows)]
+mod discovery;
+#[cfg(windows)]
 mod health;
 // ponytail: some helpers only get callers with the configuration port (B5).
 #[cfg(windows)]

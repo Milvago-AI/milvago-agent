@@ -1,0 +1,37 @@
+[package]
+name = "milvago-discovery-collector"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[features]
+runtime-qualification = []
+
+[[test]]
+name = "native_runtime"
+required-features = ["runtime-qualification"]
+
+[dependencies]
+milvago-discovery-engine = { path = "../discovery-engine" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "=0.11.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.190"
+tonic = { version = "=0.14.6", default-features = false, features = ["channel", "codegen"] }
+tonic-prost = "=0.14.6"
+prost = "=0.14.4"
+tokio = { version = "=1.53.1", default-features = false, features = ["rt", "net", "time"] }
+tower = { version = "=0.5.3", features = ["util"] }
+hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+h2 = "=0.4.20"
+bytes = "=1.12.1"
+http = "=1.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }

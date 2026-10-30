@@ -1,0 +1,42 @@
+[Unit]
+Description=Milvago protected endpoint discovery enrollment
+After=network-online.target
+Before=milvago-community.service milvago-browser.service milvago-commercial.service
+ConditionPathExists=/etc/milvago-discovery/installation.json
+[Service]
+Type=oneshot
+User=root
+Group=milvago-agent
+ExecStart=/opt/milvago-discovery/milvago-discovery-system bootstrap
+ExecStartPost=/usr/bin/systemctl start --no-block milvago-discovery.service
+TimeoutStartSec=20
+StateDirectory=milvago-discovery
+StateDirectoryMode=0700
+ConfigurationDirectory=milvago-discovery
+ConfigurationDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+# The importer drops to the bridge account after sandbox setup.
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+ReadWritePaths=/var/lib/milvago-discovery /etc/milvago-discovery -/var/lib/milvago-browser -/var/lib/milvago-commercial
+UMask=0077
+MemoryMax=128M
+CPUQuota=100%
+TasksMax=16
+LimitNOFILE=256
+LimitCORE=0

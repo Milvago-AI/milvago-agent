@@ -42,13 +42,14 @@ fn context(edition: &str, product: &str) -> Result<Context> {
     let folders: &[&str] = if commercial { &["Browser", "Commercial", "Collector", "ModelFilter"] } else { &["Browser"] };
     let mut tree_paths: Vec<PathBuf> = folders.iter().map(|f| data.join("Milvago").join(f)).collect();
     tree_paths.push(programs.join("Milvago").join(if commercial { "Commercial" } else { "Browser" }));
-    // ProgramData\MilvagoAuthorization is authority material: never snapshot, restored or removed.
+    // ProgramData\MilvagoAuthorization and MilvagoDiscovery are independent
+    // authority material: never snapshot, restore or remove their revision floors.
     if commercial {
         tree_paths.push(programs.join("Milvago").join("Browser"));
     }
-    let mut service_names = vec!["Milvago Agent Logger Community", "Milvago Update Applier Community", "MilvagoBrowserAgent"];
+    let mut service_names = vec!["Milvago Agent Logger Community", "Milvago Update Applier Community", "MilvagoBrowserAgent", "Milvago Discovery Community"];
     if commercial {
-        service_names.extend(["Milvago Agent Logger", "Milvago Update Applier", "MilvagoCommercialAgent", "Milvago Native Collector", "MilvagoModelFilter"]);
+        service_names.extend(["Milvago Agent Logger", "Milvago Update Applier", "MilvagoCommercialAgent", "Milvago Native Collector", "MilvagoModelFilter", "Milvago Discovery"]);
     }
     Ok(Context {
         edition: edition.into(),
@@ -131,6 +132,8 @@ pub fn service_image(programs: &Path, name: &str, image: &str) -> bool {
         "Milvago Update Applier" => r"Commercial\milvago-updater.exe",
         "Milvago Native Collector" => r"Commercial\milvago-collector.exe",
         "MilvagoModelFilter" => r"Commercial\milvago-model-filter.exe",
+        "Milvago Discovery Community" => r"Browser\milvago-discovery-system.exe",
+        "Milvago Discovery" => r"Commercial\milvago-discovery-system.exe",
         _ => return false,
     };
     let Some(rest) = image.strip_prefix('"') else { return false };
@@ -179,6 +182,7 @@ fn image_stem(name: &str) -> &'static str {
         "Milvago Agent Logger" | "MilvagoCommercialAgent" => "milvago-commercial-bridge",
         "Milvago Native Collector" => "milvago-collector",
         "MilvagoModelFilter" => "milvago-model-filter",
+        "Milvago Discovery Community" | "Milvago Discovery" => "milvago-discovery-system",
         _ => "milvago-updater",
     }
 }
@@ -349,33 +353,6 @@ fn run(step: &'static str, executable: &Path, arguments: &[&str]) -> Result<()> 
     crate::win::run(step, executable, arguments, std::time::Instant::now() + Duration::from_secs(120)).map(|_| ())
 }
 
-/// `Request-ApplierHandoff`: a running applier of an earlier release (≥ 0.5.14, which
-/// defers STOP) is asked to stop, never waited for: this MSI must finish first.
-fn applier_handoff(c: &Context) -> Result<()> {
-    for name in c.services.iter().filter(|n| is_applier(n)) {
-        if !owned(c, name)? || !services::running(name)? {
-            continue;
-        }
-        let configured = image_path(name).unwrap_or_default();
-        let configured = configured.trim_start_matches('"').split('"').next().unwrap_or_default().to_owned();
-        let running = process_images().into_iter().find(|image| image.to_ascii_lowercase().ends_with("\\milvago-updater.exe")
-            && service_image(&c.programs, name, &format!("\"{image}\"")));
-        let Some(running) = running else { continue };
-        if same(Path::new(&running), Path::new(&configured)) {
-            continue;
-        }
-        let version = running.to_ascii_lowercase().rsplit_once("\\runtime\\").and_then(|(_, t)| t.split_once('\\').map(|(v, _)| v.to_owned()));
-        let at_least = version.is_some_and(|v| {
-            let n: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
-            n.len() == 3 && (n[0], n[1], n[2]) >= (0, 5, 14)
-        });
-        if at_least {
-            services::request_stop(name)?;
-        }
-    }
-    Ok(())
-}
-
 #[derive(Serialize, Deserialize, Clone)]
 struct ServiceRecord {
     name: String,
@@ -426,9 +403,36 @@ fn description(name: &str) -> String {
     crate::win::reg_string(&format!(r"SYSTEM\CurrentControlSet\Services\{name}"), "Description").unwrap_or_default()
 }
 
+fn capture_tree(c: &Context, path: &Path, backup: &Path) -> Result<TreeRecord> {
+    let mut entry = TreeRecord { exists: path.exists(), acls: Vec::new(), hashes: Vec::new() };
+    if !entry.exists { return Ok(entry); }
+    tree(path)?;
+    paths::plain(backup)?;
+    std::fs::create_dir_all(backup).map_err(io("Snapshot directory could not be created"))?;
+    entry.acls.push(AclEntry { relative: String::new(), sddl: paths::sddl_of(path)?, directory: true });
+    let items = snapshot_items(c, path)?;
+    for (item, directory) in &items {
+        let suffix = item.strip_prefix(path).map_err(|_| Failure { step: "Snapshot path escaped", detail: String::new() })?;
+        let target = backup.join(suffix);
+        let relative = item.to_string_lossy()[path.to_string_lossy().len()..].to_owned();
+        if *directory {
+            paths::plain(item)?;
+            std::fs::create_dir_all(&target).map_err(io("Snapshot directory could not be created"))?;
+            entry.acls.push(AclEntry { relative, sddl: paths::sddl_of(item)?, directory: true });
+        } else {
+            let proof = paths::copy_snapshot(item, &target)?;
+            entry.acls.push(AclEntry { relative: relative.clone(), sddl: proof.sddl, directory: false });
+            entry.hashes.push(HashEntry { relative, hash: proof.hash });
+        }
+    }
+    if items != snapshot_items(c, path)? { return fail("Snapshot tree changed during capture"); }
+    tree(backup)?;
+    Ok(entry)
+}
+
 fn prepare(c: &Context, chromium: &str, firefox: &str, held: &mut Vec<&'static str>, saved: &mut bool, tx: &mut Option<PathBuf>) -> Result<()> {
     if !c.commercial
-        && (["Milvago Agent Logger", "MilvagoCommercialAgent", "Milvago Native Collector", "MilvagoModelFilter"].iter().any(|n| services::exists(n).unwrap_or(true))
+        && (["Milvago Agent Logger", "MilvagoCommercialAgent", "Milvago Native Collector", "MilvagoModelFilter", "Milvago Discovery"].iter().any(|n| services::exists(n).unwrap_or(true))
             || c.programs.join("Milvago").join("Commercial").join("installation.json").exists())
     {
         return fail("Enterprise is present; Community operation refused");
@@ -492,25 +496,7 @@ fn prepare(c: &Context, chromium: &str, firefox: &str, held: &mut Vec<&'static s
     stop_writers(c, true)?;
     assert_writers_stopped(c)?;
     for (i, path) in c.paths.iter().enumerate() {
-        let mut entry = TreeRecord { exists: path.exists(), acls: Vec::new(), hashes: Vec::new() };
-        if entry.exists {
-            let backup = dir.join(format!("tree-{i}"));
-            copy_tree(c, path, &backup)?;
-            let mut items = vec![(path.clone(), true)];
-            items.extend(snapshot_items(c, path)?);
-            for (item, directory) in items {
-                let relative = item.to_string_lossy()[path.to_string_lossy().len()..].to_owned();
-                entry.acls.push(AclEntry { relative: relative.clone(), sddl: paths::sddl_of(&item)?, directory });
-                if !directory {
-                    let hash = sha256(&item)?;
-                    if sha256(&PathBuf::from(format!("{}{relative}", backup.to_string_lossy())))? != hash {
-                        return fail("Snapshot changed during capture");
-                    }
-                    entry.hashes.push(HashEntry { relative, hash });
-                }
-            }
-        }
-        record.trees.push(entry);
+        record.trees.push(capture_tree(c, path, &dir.join(format!("tree-{i}")))?);
     }
     record.browser = Some(browser::save(chromium, firefox, c.commercial)?);
     record.complete = true;
@@ -536,7 +522,24 @@ fn read_record(c: &Context) -> Result<Option<(Record, PathBuf)>> {
     Ok(Some((record, dir)))
 }
 
+fn saved_service_sid(key: &RegTree) -> Result<u32> {
+    let roots: Vec<_> = key.keys.iter().filter(|k| k.relative.is_empty()).collect();
+    if !key.exists || roots.len() != 1 { return fail("Invalid saved service SID type"); }
+    let values: Vec<_> = roots[0].values.iter().filter(|v| v.name.eq_ignore_ascii_case("ServiceSidType")).collect();
+    match values.as_slice() {
+        [] => Ok(0),
+        [value] if value.kind == "DWord" => match value.data.as_u64() {
+            Some(kind @ (0 | 1 | 3)) => Ok(kind as u32),
+            _ => fail("Invalid saved service SID type"),
+        },
+        _ => fail("Invalid saved service SID type"),
+    }
+}
+
 fn restore(c: &Context, record: &Record, dir: &Path) -> Result<()> {
+    // Validate all saved identities before changing any service. Registry import
+    // alone does not update SCM's cached SID type after a service was recreated.
+    let sid_types = record.services.iter().map(|s| saved_service_sid(&s.key)).collect::<Result<Vec<_>>>()?;
     if record.complete {
         // An interrupted journal capture needs reviewed recovery; never overwrite its evidence.
         for i in 0..c.paths.len() {
@@ -650,8 +653,15 @@ fn restore(c: &Context, record: &Record, dir: &Path) -> Result<()> {
     for service in record.services.iter().filter(|s| !is_applier(&s.name)) {
         services::write_configuration(&service.name, &service.configuration)?;
     }
-    for service in record.services.iter().filter(|s| s.running && !is_applier(&s.name)) {
-        services::start(&service.name, Duration::from_secs(30))?;
+    for (service, kind) in record.services.iter().zip(&sid_types) {
+        services::set_sid_type(&service.name, *kind)?;
+    }
+    for service in record.services.iter().filter(|s| s.running) {
+        // Preserve an active self-update host. A host recreated by rollback is
+        // stopped, however, and must recover its original running state.
+        if !is_applier(&service.name) || !services::running(&service.name)? {
+            services::start(&service.name, Duration::from_secs(30))?;
+        }
     }
     for service in &record.services {
         let configuration = services::read_configuration(&service.name)?;
@@ -661,7 +671,7 @@ fn restore(c: &Context, record: &Record, dir: &Path) -> Result<()> {
         if configuration.display != service.display || description(&service.name) != service.description {
             return fail("Restored service metadata differs");
         }
-        if service.running && !is_applier(&service.name) && !services::running(&service.name)? {
+        if service.running && !services::running(&service.name)? {
             return fail("Restored service is unavailable");
         }
         if services::sddl(&service.name)? != service.sddl {
@@ -715,7 +725,11 @@ fn prune_runtimes(runtime: &Path, current: &str) {
 }
 
 fn commit(c: &Context, dir: &Path) -> Result<()> {
-    applier_handoff(c)?;
+    // The update host detects its SCM command change and exits with a failure
+    // code after active MSI work completes, so SCM starts the new binary.
+    // Do not send administrative STOP here: it requests a clean exit and
+    // suppresses that recovery, leaving the privileged IPC service stopped.
+    // This also avoids mistaking an unrelated updater process for the service.
     delete_tree(c, dir)?;
     std::fs::remove_file(&c.index).map_err(io("Transaction index could not be removed"))?;
     for edition in &c.custody {
@@ -781,6 +795,74 @@ pub fn run_operation(operation: Operation, edition: &str, product: &str, chromiu
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn snapshot_capture_of_an_absent_tree_creates_no_backup() {
+        let dir = paths::TestDir::new("snapshot-absent");
+        let c = context("community", "01234567-89ab-4cde-8fab-0123456789ab").unwrap();
+        let backup = dir.join("backup");
+        let record = capture_tree(&c, &dir.join("absent"), &backup).unwrap();
+        assert!(!record.exists);
+        assert!(record.acls.is_empty() && record.hashes.is_empty());
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    #[ignore = "elevated disposable protected directories only; no services or registry changed"]
+    fn snapshot_capture_keeps_acl_hashes_and_empty_directories() {
+        let dir = paths::TestDir::new("snapshot-capture");
+        paths::set_acl(&dir, "O:BAD:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)", true).unwrap();
+        let source = dir.join("source");
+        std::fs::create_dir_all(source.join("nested").join("empty")).unwrap();
+        std::fs::write(source.join("plain.txt"), b"synthetic snapshot").unwrap();
+        std::fs::write(source.join("nested").join("image.bin"), [137,80,78,71,0,255]).unwrap();
+        let c = context("community", "01234567-89ab-4cde-8fab-0123456789ab").unwrap();
+        let backup = dir.join("backup");
+        let record = capture_tree(&c, &source, &backup).unwrap();
+        assert!(record.exists);
+        assert_eq!(record.hashes.len(), 2);
+        assert_eq!(record.acls.len(), 5);
+        assert!(backup.join("nested").join("empty").is_dir());
+        let decoded: TreeRecord = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        let restored = dir.join("restored");
+        copy_tree(&c, &backup, &restored).unwrap();
+        for file in &decoded.hashes {
+            let original = PathBuf::from(format!("{}{}", source.display(), file.relative));
+            let recovered = PathBuf::from(format!("{}{}", restored.display(), file.relative));
+            assert_eq!(sha256(&original).unwrap(), file.hash);
+            assert_eq!(sha256(&recovered).unwrap(), file.hash);
+        }
+        for item in &decoded.acls {
+            let original = PathBuf::from(format!("{}{}", source.display(), item.relative));
+            assert_eq!(paths::sddl_of(&original).unwrap(), item.sddl);
+        }
+    }
+
+
+    #[test]
+    fn saved_service_identity_is_exact_and_rejects_ambiguous_snapshots() {
+        let mut key = RegTree { exists: true, keys: vec![reg::RegTreeKey { relative: String::new(), values: vec![] }] };
+        assert_eq!(saved_service_sid(&key).unwrap(), 0);
+        for kind in [0, 1, 3] {
+            key.keys[0].values = vec![reg::RegValue { name: "servicesidtype".into(), kind: "DWord".into(), data: kind.into() }];
+            assert_eq!(saved_service_sid(&key).unwrap(), kind);
+        }
+        for value in [serde_json::json!(-1), serde_json::json!(2), serde_json::json!(4), serde_json::json!("1"), serde_json::json!([1])] {
+            key.keys[0].values[0].data = value;
+            assert!(saved_service_sid(&key).is_err());
+        }
+        key.keys[0].values[0].data = 1.into();
+        key.keys[0].values[0].kind = "String".into();
+        assert!(saved_service_sid(&key).is_err());
+        key.keys[0].values[0].kind = "DWord".into();
+        let duplicate = key.keys[0].values[0].clone();
+        key.keys[0].values.push(duplicate);
+        assert!(saved_service_sid(&key).is_err());
+        key.keys[0].values.clear();
+        let duplicate = key.keys[0].clone();
+        key.keys.push(duplicate);
+        assert!(saved_service_sid(&key).is_err());
+    }
+
 
     #[test]
     fn service_images_are_this_products_executables_only() {
@@ -788,6 +870,10 @@ mod tests {
         let ok = |name, image: &str| service_image(programs, name, image);
         assert!(ok("Milvago Agent Logger Community", r#""C:\Program Files\Milvago\Browser\runtime\0.5.44\milvago-browser-agent.exe" service "C:\ProgramData\Milvago\Browser\state""#));
         assert!(ok("Milvago Update Applier", r#""C:\Program Files\Milvago\Commercial\milvago-updater.exe""#));
+        assert!(ok("Milvago Discovery Community", r#""C:\Program Files\Milvago\Browser\runtime\0.7.1\milvago-discovery-system.exe" service"#));
+        assert!(ok("Milvago Discovery", r#""C:\Program Files\Milvago\Commercial\runtime\0.7.1\milvago-discovery-system.exe" service"#));
+        assert!(!ok("Milvago Discovery", r#""C:\Program Files\Milvago\Browser\runtime\0.7.1\milvago-discovery-system.exe" service"#));
+        assert!(!ok("Milvago Discovery Community", r#""C:\Temp\milvago-discovery-system.exe" service"#));
         assert!(!ok("Milvago Agent Logger Community", r#""C:\Program Files\Milvago\Browser\runtime\0.5.44\..\evil.exe""#));
         assert!(!ok("Milvago Agent Logger Community", r#"C:\Program Files\Milvago\Browser\milvago-browser-agent.exe"#));
         assert!(!ok("Milvago Agent Logger Community", r#""C:\Program Files\Milvago\Browser\runtime\latest\milvago-browser-agent.exe""#));
@@ -812,7 +898,7 @@ mod tests {
         let programs = Path::new(r"C:\Program Files");
         // Every snapshot service maps to the stem of the image service_image accepts for it.
         for name in ["Milvago Agent Logger Community", "Milvago Update Applier Community", "MilvagoBrowserAgent", "Milvago Agent Logger",
-            "Milvago Update Applier", "MilvagoCommercialAgent", "Milvago Native Collector", "MilvagoModelFilter"] {
+            "Milvago Update Applier", "MilvagoCommercialAgent", "Milvago Native Collector", "MilvagoModelFilter", "Milvago Discovery Community", "Milvago Discovery"] {
             let image = format!(r#""C:\Program Files\Milvago\{}\runtime\0.6.5\{}.exe" service"#,
                 if name.contains("Community") || name == "MilvagoBrowserAgent" { "Browser" } else { "Commercial" }, image_stem(name));
             assert!(service_image(programs, name, &image), "{name}: {image}");
