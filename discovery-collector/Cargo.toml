@@ -24,7 +24,7 @@ libc = "=0.2.190"
 tonic = { version = "=0.14.6", default-features = false, features = ["channel", "codegen"] }
 tonic-prost = "=0.14.6"
 prost = "=0.14.4"
-tokio = { version = "=1.53.1", default-features = false, features = ["rt", "net", "time"] }
+tokio = { version = "=1.53.3", default-features = false, features = ["rt", "net", "time"] }
 tower = { version = "=0.5.3", features = ["util"] }
 hyper-util = { version = "=0.1.20", default-features = false, features = ["tokio"] }
 

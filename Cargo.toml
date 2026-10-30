@@ -55,3 +55,8 @@ tempfile = "=3.27.0"
 [profile.release]
 strip = true
 lto = "thin"
+
+[[example]]
+name = "qualify_wsl_system"
+path = "examples/qualify_wsl_system.rs"
+required-features = ["windows-qualification"]
