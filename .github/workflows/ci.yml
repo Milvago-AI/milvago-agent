@@ -32,8 +32,19 @@ jobs:
       - name: Prepare root-owned discovery fixtures
         if: runner.os == 'Linux'
         run: sudo install -d -m 0700 -o root -g root /milvago-test-tmp
-      - run: cargo test --locked
+      # Process-wide handle counts need an isolated process: concurrent tests
+      # legitimately open their own handles during this leak measurement.
+      - run: cargo test --locked -- --skip discovery_wsl::input_section::tests::one_thousand_private_sections_release_views_and_handles
         if: runner.os == 'Windows'
+      - name: Verify private section handles in an isolated test process
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $result = & cargo test --locked --lib discovery_wsl::input_section::tests::one_thousand_private_sections_release_views_and_handles -- --exact --test-threads=1 2>&1
+          $testExit = $LASTEXITCODE
+          $result | Write-Output
+          if ($testExit -ne 0) { throw 'Private section handle regression failed' }
+          if (($result -join "`n") -notmatch 'test result: ok\. 1 passed; 0 failed') { throw 'Expected handle regression did not run' }
       - name: Check the opt-in Windows qualification example
         if: runner.os == 'Windows'
         run: cargo check --locked --features windows-qualification --example qualify_wsl_system
