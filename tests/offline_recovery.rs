@@ -83,8 +83,12 @@ fn running_agent_retains_encrypted_events_offline_and_recovers_without_restart()
             }
             assert!(length<=128*1024);
             let mut body=vec![0;length];reader.read_exact(&mut body).unwrap();
-            if route=="/v3/policy"{calls.fetch_add(1,Ordering::AcqRel);}
-            let (status,answer)=if !server_online.load(Ordering::Acquire) {
+            if matches!(route.as_str(),"/v4/policy"|"/v3/policy"){calls.fetch_add(1,Ordering::AcqRel);}
+            // This fixture models a v3 server. Unsupported routes remain 404
+            // during an outage, so the client exercises its real v3 fallback.
+            let (status,answer)=if route=="/v4/policy" {
+                ("404 Not Found",json!({}))
+            } else if !server_online.load(Ordering::Acquire) {
                 ("503 Service Unavailable",json!({"error":"offline"}))
             } else if route=="/v3/policy" {
                 ("200 OK",serde_json::to_value(envelope(Utc::now()).0).unwrap())
