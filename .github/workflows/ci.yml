@@ -55,7 +55,13 @@ jobs:
       - run: cargo test --locked --manifest-path browser-engine/Cargo.toml
       - run: cargo test --locked --manifest-path dlp-engine/Cargo.toml
       - run: cargo test --locked --manifest-path discovery-engine/Cargo.toml
+      - run: sudo -E env "PATH=$PATH" TMPDIR=/milvago-test-tmp cargo test --locked --manifest-path discovery-collector/Cargo.toml
+        if: runner.os == 'Linux'
       - run: cargo test --locked --manifest-path discovery-collector/Cargo.toml
+        if: runner.os == 'Windows'
+      - name: Return collector build files to the runner account
+        if: runner.os == 'Linux'
+        run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo" discovery-collector/target
       # A release build without the signed extension packages, as a contributor would make it.
       - run: cargo build --release --locked
         env:
