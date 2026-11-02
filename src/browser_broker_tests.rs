@@ -5,14 +5,14 @@ use crate::{Envelope, State, browser_broker as broker, browser_cache as cache, d
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use rand::{RngCore, rngs::OsRng};
+
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+
 
 fn authority() -> SigningKey {
     let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
+    crate::fill_random(&mut seed);
     SigningKey::from_bytes(&seed)
 }
 
@@ -79,7 +79,7 @@ fn catalog(key: &SigningKey) -> Envelope {
             extension: detection::ENGINE_VERSION.into(),
             bridge: detection::ENGINE_VERSION.into(),
         },
-        content_hash: format!("{:x}", Sha256::digest(&raw)),
+        content_hash: crate::sha256_hex(&raw),
         content: STANDARD.encode(raw),
     };
     signed(key, &header)
@@ -1048,4 +1048,44 @@ fn a_completion_that_would_overflow_the_queue_is_not_placed() {
     assert!(!queue.complete(&completion));
     assert!(queue.pending[0].event.model.is_none());
     queue.validate().unwrap();
+}
+
+/// A send the network guard sealed after its DOM record is one blocked event: the seal
+/// completes that record where it still waits. Placed nowhere else, it says so, and the
+/// browser records the refusal on its own.
+#[test]
+fn a_sealed_send_turns_its_waiting_record_blocked_and_nothing_else() {
+    let (journal, _, policy_envelope, authority) = prepared();
+    let policy = shadow::verify(&policy_envelope, &STANDARD.encode(authority.verifying_key().as_bytes()), 1, Utc::now()).unwrap();
+    let mut queue = broker::Queue::default();
+    let delivery = uuid::Uuid::new_v4();
+    let id = queue.admit(&journal, &policy, &broker::parse(&event_for_principal("S-1-5-21-601", delivery, 4)).unwrap()).unwrap();
+    let seal = json!({"decision_reason":"control_unavailable","platform_id":"chatgpt"});
+    // Another account cannot name this send.
+    assert!(queue.completed(&journal, &broker::parse(&completion_request(delivery, seal.clone(), "S-1-5-21-602")).unwrap()).unwrap().is_none());
+    let completion = shadow::ShadowCompletion::parse_for(id, &seal).unwrap();
+    let before = (queue.pending[0].event.prompt.clone(), queue.pending[0].event.characters);
+    assert!(queue.complete(&completion));
+    let event = &queue.pending[0].event;
+    assert_eq!((event.action.as_str(), event.decision_reason.as_deref(), event.platform_id.as_deref()), ("blocked", Some("control_unavailable"), Some("chatgpt")));
+    assert_eq!((event.prompt.clone(), event.characters), before, "no text and no count change");
+    // A record of another platform keeps its action.
+    let mut other = queue.pending[0].event.clone();
+    (other.action, other.decision_reason, other.platform_id, other.provider) = ("observed".into(), None, None, "claude.ai".into());
+    completion.apply(&mut other);
+    assert_eq!(other.action, "observed");
+    // Already at the server: not placed, and said so.
+    let mut state = State::default();
+    let mut gone = completion;
+    gone.id = uuid::Uuid::new_v4();
+    assert!(!shadow::complete(&mut state, gone).unwrap());
+    assert!(state.shadow_completions.is_empty());
+    for bad in [
+        json!({"decision_reason":"model_denied","platform_id":"chatgpt"}),
+        json!({"decision_reason":"control_unavailable"}),
+        json!({"decision_reason":"control_unavailable","platform_id":"unknown-platform"}),
+        json!({"platform_id":"chatgpt","model":"model-alpha"}),
+    ] {
+        assert!(shadow::ShadowCompletion::parse_for(uuid::Uuid::nil(), &bad).is_err(), "{bad}");
+    }
 }

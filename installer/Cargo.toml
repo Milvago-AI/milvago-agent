@@ -1,0 +1,18 @@
+[package]
+name = "milvago-installer"
+version = "0.7.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Custom actions of the Windows MSI, stored in its Binary table so they run even when the
+# installed files are already gone. Replaces the earlier PowerShell custom actions.
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+
+[profile.release]
+strip = true
+lto = "thin"

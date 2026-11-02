@@ -38,14 +38,22 @@ fn verify_security(handle:isize,kind:i32,private:bool,installer:bool)->Result<()
     let(mut owner,mut dacl,mut descriptor)=(std::ptr::null_mut(),std::ptr::null_mut(),std::ptr::null_mut());
     let status=unsafe{GetSecurityInfo(handle,kind,5,&mut owner,std::ptr::null_mut(),&mut dacl,std::ptr::null_mut(),&mut descriptor)};
     let _memory=Allocation(descriptor);
-    if status!=0||dacl.is_null()||!privileged(owner,installer)?{return Err("cache ownership or ACL rejected".into())}
+    if status!=0{return Err("cache ownership or ACL rejected".into())}
+    verify_descriptor(owner,dacl,private,installer)
+}
+fn verify_descriptor(owner:*mut c_void,dacl:*mut c_void,private:bool,installer:bool)->Result<()>{
+    if dacl.is_null()||!privileged(owner,installer)?{return Err("cache ownership or ACL rejected".into())}
     let acl=dacl as *const Acl;
     for index in 0..unsafe{(*acl).count} as u32{
         let mut ace=std::ptr::null_mut();
         if unsafe{GetAce(acl,index,&mut ace)}==0{return Err("cache ACL unavailable".into())}
         let header=unsafe{&*(ace as *const AceHeader)};
-        if header.kind==1||header.flags&8!=0{continue}
-        if header.kind!=0||header.size<12{return Err("unsupported cache ACL".into())}
+        // 1 and 10 are denials (plain and conditional): they only take access away.
+        if matches!(header.kind,1|10)||header.flags&8!=0{continue}
+        // 9 is a conditional grant, laid out like a plain one (mask, then SID). Edge puts one on
+        // its installed msedge.exe (measured 2026-10-15): refusing it rejected every Edge
+        // native-messaging session. The condition is ignored, as if the grant always applied.
+        if !matches!(header.kind,0|9)||header.size<12{return Err("unsupported cache ACL".into())}
         let mask=unsafe{*((ace as *const u8).add(4) as *const u32)};
         let dangerous=if private {0xffff_ffff} else {0x10000000|0x40000000|0x000d0156};
         if mask&dangerous!=0&&!privileged(unsafe{(ace as *const u8).add(8).cast()},installer)?{return Err("cache ACL permits untrusted access".into())}
@@ -76,7 +84,7 @@ impl Directory {
     }
     pub fn contains(&self,name:&str)->Result<bool>{Ok(self.path.join(name).try_exists()?)}
     pub fn read(&self,name:&str,limit:u64)->Result<Vec<u8>>{
-        if !matches!(name,"anchor.json"|"state.bin"|"pending.bin"|"custody.json"|"release.json")&&!legacy_snapshot(name){return Err("invalid cache file".into())}
+        if !matches!(name,"anchor.json"|"state.bin"|"pending.bin"|"custody.json"|"release.json"|"guest-failures.json")&&!legacy_snapshot(name){return Err("invalid cache file".into())}
         let file=OpenOptions::new().access_mode(0x80020000).share_mode(1).custom_flags(0x00200000).open(self.path.join(name))?;
         verify(&file,self.private,self.installer)?;
         if !file.metadata()?.is_file()||file.metadata()?.len()>limit{return Err("cache file exceeds limit".into())}
@@ -84,7 +92,7 @@ impl Directory {
         if bytes.len() as u64>limit{return Err("cache file exceeds limit".into())}Ok(bytes)
     }
     pub fn write(&self,name:&str,bytes:&[u8])->Result<()>{
-        if !matches!(name,"anchor.json"|"state.bin"|"pending.bin"|"custody.json"|"release.json"){return Err("invalid cache file".into())}
+        if !matches!(name,"anchor.json"|"state.bin"|"pending.bin"|"custody.json"|"release.json"|"guest-failures.json"){return Err("invalid cache file".into())}
         let path=self.path.join(name);
         if path.exists(){self.read(name,12*1024*1024)?;}
         crate::atomic_private(&path,bytes)?;
@@ -213,5 +221,42 @@ mod recovery_path_tests {
             "state.invalid.tmp".into(),"state.bin".into()] {
             assert!(!legacy_snapshot(&name));
         }
+    }
+}
+
+#[cfg(test)]
+mod acl_tests {
+    use super::{Allocation,ConvertStringSecurityDescriptorToSecurityDescriptorW,c_void,verify_descriptor,wide};
+    #[link(name="advapi32")]
+    unsafe extern "system" {
+        fn GetSecurityDescriptorOwner(descriptor:*mut c_void,owner:*mut *mut c_void,defaulted:*mut i32)->i32;
+        fn GetSecurityDescriptorDacl(descriptor:*mut c_void,present:*mut i32,dacl:*mut *mut c_void,defaulted:*mut i32)->i32;
+    }
+    fn check(sddl:&str,private:bool)->crate::Result<()> {
+        let text=wide(sddl);let mut descriptor=std::ptr::null_mut();
+        assert_ne!(unsafe{ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(),1,&mut descriptor,std::ptr::null_mut())},0,"{sddl}");
+        let _memory=Allocation(descriptor);
+        let(mut owner,mut dacl,mut present,mut defaulted)=(std::ptr::null_mut(),std::ptr::null_mut(),0,0);
+        assert_ne!(unsafe{GetSecurityDescriptorOwner(descriptor,&mut owner,&mut defaulted)},0);
+        assert_ne!(unsafe{GetSecurityDescriptorDacl(descriptor,&mut present,&mut dacl,&mut defaulted)},0);
+        verify_descriptor(owner,dacl,private,true)
+    }
+    const CONDITION:&str="(WIN://SYSAPPID Contains \"Example.Browser_0000000000000\")";
+    #[test]
+    fn installed_browser_with_a_conditional_read_grant_is_accepted() {
+        // Shape of the DACL Edge puts on msedge.exe: read for users, granted conditionally.
+        let edge=format!("O:SYD:AI(A;ID;FA;;;SY)(A;ID;0x1200a9;;;BU)(XA;ID;0x1200a9;;;BU;{CONDITION})(A;ID;0x1200a9;;;AC)(A;ID;FA;;;BA)");
+        check(&edge,false).unwrap();
+    }
+    #[test]
+    fn conditional_aces_never_open_a_way_in() {
+        // A conditional grant is judged as if its condition always held.
+        assert!(check(&format!("O:SYD:(A;;FA;;;SY)(XA;;FA;;;BU;{CONDITION})"),false).is_err());
+        assert!(check(&format!("O:SYD:(A;;FA;;;SY)(XA;;0x100;;;WD;{CONDITION})"),false).is_err());
+        assert!(check(&format!("O:SYD:(A;;FA;;;SY)(XA;;0x1200a9;;;BU;{CONDITION})"),true).is_err());
+        // A conditional denial only removes access.
+        check(&format!("O:SYD:(A;;FA;;;SY)(XD;;FA;;;BU;{CONDITION})"),false).unwrap();
+        // An untrusted owner stays refused.
+        assert!(check(&format!("O:BUD:(A;;FA;;;SY)(XA;;0x1200a9;;;BU;{CONDITION})"),false).is_err());
     }
 }

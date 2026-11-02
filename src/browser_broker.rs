@@ -44,6 +44,8 @@ pub struct Request {
     #[serde(default)]
     pub check_model: Option<bool>,
     #[serde(default)]
+    pub observation: Option<bool>,
+    #[serde(default)]
     pub platform_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -51,6 +53,8 @@ pub struct Request {
     pub event: Option<Value>,
     #[serde(default)]
     pub delivery_id: Option<String>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
     #[serde(default)]
     pub batch: Option<Value>,
     #[serde(default)]
@@ -95,6 +99,7 @@ pub fn parse(value: &Value) -> Result<Parsed> {
     let health = request.op == "browser_health";
     let receipt = request.op == "browser_receipt";
     let complete = request.op == "browser_complete";
+    let cancelled=matches!(request.op.as_str(),"browser_cancelled"|"browser_confirm");
     if !matches!(
         request.op.as_str(),
         "browser_policy"
@@ -105,21 +110,24 @@ pub fn parse(value: &Value) -> Result<Parsed> {
             | "browser_submit"
             | "browser_receipt"
             | "browser_complete"
+            | "browser_cancelled"
+            | "browser_confirm"
     ) || (complete != request.completion.is_some())
         || (!inspect
         && (request.provider.is_some()
             || request.text.is_some()
             || request.upload.is_some()
             || request.check_model.is_some()
+            || request.observation.is_some()
             || request.model.is_some()
             || request.platform_id.is_some()))
         || ((!event && request.event.is_some())
-            || (!event && !receipt && !complete && request.delivery_id.is_some()))
+            || (!event && !receipt && !complete && !cancelled && request.delivery_id.is_some()))
         || (health != request.batch.is_some())
     {
         return Err("browser operation fields refused".into());
     }
-    if receipt {
+    if receipt || cancelled {
         if fields
             .as_object()
             .ok_or("browser receipt fields refused")?
@@ -139,6 +147,9 @@ pub fn parse(value: &Value) -> Result<Parsed> {
                 .as_deref()
                 .ok_or("delivery identity missing")?,
         )?;
+    }
+    if let Some(id)=&request.approval_id {
+        if request.op!="browser_submit"||uuid::Uuid::parse_str(id).is_err(){return Err("confirmation identity refused".into());}
     }
     if complete {
         // A completion names the send it enriches, and says nothing else: it carries
@@ -229,7 +240,7 @@ impl Parsed {
 impl Request {
     pub fn inspection(&self) -> Value {
         json!({"op":"inspect","tool":self.tool,"provider":self.provider,"text":self.text,"upload":self.upload,
-        "check_model":self.check_model.unwrap_or(false),"platform_id":self.platform_id,"model":self.model})
+        "observation":self.observation.unwrap_or(false),"check_model":self.check_model.unwrap_or(false),"platform_id":self.platform_id,"model":self.model})
     }
 }
 pub fn signed(
@@ -692,9 +703,8 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
     let policy = crate::shadow::cached(state)?;
     // Retention is applied before accepting or retrying custody, including when
     // collection was turned off during the outage.
-    let collect = policy.config["collection"]["enabled"]
-        .as_bool()
-        .unwrap_or(false);
+    let collect = policy.config["collection"]["enabled"]==true ||
+        (event.dlp.as_ref().is_some_and(|t|t.valid()) && crate::shadow::dlp_transport::journal(&policy));
     if collect {
         let id = event.id;
         let occurred = event.occurred_at;
@@ -718,18 +728,25 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         }
         let mut input = serde_json::to_value(&event)?;
         let obj = input.as_object_mut().ok_or("invalid broker event")?;
-        for key in ["id", "occurred_at", "user"] {
+        for key in ["id", "occurred_at", "user", "dlp"] {
             obj.remove(key);
         }
         *changed = true;
         // An event the current policy refuses for good (its service was disabled since
         // SYSTEM admitted it) is acknowledged and dropped, as when collection is off:
         // refused forever, it would wedge the head of the machine-wide SYSTEM queue.
-        if crate::shadow::browser_event(&policy, state.detection.revision, input.clone()).is_err() {
+        let mut narrow=policy.clone();
+        if event.dlp.is_some() {narrow.config["collection"]["enabled"]=json!(true);}
+        if crate::shadow::browser_event(&narrow, state.detection.revision, input.clone()).is_err() {
             state.browser_broker_receipt = Some(AgentReceipt { installation: installation.into(), sequence, id });
             return Ok(json!({"ok":true,"durable":true,"id":id}));
         }
-        let generated = crate::shadow::enqueue_browser(state, input)?;
+        let mut prepared=crate::shadow::browser_event(&narrow,state.detection.revision,input)?;
+        prepared.dlp=event.dlp.clone();
+        let size=crate::shadow::fit_event(&mut prepared)?;
+        crate::config::current().queue.check(state,1,size)?;
+        let generated=prepared.id;
+        state.shadow_queue.push(prepared);
         let received = state
             .shadow_queue
             .iter_mut()

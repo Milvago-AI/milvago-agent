@@ -15,35 +15,19 @@ pub fn valid_model(id: &str) -> bool {
     !id.is_empty() && id.len() <= 200 && id.as_bytes()[0].is_ascii_alphanumeric()
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:/+-".contains(&b))
 }
-// Community covers ChatGPT and Claude, Enterprise all nine: the other seven are removed
-// from the build rather than refused at runtime, so the Community binary does not carry
-// the names of sites it does not observe (product decision of 2026-09-15).
+// Community covers ChatGPT and Claude only: the Community source and binary carry no other
+// site name (product decisions of 2026-09-15 and 2026-10-15).
 pub fn browser_platform(domain: &str) -> Option<&'static str> {
     match domain {
         "chatgpt.com" | "chat.openai.com" | "api.openai.com" => Some("chatgpt"),
         "claude.ai" | "api.anthropic.com" => Some("claude"),
-        #[cfg(feature = "enterprise-extension")]
-        "chat.mistral.ai" => Some("lechat"),
-        #[cfg(feature = "enterprise-extension")]
-        "copilot.microsoft.com" | "copilot.cloud.microsoft" => Some("copilot"),
-        #[cfg(feature = "enterprise-extension")]
-        "gemini.google.com" => Some("gemini"),
-        #[cfg(feature = "enterprise-extension")]
-        "notebooklm.google.com" | "notebook.google.com" => Some("notebooklm"),
-        #[cfg(feature = "enterprise-extension")]
-        "chat.deepseek.com" => Some("deepseek"),
-        #[cfg(feature = "enterprise-extension")]
-        "perplexity.ai" | "www.perplexity.ai" => Some("perplexity"),
-        #[cfg(feature = "enterprise-extension")]
-        "grok.com" => Some("grok"), _ => None,
+        _ => None,
     }
 }
 pub fn valid_platform(platform: &str, channel: &str) -> bool {
     match channel {
         "browser" => match platform {
             "chatgpt" | "claude" => true,
-            #[cfg(feature = "enterprise-extension")]
-            "lechat" | "copilot" | "gemini" | "notebooklm" | "deepseek" | "perplexity" | "grok" => true,
             _ => false,
         },
         "native" => matches!(platform, "codex"|"claude-code"|"claude-desktop"|"claude-desktop-agent"), _ => false,
@@ -82,21 +66,20 @@ pub(crate) use enterprise::decide_authorized;
 mod trusted_provider_tests {
     use super::*;
     #[test]
-    fn notebook_alias_maps_to_the_trusted_platform() {
-        // An alias's fallback stays exact: it is the whole domain that decides, never a
-        // suffix. The alias itself only exists in the edition that covers the site.
-        let expected = if cfg!(feature = "enterprise-extension") { Some("notebooklm") } else { None };
-        assert_eq!(browser_platform("notebook.google.com"), expected);
-        assert_eq!(browser_platform("notebook.google.com.attacker.test"), None);
+    fn a_domain_maps_exactly_never_by_suffix() {
+        assert_eq!(browser_platform("chat.openai.com"), Some("chatgpt"));
+        assert_eq!(browser_platform("chat.openai.com.attacker.test"), None);
     }
     #[test]
     fn this_edition_knows_only_the_platforms_it_covers() {
         for platform in ["chatgpt", "claude"] {
             assert!(valid_platform(platform, "browser"), "{platform} must be covered");
         }
-        for domain in ["chat.mistral.ai", "gemini.google.com", "www.perplexity.ai", "grok.com"] {
-            assert_eq!(browser_platform(domain).is_some(), cfg!(feature = "enterprise-extension"), "{domain}");
+        // Any other assistant is reached and reported by presence, never mapped to a
+        // platform whose prompts, responses or model this edition would take.
+        for domain in ["gemini.google.com", "www.perplexity.ai", "notebook.google.com"] {
+            assert_eq!(browser_platform(domain), None, "{domain}");
         }
-        assert_eq!(valid_platform("grok", "browser"), cfg!(feature = "enterprise-extension"));
+        assert!(!valid_platform("gemini", "browser"));
     }
 }

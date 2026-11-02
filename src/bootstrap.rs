@@ -5,7 +5,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
 };
 use chrono::{DateTime, Utc};
-use rand::{RngCore, rngs::OsRng};
+
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::Path};
 use uuid::Uuid;
@@ -253,7 +253,7 @@ fn follow_machine(home: &Path, edition: &str, fingerprint: Option<String>, host:
     let provision = provision.filter(|p| p.validate_stored(edition).is_ok());
     if let Some(provision) = &provision {
         let mut secret = [0; 32];
-        OsRng.fill_bytes(&mut secret);
+        crate::fill_random(&mut secret);
         state.pending_installation = Some(PendingInstallation {
             provision: provision.clone(),
             installation_id: Uuid::new_v4(),
@@ -371,7 +371,7 @@ pub fn stage(
             provision.validate(edition)?;
             let pending = state.pending_reinstallation.get_or_insert_with(|| {
                 let mut secret = [0; 32];
-                OsRng.fill_bytes(&mut secret);
+                crate::fill_random(&mut secret);
                 PendingInstallation {
                     provision: provision.clone(), installation_id: Uuid::new_v4(),
                     installation_secret: URL_SAFE_NO_PAD.encode(secret), hostname: hostname.into(),
@@ -438,7 +438,7 @@ pub fn stage(
     }
     provision.validate(edition)?;
     let mut secret = [0; 32];
-    OsRng.fill_bytes(&mut secret);
+    crate::fill_random(&mut secret);
     state.pending_installation = Some(PendingInstallation {
         provision,
         installation_id: Uuid::new_v4(),

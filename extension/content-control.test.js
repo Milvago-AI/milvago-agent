@@ -226,3 +226,21 @@ test('a full approved set evicts its oldest entry, never every approved send', a
     assert.equal(headers(sent[64]), true);
   } finally { state.close(); }
 });
+
+// Real campaign 0.7.3: an image sent alone (`prompt` empty) was sealed under masking. A send
+// with no text at its route's path passes; text anywhere else in the body keeps it sealed.
+test('under masking a send without text passes, text elsewhere in its body does not', async () => {
+  const state = await worker(masking);
+  const attachments = JSON.stringify([{ fileId: 'file-synthetic', mimeType: 'image/jpeg', name: 'Synthetic drawing 2.jpg', size: 42 }]);
+  const image = (prompt, state_ = '{"backendConversationId":"6aa99383-dd04-83ea-88fb-50a164a3820d","messages":[],"userMessageCount":1}') =>
+    post({ requestBody: { formData: { prompt: [prompt], imageAttachments: [attachments], conversationState: [state_] } } });
+  try {
+    assert.equal(allowed(state, image('')), true, 'an image alone, nothing approved');
+    await approve(state, '');
+    assert.equal(allowed(state, image('')), true, 'an image alone after an empty send');
+    assert.equal(allowed(state, image('Bonjour jean.exemple@example.com')), false, 'an image with text nobody approved');
+    assert.equal(allowed(state, image('', JSON.stringify({ messages: [{ content: 'Bonjour jean.exemple@example.com merci' }] }))), false, 'text hidden in another field');
+    assert.equal(allowed(state, post({ requestBody: { formData: { prompt: [''], note: ['Bonjour jean.exemple@example.com merci'] } } })), false, 'text in a field of its own');
+    assert.equal(allowed(state, image('   ')), false, 'blanks are still text at the path');
+  } finally { state.close(); }
+});

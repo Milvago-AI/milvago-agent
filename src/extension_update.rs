@@ -2,7 +2,7 @@
 //! No remote fetch, upload, mutable package directory or proxy.
 use crate::Result;
 use rustls::{ServerConnection, StreamOwned};
-use sha2::{Digest, Sha256};
+
 use std::{
     io::{self, Read, Write},
     net::{TcpListener, TcpStream},
@@ -26,8 +26,8 @@ pub fn info() -> Result<serde_json::Value> {
         "firefox_origin": FIREFOX_ORIGIN, "firefox_id": FIREFOX_ID, "firefox_version": FIREFOX_VERSION,
         "firefox_install_url": format!("{FIREFOX_ORIGIN}/ext/{FIREFOX_VERSION}/milvago.xpi"),
         "chromium_id": CHROMIUM_ID, "embedded": true,
-        "crx_size": CRX.len(), "crx_sha256": format!("{:x}", Sha256::digest(CRX)),
-        "xpi_size": XPI.len(), "xpi_sha256": format!("{:x}", Sha256::digest(XPI)),
+        "crx_size": CRX.len(), "crx_sha256": crate::sha256_hex(CRX),
+        "xpi_size": XPI.len(), "xpi_sha256": crate::sha256_hex(XPI),
     }))
 }
 
@@ -446,7 +446,7 @@ fn respond(stream: &mut impl Channel, firefox: bool) -> Result<()> {
         serde_json::to_string(&serde_json::json!({"addons": {
             (FIREFOX_ID): {"updates": [{"version": FIREFOX_VERSION,
                 "update_link": format!("{FIREFOX_ORIGIN}{xpi_path}"),
-                "update_hash": format!("sha256:{:x}", Sha256::digest(XPI)),
+                "update_hash": format!("sha256:{}", crate::sha256_hex(XPI)),
                 "applications":{"gecko":{"strict_min_version":"140.0"}}
             }]}
         }}))?

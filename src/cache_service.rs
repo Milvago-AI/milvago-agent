@@ -21,6 +21,42 @@ pub struct Authority {
     stored: Stored,
     storage: Storage,
     storage_failed: bool,
+    /// Labels of drafts the inspection rewrote, keyed by the rewritten text's digest
+    /// (never the original): the submit only sees the masked text, which no longer
+    /// carries what made it sensitive. In memory, short-lived, single-use.
+    masked: Vec<Masked>,
+}
+struct Masked {
+    key: String,
+    /// Digests of its lines, so that a masked paste still lends its labels once laid out
+    /// in a larger draft by the page's editor (real campaign 0.7.10: `labels=[]`).
+    lines: Vec<String>,
+    labels: Vec<Value>,
+    dlp: Option<crate::shadow::dlp_transport::Trace>,
+    verified_policy: Option<String>,
+    receipt: String,
+    requires_confirmation: bool,
+    transformed: bool,
+    confirmed: bool,
+    owner: String,
+    provider: String,
+    at: Instant,
+}
+const MASKED_ENTRIES: usize = 32;
+const MASKED_LINES: usize = 256;
+const MASKED_TTL: Duration = Duration::from_secs(600);
+// Bound to the OS account, browser, service and policy revision: another account,
+// browser or draft cannot lend its labels to a send.
+fn masked_key(parsed: &crate::browser_broker::Parsed, revision: u64, text: &Value) -> String {
+    cache::hash(json!([parsed.principal, parsed.request.tool, parsed.request.provider, parsed.request.upload, parsed.request.check_model.unwrap_or(false), parsed.request.model, parsed.request.observation.unwrap_or(false), revision, text]).to_string().as_bytes())
+}
+// Each non-blank line, its blanks collapsed (an editor splits paragraphs and may double the
+// break between them), bound like the whole text. Digests only, never the line.
+fn masked_lines(parsed: &crate::browser_broker::Parsed, revision: u64, text: &str) -> impl Iterator<Item = String> {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .map(move |line| masked_key(parsed, revision, &json!(["line", line])))
 }
 enum Storage {
     Protected {
@@ -300,6 +336,7 @@ impl Authority {
                 _lock: lock,
             },
             storage_failed: false,
+            masked: Vec::new(),
         })
     }
     fn save(&mut self) -> Result<()> {
@@ -698,12 +735,22 @@ impl Authority {
                 let answer = exchange(&json!({"op":"broker_complete","completion":completion}));
                 Ok((
                     mode,
-                    json!({"ok":true,"applied":answer.is_ok_and(|a| a["ok"] == true)}),
+                    json!({"ok":true,"applied":answer.is_ok_and(|a| a["ok"] == true && a["applied"] == true)}),
                 ))
             }
             "browser_submit" => {
                 let mut request = parsed.request.inspection();
-                let mut reply = if connected {
+                self.masked.retain(|m|m.at.elapsed()<MASKED_TTL);
+                let key=masked_key(parsed,policy.revision,&request["text"]);
+                let fingerprint=policy.config["dlp_fingerprint"].as_str().or_else(||policy.config["dlp_control"]["fingerprint"].as_str());
+                // Exact bytes already passed final verification in this policy and
+                // context. Reuse only privileged custody, never a page-supplied marker.
+                let sealed=self.masked.iter().find(|m|m.key==key&&m.confirmed&&(!m.requires_confirmation||Some(m.receipt.as_str())==parsed.request.approval_id.as_deref())&&m.verified_policy.as_deref().is_some()&&m.verified_policy.as_deref()==fingerprint);
+                let mut reply = if let Some(sealed)=sealed {
+                    let mut answer=json!({"ok":true,"action":"observe","text":request["text"],"labels":sealed.labels});
+                    if let Some(trace)=&sealed.dlp {answer["dlp"]=serde_json::to_value(&trace.decisions)?;answer["dlp_fingerprint"]=json!(trace.fingerprint);}
+                    answer
+                } else if connected {
                     request["op"] = json!("broker_inspect");
                     let answer = exchange(&request)?;
                     if answer["ok"] != true
@@ -724,9 +771,37 @@ impl Authority {
                 {
                     return Ok((mode, reply));
                 }
-                let required = policy.config["collection"]["enabled"]
-                    .as_bool()
-                    .unwrap_or(false);
+                let key = masked_key(parsed, policy.revision, &request["text"]);
+                self.masked.retain(|m| m.at.elapsed() < MASKED_TTL);
+                let mut lent = Vec::new();
+                if let Some(found) = self.masked.iter().position(|m| m.key == key && m.confirmed && (!m.requires_confirmation || Some(m.receipt.as_str())==parsed.request.approval_id.as_deref())) {
+                    lent.push(self.masked.remove(found));
+                }
+                // Then every masked text whose lines all appear in this draft: a paste reviewed
+                // apart, sent with or without words around it.
+                let sent: std::collections::HashSet<String> =
+                    masked_lines(parsed, policy.revision, request["text"].as_str().unwrap_or("")).collect();
+                while let Some(found) = self.masked.iter().position(|m| m.confirmed && !m.requires_confirmation && !m.lines.is_empty() && m.lines.iter().all(|line| sent.contains(line))) {
+                    lent.push(self.masked.remove(found));
+                }
+                let mut dlp=crate::shadow::dlp_transport::Trace::inspection(&reply,&request["text"]);
+                let transformed=lent.iter().any(|m|m.transformed);
+                if !lent.is_empty() {
+                    for masked in &lent {
+                        if let Some(trace)=masked.dlp.clone() {
+                            if let Some(current)=&mut dlp {current.merge(trace);} else {dlp=Some(trace);}
+                        }
+                    }
+                    let mut merged = reply["labels"].as_array().cloned().unwrap_or_default();
+                    for label in lent.into_iter().flat_map(|m| m.labels) {
+                        if !merged.contains(&label) {
+                            merged.push(label);
+                        }
+                    }
+                    reply["labels"] = json!(merged);
+                }
+                if let Some(trace)=&mut dlp {if trace.action=="review" {trace.action=if transformed {"transform"}else{"observe"}.into();}}
+                let required = policy.config["collection"]["enabled"] == true || dlp.is_some();
                 reply["recording_required"] = json!(required);
                 reply["recorded"] = json!(false);
                 if required {
@@ -758,7 +833,11 @@ impl Authority {
                     self.stored
                         .queue
                         .restrict(Some(&policy), self.stored.journal.generation);
-                    let id = if let Some(response) = &response {
+                    let id = if let Some(trace) = dlp {
+                        let mut prepared=crate::shadow::dlp_transport::event(&policy,self.stored.journal.catalog_revision,event.clone(),trace)?;
+                        prepared.id=uuid::Uuid::nil();
+                        self.stored.queue.admit_prepared(&admission_journal,&custody,prepared)?
+                    } else if let Some(response) = &response {
                         let prepared = self.prepare_connected_event(&custody, response, exchange)?;
                         self.stored.queue.admit_prepared(&admission_journal, &custody, prepared)?
                     } else {
@@ -781,12 +860,67 @@ impl Authority {
                     return Err("browser queue full".into());
                 }
                 let request = parsed.request.inspection();
-                let reply = if connected {
+                let mut reply = if connected {
                     exchange(&request)?
                 } else {
                     crate::native::inspect_authorized_request(&policy, &request)?
                 };
+                if let Some(labels) = reply["labels"].as_array().filter(|labels| {
+                    reply["ok"] == true && request["observation"]!=true && (!labels.is_empty() || reply["dlp"].as_array().is_some_and(|d|!d.is_empty()) || policy.version>=4) && reply["text"].is_string() && (reply["text"] != request["text"] || reply["confirmation"]==true)
+                }) {
+                    self.masked.retain(|m| m.at.elapsed() < MASKED_TTL);
+                    if self.masked.len() >= MASKED_ENTRIES {
+                        self.masked.remove(0);
+                    }
+                    let labels = labels.iter().take(16).cloned().collect();
+                    let text = reply["text"].as_str().unwrap_or("");
+                    let lines = if reply["confirmation"]==true {vec![]}else{masked_lines(parsed, policy.revision, text).take(MASKED_LINES).collect()};
+                    let receipt=uuid::Uuid::new_v4().to_string();
+                    reply["dlp_receipt"]=json!(receipt);
+                    let verified_policy=if policy.version>=4 {policy.config["dlp_fingerprint"].as_str().or_else(||policy.config["dlp_control"]["fingerprint"].as_str()).map(str::to_owned)}else{None};
+                    self.masked.push(Masked { transformed:reply["text"]!=request["text"],requires_confirmation:reply["confirmation"]==true,confirmed:reply["confirmation"]!=true,verified_policy,receipt,owner:cache::hash(json!([parsed.principal,parsed.request.tool]).to_string().as_bytes()),provider:request["provider"].as_str().unwrap_or("").into(),key: masked_key(parsed, policy.revision, &reply["text"]), lines, labels, dlp:crate::shadow::dlp_transport::Trace::inspection(&reply,&request["text"]), at: Instant::now() });
+                }
+                if reply["action"]=="block" && request["observation"]!=true {
+                    if let Some(trace)=crate::shadow::dlp_transport::Trace::inspection(&reply,&request["text"]) {
+                        let input=json!({"source":"browser","tool":parsed.request.tool,"provider":request["provider"],"kind":"prompt","action":"blocked","characters":request["text"].as_str().unwrap_or("").chars().count(),"labels":reply["labels"],"prompt":request["text"]});
+                        let mut custody=parsed.clone();
+                        custody.request.op="browser_event".into();
+                        custody.request.delivery_id=Some(uuid::Uuid::new_v4().to_string());
+                        custody.request.event=Some(input.clone());
+                        let mut event=crate::shadow::dlp_transport::event(&policy,self.stored.journal.catalog_revision,input,trace)?;
+                        event.id=uuid::Uuid::nil();
+                        let id=self.stored.queue.admit_prepared(&admission_journal,&custody,event)?;
+                        self.save()?;
+                        reply["dlp_recorded"]=json!(true);
+                        reply["id"]=json!(id);
+                    }
+                }
                 Ok((mode, reply))
+            }
+            "browser_confirm" => {
+                let owner=cache::hash(json!([parsed.principal,parsed.request.tool]).to_string().as_bytes());
+                self.masked.retain(|m|m.at.elapsed()<MASKED_TTL);
+                // Connected responses carry the redacted browser projection; grace
+                // uses the complete signed policy. Bind both to the same fingerprint.
+                let Some(fingerprint)=policy.config["dlp_fingerprint"].as_str().or_else(||policy.config["dlp_control"]["fingerprint"].as_str()) else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                let Some(pending)=self.masked.iter_mut().find(|m|m.owner==owner&&Some(m.receipt.as_str())==parsed.request.delivery_id.as_deref()&&m.verified_policy.as_deref()==Some(fingerprint)) else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                if !pending.requires_confirmation||pending.confirmed{return Ok((mode,json!({"ok":true,"applied":false})));}
+                pending.confirmed=true;
+                Ok((mode,json!({"ok":true,"applied":true})))
+            }
+            "browser_cancelled" => {
+                let owner=cache::hash(json!([parsed.principal,parsed.request.tool]).to_string().as_bytes());
+                self.masked.retain(|m|m.at.elapsed()<MASKED_TTL);
+                let Some(index)=self.masked.iter().position(|m|m.owner==owner&&Some(m.receipt.as_str())==parsed.request.delivery_id.as_deref()) else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                let pending=self.masked.remove(index);
+                let Some(mut trace)=pending.dlp else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                trace.delivery="cancelled".into();
+                for decision in &mut trace.decisions {if decision.outcome=="prepared" {decision.outcome="cancelled".into();}}
+                let input=json!({"source":"browser","tool":parsed.request.tool,"provider":pending.provider,"kind":"prompt","action":"observed","characters":0,"characters_known":false,"labels":pending.labels});
+                let mut custody=parsed.clone();custody.request.op="browser_event".into();custody.request.event=Some(input.clone());
+                let mut event=crate::shadow::dlp_transport::event(&policy,self.stored.journal.catalog_revision,input,trace)?;event.id=uuid::Uuid::nil();
+                let id=self.stored.queue.admit_prepared(&admission_journal,&custody,event)?;self.save()?;
+                Ok((mode,json!({"ok":true,"applied":true,"id":id})))
             }
             "browser_catalog" => {
                 let mut reply = if connected {

@@ -104,11 +104,13 @@ pub enum Access {
     CacheBrowser,
     #[cfg(windows)]
     UpdateAgent,
+    #[cfg(windows)]
+    DiscoveryAgent,
 }
 
 fn frame_budget(access:Access)->usize {
     #[cfg(windows)]
-    match access {Access::UpdateAgent=>return 2*1024*1024,Access::CacheBrowser=>return 1024*1024,_=>{}}
+    match access {Access::DiscoveryAgent=>return 8*1024*1024,Access::UpdateAgent=>return 2*1024*1024,Access::CacheBrowser=>return 1024*1024,_=>{}}
     let _=access;128*1024
 }
 /// Handler invoked for each request frame received from a relayed client.
@@ -215,6 +217,8 @@ struct DeadlineStream<S> {
 impl<S> DeadlineStream<S> {
     fn new(inner: S, access: Access, stop: Arc<AtomicBool>) -> Self {
         let seconds = if matches!(access, Access::Service) { 120 } else { 10 };
+        #[cfg(windows)]
+        let seconds=if access==Access::DiscoveryAgent {120} else {seconds};
         Self { inner, deadline: std::time::Instant::now() + std::time::Duration::from_secs(seconds), stop }
     }
     fn check(&self) -> io::Result<()> {
@@ -627,7 +631,7 @@ mod windows {
                 "S-1-5-18" | "S-1-5-20" | "S-1-5-32-544"
             ),
             // Only LocalSystem serves a service channel.
-            Access::Service | Access::CacheBrowser | Access::UpdateAgent => owner == "S-1-5-18",
+            Access::Service | Access::CacheBrowser | Access::UpdateAgent | Access::DiscoveryAgent => owner == "S-1-5-18",
         };
         if !owned_by_a_service {
             return Ok(false);
@@ -642,7 +646,7 @@ mod windows {
             None => true,
             Some(text) => match access {
                 Access::Browser => matches!(text.as_str(), "S-1-5-18" | "S-1-5-20"),
-                Access::Service | Access::CacheBrowser | Access::UpdateAgent => text == "S-1-5-18",
+                Access::Service | Access::CacheBrowser | Access::UpdateAgent | Access::DiscoveryAgent => text == "S-1-5-18",
             },
         })
     }
@@ -832,6 +836,7 @@ mod windows {
             Access::Service => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{})", crate::cache_peer::service_sid(edition)?),
             Access::CacheBrowser => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;AU)"),
             Access::UpdateAgent => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{})", crate::cache_peer::service_sid(edition)?),
+            Access::DiscoveryAgent => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{})", crate::cache_peer::service_sid(edition)?),
         })
     }
     /// Who may create instances of a Browser channel: the one service that serves it,
@@ -999,7 +1004,7 @@ mod windows {
                 continue;
             }
             let authenticated = match access {
-                Access::CacheBrowser | Access::UpdateAgent => {
+                Access::CacheBrowser | Access::UpdateAgent | Access::DiscoveryAgent => {
                     let mut pid = 0;
                     if unsafe { GetNamedPipeClientProcessId(handle, &mut pid) } == 0 { false }
                     else if access == Access::CacheBrowser { crate::cache_peer::relay(pid, edition).is_ok() }
@@ -1012,7 +1017,8 @@ mod windows {
                 continue;
             }
             let caller = caller_identity(handle);
-            if active.load(Ordering::Acquire) >= MAX_CONNECTIONS || !callers.admit(&caller) {
+            let connection_limit=if access==Access::DiscoveryAgent {1} else {MAX_CONNECTIONS};
+            if active.load(Ordering::Acquire) >= connection_limit || !callers.admit(&caller) {
                 unsafe {
                     DisconnectNamedPipe(handle);
                     CloseHandle(handle);
@@ -1034,6 +1040,9 @@ mod windows {
                 let object=request.as_object_mut().ok_or("IPC object required")?;
                 let caller=object.get_mut("caller").and_then(Value::as_object_mut).ok_or("IPC caller absent")?;
                 caller.insert("system".into(),json!(principal == "S-1-5-18"));
+                if access==Access::DiscoveryAgent {
+                    caller.insert("service_sid".into(),json!(crate::cache_peer::service_sid(edition)?));
+                }
                 // The account comes from the same kernel token as the SID, never from a
                 // process id the client could have recycled.
                 caller.insert("user".into(),json!(sid_account(&principal).unwrap_or_default()));
@@ -1064,9 +1073,9 @@ mod windows {
                 fn GetSecurityDescriptorOwner(descriptor: *mut c_void, owner: *mut *mut c_void, defaulted: *mut i32) -> i32;
             }
             let mut checked=0;
-            for access in [Access::Service, Access::CacheBrowser, Access::UpdateAgent] {
+            for access in [Access::Service, Access::CacheBrowser, Access::UpdateAgent, Access::DiscoveryAgent] {
                 // The agent's service SID resolves only where the service is installed.
-                if matches!(access, Access::UpdateAgent | Access::Service) && crate::cache_peer::service_sid("community").is_err() { continue; }
+                if matches!(access, Access::UpdateAgent | Access::Service | Access::DiscoveryAgent) && crate::cache_peer::service_sid("community").is_err() { continue; }
                 let text=pipe_sddl(access,"community","").unwrap();
                 let mut raw=std::ptr::null_mut();
                 assert_ne!(unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(&text).as_ptr(),
@@ -1087,8 +1096,8 @@ mod windows {
             assert_eq!(pipe_sddl(Access::Browser,"community","OW").unwrap(),
                 "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;0x0012019b;;;AU)");
             // No client ACE may carry FILE_CREATE_PIPE_INSTANCE (0x4) or GENERIC_WRITE.
-            for access in [Access::Browser, Access::Service, Access::CacheBrowser] {
-                if access == Access::Service && crate::cache_peer::service_sid("community").is_err() { continue; }
+            for access in [Access::Browser, Access::Service, Access::CacheBrowser, Access::DiscoveryAgent] {
+                if matches!(access, Access::Service | Access::DiscoveryAgent) && crate::cache_peer::service_sid("community").is_err() { continue; }
                 let text=pipe_sddl(access,"community","OW").unwrap();
                 assert!(!text.contains("GW"), "generic write granted: {text}");
                 assert_eq!(u32::from_str_radix(CLIENT.trim_start_matches("0x"),16).unwrap()&0x4,0);
@@ -1098,6 +1107,18 @@ mod windows {
 
         // The kernel decides: a principal granted only the client ACE cannot serve its
         // own instance of the name, where the former GENERIC_WRITE grant let it.
+        #[test]
+        fn discovery_channel_grants_only_the_installed_service_identity() {
+            if let Ok(sid) = crate::cache_peer::service_sid("community") {
+                let descriptor = pipe_sddl(Access::DiscoveryAgent, "community", "S-1-5-21-1-2-3-1000").unwrap();
+                assert_eq!(descriptor, format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{sid})"));
+                assert!(!descriptor.contains(";;;AU)"));
+                assert!(!descriptor.contains(";;;NS)"));
+                assert!(!descriptor.contains("S-1-5-21-1-2-3-1000"));
+            }
+            assert_eq!(frame_budget(Access::DiscoveryAgent), 8*1024*1024);
+        }
+
         #[test]
         fn a_client_principal_cannot_add_a_pipe_instance() {
             let join = |sddl: &str| -> u32 {

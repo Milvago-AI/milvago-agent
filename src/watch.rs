@@ -80,6 +80,14 @@ pub fn cause(error: &(dyn std::error::Error + Send + Sync + 'static)) -> &'stati
         return transport(&chain);
     }
     let text = error.to_string();
+    // Exact local error strings become stable support codes. Never include the
+    // server response or attacker-controlled detail in the service log.
+    if text == "event batch rejected; valid events retained" {
+        return "event_batch_rejected: server refused records; queued records will retry";
+    }
+    if text == "completion batch rejected" {
+        return "completion_batch_rejected: optional event enrichment was refused";
+    }
     if text.contains("authorization refused") {
         UNAUTHORIZED
     } else if text.contains("tls.ca_file") || text.contains("tls.allow_private_ca") {
@@ -145,6 +153,19 @@ mod tests {
 
     fn boxed(message: &str) -> Box<dyn std::error::Error + Send + Sync> {
         message.into()
+    }
+
+    #[test]
+    fn rejected_event_diagnostics_are_distinct_and_never_echo_payloads() {
+        assert_eq!(cause(&*boxed("event batch rejected; valid events retained")),
+            "event_batch_rejected: server refused records; queued records will retry");
+        assert_eq!(cause(&*boxed("completion batch rejected")),
+            "completion_batch_rejected: optional event enrichment was refused");
+        for raw in ["event batch rejected; valid events retained https://private.invalid/?token=synthetic",
+            "completion batch rejected synthetic-secret", "synthetic-secret\nHTTP 400"] {
+            let reason=cause(&*boxed(raw));assert!(!reason.contains("synthetic"));assert!(!reason.contains("private.invalid"));
+            assert!(!reason.starts_with("event_batch_rejected"));assert!(!reason.starts_with("completion_batch_rejected"));
+        }
     }
 
     #[test]

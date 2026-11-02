@@ -136,7 +136,7 @@ test('an identifier the event already carries is never overwritten', async () =>
 });
 
 test('one route with two body shapes is read by candidate paths, in order', async () => {
-  // Measured on Le Chat: the prompt is `content[*].text` when a thread opens and
+  // Measured on a provider: the prompt is `content[*].text` when a thread opens and
   // `messageInput[*].text` afterwards, on the same route. Two rules cannot settle it,
   // so the rule names both and the first that yields text wins.
   const both = { providers: [{ ...catalog.providers[0], network: [{ ...rule, text_path: '', text_paths: ['messageInput[*].text', 'content[*].text'] }] }] };
@@ -164,7 +164,7 @@ test('one route with two body shapes is read by candidate paths, in order', asyn
 });
 
 test('an ambiguous path reports nothing rather than a plausible wrong value', async () => {
-  // Measured on Le Chat: the reasoning is stated by *adding* `beta-reasoning` to a
+  // Measured on a provider: the reasoning is stated by *adding* `beta-reasoning` to a
   // `features` array, not by a value at a path. An `effort_path` of `features[*]`
   // would report the first conforming string of the list — `beta-code-interpreter` —
   // which is plausible, wrong and silent. Ambiguity reports nothing instead.
