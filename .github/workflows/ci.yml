@@ -85,7 +85,7 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: installer
 
-  # cargo-audit reads the RustSec advisories against both lock files. A non-zero exit fails.
+  # Audit every tracked dependency graph, including the fuzz harness.
   audit:
     runs-on: ubuntu-24.04
     steps:
@@ -102,6 +102,7 @@ jobs:
       - run: cargo audit --file discovery-engine/Cargo.lock
       - run: cargo audit --file discovery-collector/Cargo.lock
       - run: cargo audit --file installer/Cargo.lock
+      - run: cargo audit --file fuzz/Cargo.lock
 
   extension:
     runs-on: ubuntu-24.04
@@ -131,6 +132,8 @@ jobs:
           console.log('Agent and extension versions match: ' + version);
           NODE
       - run: npm ci --ignore-scripts
+        working-directory: extension
+      - run: npm audit --audit-level=low --ignore-scripts
         working-directory: extension
       - run: npm test
         working-directory: extension
