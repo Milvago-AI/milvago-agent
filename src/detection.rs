@@ -11,7 +11,8 @@ use std::{
     io::Read,
     path::Path,
 };
-pub const ENGINE_VERSION: &str = "0.5.0";
+// Catalog capability level; the signed server floor must match this generation.
+pub const ENGINE_VERSION: &str = "0.7.0";
 #[derive(Default, Serialize, Deserialize)]
 pub struct Cache {
     pub revision: u64,
@@ -76,8 +77,8 @@ pub struct Network {
     /// differently (`effort`, `thinking_effort`), so it is a path like the others.
     /// Tolerated before any catalog uses it: `Dom` and `Network` refuse unknown
     /// fields, so a catalog published with a field an older agent does not know is
-    /// rejected outright, and `min_engine` does not protect against that - it compares
-    /// both of its fields to one frozen constant. Field first, catalog afterwards.
+    /// rejected outright. The signed `min_engine` floor is checked before content;
+    /// declare and ship new fields with the matching engine before the catalogue.
     #[serde(default)]
     pub effort_path: String,
     #[serde(default)]
@@ -775,7 +776,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     fn signed(content: Content, revision: u64, now: DateTime<Utc>) -> (Envelope, String, Header) {
-        let key = SigningKey::from_bytes(&[67; 32]);
         let raw = serde_json::to_vec(&content).unwrap();
         let h = Header {
             kind: "detection_catalog".into(),
@@ -784,12 +784,16 @@ mod tests {
             issued_at: now,
             expires_at: now + chrono::Duration::hours(1),
             min_engine: Engines {
-                extension: "0.5.0".into(),
-                bridge: "0.5.0".into(),
+                extension: ENGINE_VERSION.into(),
+                bridge: ENGINE_VERSION.into(),
             },
             content_hash: crate::sha256_hex(&raw),
             content: STANDARD.encode(raw),
         };
+        signed_header(h)
+    }
+    fn signed_header(h: Header) -> (Envelope, String, Header) {
+        let key = SigningKey::from_bytes(&[67; 32]);
         let bytes = serde_json::to_vec(&h).unwrap();
         (
             Envelope {
@@ -825,6 +829,48 @@ mod tests {
         changed.signature = STANDARD.encode([0; 64]);
         assert!(verify(&changed, &key, 0, "", now).is_err());
         assert!(verify(&env, &STANDARD.encode([1; 32]), 0, "", now).is_err());
+    }
+    #[test]
+    fn signed_engine_floors_are_enforced_before_content() {
+        let now = Utc::now();
+        let (_, _, original) = signed(factory(), 3, now);
+        assert_eq!(ENGINE_VERSION, "0.7.0");
+        for (extension, bridge, accepted) in [
+            ("0.5.0", "0.5.0", true),
+            ("0.7.0", "0.7.0", true),
+            ("9.9.9", "0.7.0", false),
+            ("0.7.0", "9.9.9", false),
+            ("0.7", "0.7.0", false),
+            ("0.7.0", "0.7", false),
+        ] {
+            let mut header = original.clone();
+            header.min_engine = Engines {
+                extension: extension.into(),
+                bridge: bridge.into(),
+            };
+            let (envelope, key, _) = signed_header(header.clone());
+            let result = verify(&envelope, &key, 3, "", now);
+            if accepted {
+                assert!(result.is_ok(), "compatible floor {extension}/{bridge}");
+            } else {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "catalog requires newer engine"
+                );
+                // Correctly hash and sign invalid content: the floor, not its parser,
+                // must reject this envelope first.
+                header.content = STANDARD.encode(b"not-json");
+                header.content_hash = crate::sha256_hex(b"not-json");
+                let (envelope, key, _) = signed_header(header);
+                assert_eq!(
+                    verify(&envelope, &key, 3, "", now)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    "catalog requires newer engine"
+                );
+            }
+        }
     }
     #[test]
     fn same_revision_may_renew_expiry_but_never_change_content() {
