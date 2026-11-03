@@ -666,6 +666,7 @@ pub(super) fn query(request: Request, budget: &Budget<'_>) -> Result<Vec<u8>> {
             return Err("access_denied");
         }
     }
+    if matches!(request, Request::DesktopInventory { .. }) { return Err("unsupported_query"); }
     let _lease = abi_guard()?;
     // Initialize Winsock before receiving transferred hvsockets.
     let _winsock = std::net::UdpSocket::bind("127.0.0.1:0").map_err(|_| "unavailable")?;
@@ -688,6 +689,7 @@ pub(super) fn query(request: Request, budget: &Budget<'_>) -> Result<Vec<u8>> {
             }
             com.processes(&distribution_id, budget)
         }
+        Request::DesktopInventory { .. } => Err("unsupported_query"),
     }
 }
 

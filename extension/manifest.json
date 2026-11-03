@@ -47,7 +47,10 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "blocked.html"
+        "blocked.html",
+        "milvago-logo-horizontal-inverse.svg",
+        "milvago-logo-horizontal-mono-black.svg",
+        "Inter-latin.woff2"
       ],
       "matches": [
         "<all_urls>"

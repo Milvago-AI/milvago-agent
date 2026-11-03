@@ -1217,7 +1217,7 @@ fn reviewed_http_fingerprints_work_through_the_bounded_socket_collector() {
             case["responses"].as_array().unwrap().len(),
             "{expected}"
         );
-        for page in milvago_discovery_engine::report::pages(&snapshot, &result, 1, 1).unwrap() {
+        for page in milvago_discovery_engine::report::pages(&snapshot, &result, catalog.revision, 1).unwrap() {
             milvago_discovery_engine::report::validate(&page, &catalog).unwrap();
         }
     }

@@ -143,6 +143,8 @@ struct Authority {
     anchor: Anchor,
     ledger: Ledger,
     last_scan: Option<Instant>,
+    observed_settings_revision: u64,
+    observed_catalog_revision: u64,
 }
 enum Decision {
     Collect {
@@ -172,10 +174,13 @@ impl Authority {
         ledger.binding = binding;
         Ok(Self {
             anchor,
+            observed_settings_revision: ledger.settings_revision,
+            observed_catalog_revision: ledger.catalog_revision,
             ledger,
             last_scan: None,
         })
     }
+    #[cfg(test)]
     fn authorize(
         &mut self,
         peer: &Peer,
@@ -183,6 +188,18 @@ impl Authority {
         acquire: bool,
         now: DateTime<Utc>,
         clock: Instant,
+        persist: impl FnOnce(&Ledger) -> Result<()>,
+    ) -> Result<Decision> {
+        self.authorize_with_revocation(peer, envelope, acquire, now, clock, |_| {}, persist)
+    }
+    fn authorize_with_revocation(
+        &mut self,
+        peer: &Peer,
+        envelope: &Envelope,
+        acquire: bool,
+        now: DateTime<Utc>,
+        clock: Instant,
+        revoke: impl FnOnce(&Policy),
         persist: impl FnOnce(&Ledger) -> Result<()>,
     ) -> Result<Decision> {
         if peer.service_sid != self.anchor.agent_service_sid {
@@ -193,13 +210,20 @@ impl Authority {
             server_url: self.anchor.server_url.clone(),
             public_key: self.anchor.public_key.clone(),
             discovery: Cache {
-                settings_revision: self.ledger.settings_revision,
-                catalog_revision: self.ledger.catalog_revision,
+                settings_revision: self.ledger.settings_revision.max(self.observed_settings_revision),
+                catalog_revision: self.ledger.catalog_revision.max(self.observed_catalog_revision),
                 ..Default::default()
             },
             ..Default::default()
         };
         let policy = crate::discovery::verify(envelope, &state, now)?;
+        // A failed durable quota write cannot allow an older signed grant to
+        // undo a revocation already observed by this process.
+        self.observed_settings_revision = self.observed_settings_revision.max(policy.revision);
+        self.observed_catalog_revision = self.observed_catalog_revision.max(policy.catalog.revision);
+        // Revocation needs verified current authority, but must not depend on a
+        // quota reservation or durable write succeeding. This hook cannot grant.
+        revoke(&policy);
         let reservation = reserve(&self.ledger, self.last_scan, &policy, now, clock, acquire)?;
         // A failed write must never issue a new collection permit.
         persist(&reservation.next)?;
@@ -313,6 +337,38 @@ mod tests {
         let policy = serde_json::json!({"kind":"discovery_policy","version":1,"device_id":anchor.device_id,"revision":7,"issued_at":now,"expires_at":now+chrono::Duration::minutes(10),"configuration":{"host":true,"containers":false,"virtual_machines":true,"guest_read":true,"guest_execute":true,"http":false,"network":false,"interval_seconds":300},"catalog":catalog,"runs":[]});
         (anchor, policy, key, now)
     }
+    #[test]
+    fn failed_persistence_cannot_replay_a_previously_revoked_grant() {
+        let (anchor, policy, key, now) = fixture();
+        let clock = Instant::now();
+        let peer = Peer { service_sid: SID.into() };
+        for catalog_only in [false, true] {
+            let mut authority = Authority::new(anchor.clone(), Ledger::default()).unwrap();
+            authority.authorize_with_revocation(&peer, &sign(&policy, &key), false, now, clock, |_| {}, |_| Ok(())).unwrap();
+            let saved = serde_json::to_value(&authority.ledger).unwrap();
+            let mut revoked = policy.clone();
+            if catalog_only {
+                revoked["catalog"]["revision"] = serde_json::json!(policy["catalog"]["revision"].as_u64().unwrap()+1);
+            } else {
+                revoked["revision"] = serde_json::json!(policy["revision"].as_u64().unwrap()+1);
+            }
+            for field in ["host","containers","virtual_machines","network","guest_read","guest_execute"] {
+                revoked["configuration"][field] = serde_json::json!(false);
+            }
+            let stopped = std::cell::Cell::new(false);
+            assert!(authority.authorize_with_revocation(&peer, &sign(&revoked, &key), false, now, clock, |_| stopped.set(true), |_| {
+                assert!(stopped.get()); Err("synthetic durable failure".into())
+            }).is_err());
+            assert!(stopped.get());
+            assert_eq!(serde_json::to_value(&authority.ledger).unwrap(), saved);
+            assert!(authority.authorize_with_revocation(&peer, &sign(&policy, &key), false, now, clock, |_| panic!("old grant reached revocation callback"),
+                |_| panic!("old grant reached persistence")).is_err());
+            authority.authorize_with_revocation(&peer, &sign(&revoked, &key), false, now, clock, |_| {}, |_| Ok(())).unwrap();
+            assert_eq!(authority.ledger.settings_revision, revoked["revision"].as_u64().unwrap());
+            assert_eq!(authority.ledger.catalog_revision, revoked["catalog"]["revision"].as_u64().unwrap());
+        }
+    }
+
     fn sign(policy: &serde_json::Value, key: &SigningKey) -> Envelope {
         let bytes = serde_json::to_vec(policy).unwrap();
         Envelope {
@@ -385,6 +441,31 @@ mod tests {
             Decision::Wait { .. }
         ));
     }
+    #[test]
+    fn verified_revocation_precedes_failed_persistence_without_advancing_durable_ledger() {
+        let (anchor, mut policy, key, now) = fixture();
+        let mut authority = Authority::new(anchor, Ledger::default()).unwrap();
+        let before = serde_json::to_value(&authority.ledger).unwrap();
+        for field in ["host", "containers", "virtual_machines", "network", "guest_read", "guest_execute"] {
+            policy["configuration"][field] = serde_json::json!(false);
+        }
+        let peer = Peer { service_sid: SID.into() };
+        let revoked = std::cell::Cell::new(false);
+        assert!(authority.authorize_with_revocation(&peer, &sign(&policy, &key), false, now, Instant::now(),
+            |verified| { assert!(!verified.configuration.network); revoked.set(true); },
+            |_| { assert!(revoked.get()); Err("synthetic durable write failure".into()) }).is_err());
+        assert!(revoked.get());
+        assert_eq!(serde_json::to_value(&authority.ledger).unwrap(), before);
+        revoked.set(false);
+        assert!(authority.authorize_with_revocation(&peer, &sign(&policy, &SigningKey::from_bytes(&[72;32])), false, now, Instant::now(),
+            |_| revoked.set(true), |_| panic!("invalid signature reached persistence")).is_err());
+        assert!(!revoked.get());
+        let bad_peer = Peer { service_sid: "S-1-5-20".into() };
+        assert!(authority.authorize_with_revocation(&bad_peer, &sign(&policy, &key), false, now, Instant::now(),
+            |_| revoked.set(true), |_| panic!("invalid peer reached persistence")).is_err());
+        assert!(!revoked.get());
+    }
+
     #[test]
     fn windows_restart_rollback_withdrawal_and_run_quotas_keep_the_same_authority() {
         let (anchor, mut policy, key, now) = fixture();

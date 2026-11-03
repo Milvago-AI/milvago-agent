@@ -94,9 +94,9 @@ impl Directory {
     pub fn write(&self,name:&str,bytes:&[u8])->Result<()>{
         if !matches!(name,"anchor.json"|"state.bin"|"pending.bin"|"custody.json"|"release.json"|"guest-failures.json"){return Err("invalid cache file".into())}
         let path=self.path.join(name);
-        if path.exists(){self.read(name,12*1024*1024)?;}
+        if path.exists(){self.read(name,12 * 1024 * 1024 + crate::browser_broker::MAX_TRANSFER_FORMAT_BYTES as u64)?;}
         crate::atomic_private(&path,bytes)?;
-        if self.read(name,12*1024*1024)?!=bytes{return Err("cache durable readback failed".into())}Ok(())
+        if self.read(name,12 * 1024 * 1024 + crate::browser_broker::MAX_TRANSFER_FORMAT_BYTES as u64)?!=bytes{return Err("cache durable readback failed".into())}Ok(())
     }
     pub(crate) fn legacy_snapshots(&self)->Result<Vec<String>>{
         if !self.private{return Err("cache recovery requires private directory".into())}

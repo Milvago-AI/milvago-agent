@@ -362,7 +362,7 @@ pub fn spawn(home: PathBuf, stop: Arc<AtomicBool>) -> Result<std::thread::JoinHa
                     observer = None;
                     #[cfg(any(windows, target_os = "linux"))]
                     if outcome.is_err()
-                        || policy.as_ref().is_none_or(|p| p.expires_at <= Utc::now())
+                        || policy.as_ref().is_none_or(|p| !p.configuration.network || p.expires_at <= Utc::now())
                     {
                         withdraw_system();
                     }
@@ -614,6 +614,7 @@ pub(crate) fn acquire(
             &mut cache.guest_failures,
             &budget,
             &running_guests,
+            policy.configuration.http.then_some(policy.catalog.http_paths.as_slice()),
         );
         // Persist failed access attempts before cancellation/evaluation can
         // discard this scan; repeated runs must not lock guest accounts.
@@ -1325,7 +1326,7 @@ mod tests {
         state.discovery.settings_revision = 8;
         assert!(verify(&signed, &state, Utc::now()).is_err());
         state.discovery.settings_revision = 0;
-        state.discovery.catalog_revision = 2;
+        state.discovery.catalog_revision = verified.catalog.revision + 1;
         assert!(verify(&signed, &state, Utc::now()).is_err());
         state.discovery.catalog_revision = 0;
         assert!(verify(&signed, &state, Utc::now() + chrono::Duration::minutes(11)).is_err());
@@ -1504,7 +1505,7 @@ mod tests {
             .unwrap()
             .evaluate(&snapshot)
             .unwrap();
-        let pages = delivery_pages(&mut snapshot, &result, 1, 1).unwrap();
+        let pages = delivery_pages(&mut snapshot, &result, catalog.revision, 1).unwrap();
         assert_eq!(pages.len(), 1);
         assert!(pages[0].result.identifications.is_empty());
         assert_eq!(pages[0].coverage[0].status, CoverageStatus::Saturated);

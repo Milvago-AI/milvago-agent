@@ -67,6 +67,8 @@ pub struct Authority {
     anchor: Anchor,
     ledger: Ledger,
     last_scan: Option<Instant>,
+    observed_settings_revision: u64,
+    observed_catalog_revision: u64,
 }
 
 impl Authority {
@@ -115,6 +117,8 @@ impl Authority {
         ledger.binding = binding;
         Ok(Self {
             anchor,
+            observed_settings_revision: ledger.settings_revision,
+            observed_catalog_revision: ledger.catalog_revision,
             ledger,
             last_scan: None,
         })
@@ -173,6 +177,20 @@ impl Authority {
         acquire: bool,
         persist: impl FnOnce(&Ledger) -> Result<()>,
     ) -> Result<Decision> {
+        self.authorize_request_with_revocation(uid, envelope, now, clock, acquire, |_| {}, persist)
+    }
+
+    pub fn authorize_with_revocation(
+        &mut self, peer: &UnixStream, envelope: &Envelope, acquire: bool,
+        revoke: impl FnOnce(&Policy), persist: impl FnOnce(&Ledger) -> Result<()>,
+    ) -> Result<Decision> {
+        self.authorize_request_with_revocation(peer_uid(peer)?, envelope, Utc::now(), Instant::now(), acquire, revoke, persist)
+    }
+
+    fn authorize_request_with_revocation(
+        &mut self, uid: u32, envelope: &Envelope, now: DateTime<Utc>, clock: Instant,
+        acquire: bool, revoke: impl FnOnce(&Policy), persist: impl FnOnce(&Ledger) -> Result<()>,
+    ) -> Result<Decision> {
         if uid != self.anchor.agent_uid {
             return Err("privileged discovery peer rejected".into());
         }
@@ -181,13 +199,18 @@ impl Authority {
             public_key: self.anchor.public_key.clone(),
             server_url: self.anchor.server_url.clone(),
             discovery: Cache {
-                settings_revision: self.ledger.settings_revision,
-                catalog_revision: self.ledger.catalog_revision,
+                settings_revision: self.ledger.settings_revision.max(self.observed_settings_revision),
+                catalog_revision: self.ledger.catalog_revision.max(self.observed_catalog_revision),
                 ..Default::default()
             },
             ..Default::default()
         };
         let policy = crate::discovery::verify(envelope, &state, now)?;
+        // A failed durable quota write cannot allow an older signed grant to
+        // undo a revocation already observed by this process.
+        self.observed_settings_revision = self.observed_settings_revision.max(policy.revision);
+        self.observed_catalog_revision = self.observed_catalog_revision.max(policy.catalog.revision);
+        revoke(&policy);
         let reservation = crate::discovery_reservation::reserve(
             &self.ledger,
             self.last_scan,
@@ -252,6 +275,37 @@ mod tests {
         let policy = serde_json::json!({"kind":"discovery_policy","version":1,"device_id":anchor.device_id,"revision":7,"issued_at":now,"expires_at":now+chrono::Duration::minutes(10),"configuration":{"host":true,"containers":false,"virtual_machines":false,"guest_read":false,"guest_execute":false,"http":false,"network":false,"interval_seconds":300},"catalog":catalog,"runs":[]});
         (anchor, policy, key, now, Instant::now())
     }
+    #[test]
+    fn failed_persistence_cannot_replay_a_previously_revoked_grant() {
+        let (anchor, policy, key, now, clock) = fixture();
+
+        for catalog_only in [false, true] {
+            let mut authority = Authority::new(anchor.clone(), Ledger::default()).unwrap();
+            authority.authorize_request_with_revocation(1000, &sign(&policy, &key), now, clock, false, |_| {}, |_| Ok(())).unwrap();
+            let saved = serde_json::to_value(&authority.ledger).unwrap();
+            let mut revoked = policy.clone();
+            if catalog_only {
+                revoked["catalog"]["revision"] = serde_json::json!(policy["catalog"]["revision"].as_u64().unwrap()+1);
+            } else {
+                revoked["revision"] = serde_json::json!(policy["revision"].as_u64().unwrap()+1);
+            }
+            for field in ["host","containers","virtual_machines","network"] {
+                revoked["configuration"][field] = serde_json::json!(false);
+            }
+            let stopped = std::cell::Cell::new(false);
+            assert!(authority.authorize_request_with_revocation(1000, &sign(&revoked, &key), now, clock, false, |_| stopped.set(true), |_| {
+                assert!(stopped.get()); Err("synthetic durable failure".into())
+            }).is_err());
+            assert!(stopped.get());
+            assert_eq!(serde_json::to_value(&authority.ledger).unwrap(), saved);
+            assert!(authority.authorize_request_with_revocation(1000, &sign(&policy, &key), now, clock, false, |_| panic!("old grant reached revocation callback"),
+                |_| panic!("old grant reached persistence")).is_err());
+            authority.authorize_request_with_revocation(1000, &sign(&revoked, &key), now, clock, false, |_| {}, |_| Ok(())).unwrap();
+            assert_eq!(authority.ledger.settings_revision, revoked["revision"].as_u64().unwrap());
+            assert_eq!(authority.ledger.catalog_revision, revoked["catalog"]["revision"].as_u64().unwrap());
+        }
+    }
+
     fn sign(value: &serde_json::Value, key: &SigningKey) -> Envelope {
         let bytes = serde_json::to_vec(value).unwrap();
         Envelope {

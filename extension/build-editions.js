@@ -20,7 +20,7 @@ const root = join(here, '..');
 const firefoxVersion = (await readFile(join(here, 'firefox-version.txt'), 'utf8')).trim();
 if (!/^\d+\.\d+\.\d+$/.test(firefoxVersion)) {throw new Error('Invalid Firefox release version');}
 const ports = JSON.parse(await readFile(join(root, 'extension-ports.json'), 'utf8'));
-const shared = ['milvago-symbol-256.png', 'managed-schema.json', 'adapters.js', 'detection.js', 'detection-factory.js', 'detection-runtime.js', 'model-access.js', 'background.js', 'broker.js', 'capture.js', 'policy.js', 'popup.html', 'popup.css', 'popup.js', 'blocked.html', 'blocked.js'];
+const shared = ['milvago-symbol-256.png', 'managed-schema.json', 'adapters.js', 'detection.js', 'detection-factory.js', 'detection-runtime.js', 'model-access.js', 'background.js', 'broker.js', 'capture.js', 'policy.js', 'popup.html', 'popup.css', 'popup.js', 'blocked.html', 'blocked.js', 'brand.css', 'appearance.js', 'milvago-logo-horizontal-inverse.svg', 'milvago-logo-horizontal-mono-black.svg', 'Inter-latin.woff2', 'Inter-OFL.txt'];
 
 const factory = JSON.parse(await readFile(join(here, 'detection-factory.json'), 'utf8'));
 await writeFile(join(here, 'detection-factory.js'), factoryModule(factory, null));

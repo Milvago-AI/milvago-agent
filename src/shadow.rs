@@ -41,6 +41,7 @@ fn quarantine_reasons(state: &mut State, entries: &[(Uuid, String)]) {
             false
         } else { true }
     });
+    crate::browser_queue_quota::prune(state);
     let excess = state.rejected_events.len().saturating_sub(100);
     state.rejected_events.drain(..excess);
 }
@@ -86,7 +87,8 @@ pub fn serialized_size<T: Serialize + ?Sized>(value: &T) -> Result<usize> {
     Ok(counter.0)
 }
 pub fn queue_bytes(state: &State) -> Result<usize> {
-    Ok(serialized_size(&state.queue)? + serialized_size(&state.shadow_queue)?)
+    Ok(serialized_size(&state.queue)? + serialized_size(&state.shadow_queue)?
+        + serialized_size(&state.browser_queue_owners)?)
 }
 pub fn fit_event(event: &mut ShadowEvent) -> Result<usize> {
     if event.prompt.as_ref().is_some_and(|s| s.len() > TEXT_LIMIT)
@@ -454,6 +456,7 @@ fn network_pass(home: &std::path::Path, policy: bool, legacy: bool, cooldown: ch
         .collect();
     quarantine_reasons(&mut current, &rejected);
     current.shadow_queue.retain(|e| !removed.contains(&e.id));
+    crate::browser_queue_quota::prune(&mut current);
     // A completion this pass placed leaves the reloaded queue too; one queued while
     // the pass was running stays, because it was never part of the batch.
     let placed = removed_ids(
@@ -611,12 +614,17 @@ pub fn heartbeat(state: &State) -> Result<()> {
     };
     let collector_health: Vec<Value> = state.extension_data["health"].as_object()
         .map(|health| health.values().cloned().collect()).unwrap_or_default();
-    let mut body = json!({"os_user": user, "browsers": browsers, "version": env!("CARGO_PKG_VERSION"), "dlp_engine": 2, "discovery_engine": if crate::discovery::ready() {1} else {0}});
+    let mut body = json!({"os_user": user, "browsers": browsers, "version": env!("CARGO_PKG_VERSION"), "dlp_engine": 3, "discovery_engine": if crate::discovery::ready() {1} else {0}});
     // An empty collector_health still invokes the Enterprise-only server check.
     if !collector_health.is_empty() {
         body["collector_health"] = json!(collector_health);
     }
     let mut response = post(&body)?;
+    if response.status() == reqwest::StatusCode::BAD_REQUEST {
+        // A strict v2 server can still supervise the existing DLP features.
+        body["dlp_engine"] = json!(2);
+        response = post(&body)?;
+    }
     if response.status() == reqwest::StatusCode::BAD_REQUEST {
         // Discovery was added after DLP. An older server can still understand
         // version, DLP and per-tool prevention: do not erase those reports just
@@ -1079,8 +1087,20 @@ impl ShadowCompletion {
 /// is completed there. An identity that matches neither designates nothing and is
 /// dropped — a completion never fabricates an event.
 pub fn complete(state: &mut State, completion: ShadowCompletion) -> Result<bool> {
-    if let Some(event) = state.shadow_queue.iter_mut().find(|e| e.id == completion.id) {
-        completion.apply(event);
+    if let Some(index) = state.shadow_queue.iter().position(|event| event.id == completion.id) {
+        let before = state.shadow_queue[index].clone();
+        completion.apply(&mut state.shadow_queue[index]);
+        let allowed = (|| -> Result<()> {
+            if serialized_size(&state.shadow_queue[index])? > serialized_size(&before)? {
+                crate::browser_queue_quota::check_growth(state, completion.id)?;
+            }
+            Ok(())
+        })();
+        if allowed.is_err() {
+            // A refused enrichment never loses or changes earlier durable custody.
+            state.shadow_queue[index] = before;
+            return Ok(false);
+        }
         return Ok(true);
     }
     // The server completes no decision: a seal whose event already left is not placed,
@@ -1224,6 +1244,7 @@ fn flush_events(state: &mut State) -> Result<usize> {
     let before = state.shadow_queue.len();
     let accepted: HashSet<_> = ack.accepted_ids.into_iter().collect();
     state.shadow_queue.retain(|event| !accepted.contains(&event.id));
+    crate::browser_queue_quota::prune(state);
     Ok(before - state.shadow_queue.len())
 }
 
@@ -1361,9 +1382,9 @@ mod delivery_tests {
         state.browsers.insert("edge".into(), Utc::now());
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = count.clone();
-        let (url, server) = http_many(3, move |body| {
+        let (url, server) = http_many(4, move |body| {
             assert_eq!(body["browsers"][0]["tool"], "edge");
-            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 3 {
                 assert!(body.get("version").is_some());
                 (400, json!({"error":"invalid_request"}))
             } else {
@@ -1374,7 +1395,22 @@ mod delivery_tests {
         state.server_url = url;
         heartbeat(&state).unwrap();
         server.join().unwrap();
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn heartbeat_context_fallback_preserves_the_existing_engine_and_discovery() {
+        let mut state=authorized();state.browsers.insert("chrome".into(),Utc::now());
+        let count=std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));let observed=count.clone();
+        let (url,server)=http_many(2,move |body| {
+            let attempt=observed.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(body["dlp_engine"],if attempt==0 {3} else {2});
+            assert_eq!(body["version"],env!("CARGO_PKG_VERSION"));
+            assert!(body.get("discovery_engine").is_some());
+            assert_eq!(body["browsers"][0]["tool"],"chrome");
+            (if attempt==0 {400} else {200},json!({"ok":attempt!=0}))
+        });state.server_url=url;heartbeat(&state).unwrap();server.join().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst),2);
     }
 
     #[test]
@@ -1384,12 +1420,14 @@ mod delivery_tests {
 
         let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = count.clone();
-        let (url, server) = http_many(2, move |body| {
+        let (url, server) = http_many(3, move |body| {
             assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
-            assert_eq!(body["dlp_engine"], 2);
+
             assert_eq!(body["browsers"][0]["tool"], "edge");
 
-            if observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let attempt=observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(body["dlp_engine"], if attempt==0 {3} else {2});
+            if attempt < 2 {
                 assert!(body.get("discovery_engine").is_some());
                 (400, json!({"error":"invalid_request"}))
             } else {
@@ -1400,7 +1438,7 @@ mod delivery_tests {
         state.server_url = url;
         heartbeat(&state).unwrap();
         server.join().unwrap();
-        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 
     #[test]

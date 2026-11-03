@@ -68,8 +68,40 @@ pub fn entry_tokens(executable: &str, args: &[String]) -> Vec<String> {
     tokens
 }
 
+pub fn command_entry_tokens(executable: &str, command: &[u8]) -> Vec<String> {
+    if command.len() > 8192 { return vec![]; }
+    let mut parts = command.split(|byte| *byte == 0);
+    let title = parts.next().unwrap_or_default();
+    // Node's process.title replaces argv, while /proc/exe still identifies Node.
+    // Retain only this closed product token, never arbitrary process-title text.
+    if matches!(executable_name(executable).as_str(), "node" | "nodejs")
+        && matches!(title, b"openclaw" | b"openclaw-gateway")
+    {
+        return if parts.all(|part| part.is_empty()) { vec!["openclaw".into()] } else { vec![] };
+    }
+    let args: Vec<_> = parts.take(3).map(|value| String::from_utf8_lossy(value).to_string()).collect();
+    entry_tokens(executable, &args)
+}
+
 #[cfg(test)]
 mod interpreter_tests {
+    #[test]
+    fn node_gateway_titles_are_exact_and_do_not_export_other_arguments() {
+        use super::command_entry_tokens;
+        for executable in ["node", "nodejs", "/usr/bin/node"] {
+            for command in [b"openclaw-gateway\0\0\0".as_slice(), b"openclaw\0"] {
+                assert_eq!(command_entry_tokens(executable, command), ["openclaw"]);
+            }
+        }
+        for command in [b"openclaw-gateway-other\0".as_slice(), b"openclaw-gateway PRIVATE\0",
+            b"openclaw-gateway\0PRIVATE\0", b"data:image/png\0", b"OpenClaw-Gateway\0"] {
+            assert!(command_entry_tokens("node", command).is_empty());
+        }
+        assert!(command_entry_tokens("python3", b"openclaw-gateway\0").is_empty());
+        assert!(command_entry_tokens("node", &vec![0;8193]).is_empty());
+        assert_eq!(command_entry_tokens("node", b"node\0/opt/node_modules/openclaw/openclaw.mjs\0PRIVATE\0"),
+            ["openclaw", "openclaw.mjs"]);
+    }
     #[test]
     fn versioned_python_entries_are_recognized_without_accepting_prefix_impostors() {
         for executable in [
@@ -361,13 +393,7 @@ mod linux {
             let entity = identity("process", &[&boot, &pid.to_string(), &start]);
             let mut fields = BTreeMap::from([(Field::Executable, vec![executable.clone()])]);
             if let Ok(command) = read_limited(&path.join("cmdline"), 8192) {
-                let args: Vec<_> = command
-                    .split(|b| *b == 0)
-                    .skip(1)
-                    .take(3)
-                    .map(|v| String::from_utf8_lossy(v).to_string())
-                    .collect();
-                let tokens = entry_tokens(&executable, &args);
+                let tokens = command_entry_tokens(&executable, &command);
                 if !tokens.is_empty() {
                     fields.insert(Field::ArgumentToken, tokens);
                 }

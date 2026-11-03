@@ -162,7 +162,7 @@ pub fn exchange(channel: &str, access: Access, request: &Value) -> Result<Value>
 pub fn exchange_timeout(channel: &str, access: Access, request: &Value, timeout: std::time::Duration) -> Result<Value> {
     let deadline = std::time::Instant::now() + timeout;
     #[cfg(windows)]
-    let mut conn = windows::connect(channel, access)?;
+    let mut conn = windows::connect_until(channel, access, deadline)?;
     #[cfg(unix)]
     let mut conn = unix::connect(channel, access)?;
     conn.deadline = conn.deadline.min(deadline);
@@ -294,7 +294,7 @@ mod windows {
     const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const GENERIC_READ: u32 = 0x8000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CLIENT_ACCESS: u32 = 0x0012019b;
     const OPEN_EXISTING: u32 = 3;
     const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
@@ -306,6 +306,10 @@ mod windows {
     const ERROR_PIPE_LISTENING: u32 = 536;
     const NMPWAIT_TIMEOUT_MS: u32 = 2000;
     const BUFFER: u32 = 64 * 1024;
+    // Keep each nonblocking write below the kernel quota. Windows can report
+    // success with zero bytes for an oversized write, leaving both polling peers
+    // waiting forever. The frame limit and absolute connection deadline still apply.
+    const PIPE_WRITE_CHUNK: usize = 16 * 1024;
 
     #[repr(C)]
     struct SecurityAttributes {
@@ -724,7 +728,7 @@ mod windows {
                 WriteFile(
                     self.0,
                     buf.as_ptr(),
-                    buf.len() as u32,
+                    buf.len().min(PIPE_WRITE_CHUNK) as u32,
                     &mut written,
                     std::ptr::null_mut(),
                 )
@@ -788,7 +792,7 @@ mod windows {
                 WriteFile(
                     self.0,
                     buf.as_ptr(),
-                    buf.len() as u32,
+                    buf.len().min(PIPE_WRITE_CHUNK) as u32,
                     &mut written,
                     std::ptr::null_mut(),
                 )
@@ -1068,6 +1072,21 @@ mod windows {
     mod pipe_tests {
         use super::*;
         #[test]
+        fn an_expired_connect_budget_is_refused_before_opening_a_pipe() {
+            let result = connect_until("synthetic-expired-budget", Access::Browser, std::time::Instant::now());
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("connection deadline"));
+        }
+        #[test]
+        fn agent_connection_wait_consumes_the_exchange_budget() {
+            let channel = format!("synthetic-deadline-{}", uuid::Uuid::new_v4());
+            let start = std::time::Instant::now();
+            let error = exchange_agent(&channel, "community", &json!({"op":"policy_v3"}), std::time::Duration::from_millis(50)).unwrap_err();
+            assert!(error.to_string().contains("connection deadline"));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        }
+
+        #[test]
         fn privileged_pipe_descriptors_explicitly_own_system() {
             unsafe extern "system" {
                 fn GetSecurityDescriptorOwner(descriptor: *mut c_void, owner: *mut *mut c_void, defaulted: *mut i32) -> i32;
@@ -1144,6 +1163,33 @@ mod windows {
             assert_eq!(join(&hardened), 5, "a client principal joined the served pipe");
         }
 
+        #[test]
+        fn a_client_with_no_instance_creation_right_can_still_read_and_write() {
+            let connect=|access| {
+                let name=wide(&pipe_name(&format!("test-{}",uuid::Uuid::new_v4())));
+                let text=wide(&format!("D:P(A;;FA;;;SY)(A;;{CLIENT};;;AU)"));
+                let mut raw=std::ptr::null_mut();
+                assert_ne!(unsafe {ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(),SDDL_REVISION_1,&mut raw,std::ptr::null_mut())},0);
+                let descriptor=Descriptor(raw);
+                let sa=SecurityAttributes{n_length:std::mem::size_of::<SecurityAttributes>() as u32,security_descriptor:descriptor.0,inherit_handle:0};
+                let server=unsafe{CreateNamedPipeW(name.as_ptr(),PIPE_ACCESS_DUPLEX|FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_NOWAIT|PIPE_REJECT_REMOTE_CLIENTS,1,BUFFER,BUFFER,0,&sa)};
+                assert_ne!(server,INVALID_HANDLE_VALUE);
+                unsafe {ConnectNamedPipe(server,std::ptr::null_mut());}
+                let client=unsafe {CreateFileW(name.as_ptr(),access,0,std::ptr::null(),OPEN_EXISTING,SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,0)};
+                let error=if client==INVALID_HANDLE_VALUE {unsafe {GetLastError()}} else {
+                    assert_ne!(unsafe {SetNamedPipeHandleState(client,&PIPE_NOWAIT,std::ptr::null(),std::ptr::null())},0);
+                    let mut client=ClientStream(client);let mut serving=PipeStream(server);
+                    client.write_all(b"synthetic").unwrap();let mut bytes=[0;9];serving.read_exact(&mut bytes).unwrap();assert_eq!(&bytes,b"synthetic");
+                    serving.write_all(b"confirmed").unwrap();client.read_exact(&mut bytes).unwrap();assert_eq!(&bytes,b"confirmed");
+                    return 0;
+                };
+                unsafe {CloseHandle(server);}error
+            };
+            assert_eq!(u32::from_str_radix(CLIENT.trim_start_matches("0x"),16).unwrap(),CLIENT_ACCESS);
+            assert_eq!(connect(CLIENT_ACCESS),0,"the client cannot connect with its granted rights");
+        }
+
         // The squatting defence rests on the kernel refusing the protected namespace to a
         // standard account, which can still create the plain name. An elevated test run
         // belongs to Administrators and proves nothing: it says so and stops.
@@ -1176,7 +1222,7 @@ mod windows {
             let name = wide(&pipe_name(channel));
             let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let handle = loop {
-                let handle = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE,
+                let handle = unsafe { CreateFileW(name.as_ptr(), CLIENT_ACCESS,
                     0, std::ptr::null(), OPEN_EXISTING, SECURITY_SQOS_PRESENT | level, 0) };
                 if handle != INVALID_HANDLE_VALUE { break handle; }
                 let error = unsafe { GetLastError() };
@@ -1190,6 +1236,36 @@ mod windows {
             assert_ne!(unsafe { SetNamedPipeHandleState(handle, &PIPE_NOWAIT, std::ptr::null(), std::ptr::null()) }, 0);
             DeadlineStream::new(ClientStream(handle), Access::Browser,
                 Arc::new(AtomicBool::new(false)))
+        }
+
+        #[test]
+        fn nonblocking_byte_frames_larger_than_pipe_buffer_complete_both_directions() {
+            let channel = format!("test-{}", uuid::Uuid::new_v4());
+            let served = channel.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().to_owned();
+            let (completed, done) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                completed.send(serve(&path, &served, Access::Browser, stopping,
+                    Arc::new(|_, request| Ok(json!({"ok":true,"data":request["data"]}))))).unwrap();
+            });
+            let mut client = raw_client(&channel, &done);
+            let result = (|| -> Result<()> {
+                for size in [0, 16383, 16384, 16385, 65535, 65536, 65537, 96000, 131000] {
+                    let expected = "s".repeat(size);
+                    write_frame(&mut client, &json!({"data":expected}))?;
+                    let answer = frame(&mut client)?.ok_or("missing frame")?;
+                    assert_eq!(answer["data"], expected, "frame size {size}");
+                }
+                Ok(())
+            })();
+            drop(client);
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            done.recv().unwrap().unwrap();
+            result.unwrap();
         }
 
         #[test]
@@ -1343,20 +1419,25 @@ mod windows {
     }
 
     pub fn exchange_agent(channel: &str, edition: &str, request: &Value, timeout: std::time::Duration) -> Result<Value> {
-        let mut stream = connect(channel, Access::Browser)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stream = connect_until(channel, Access::Browser, deadline)?;
         let mut pid = 0;
         if unsafe { GetNamedPipeServerProcessId(stream.inner.0, &mut pid) } == 0 { return Err("agent process unavailable".into()); }
         crate::cache_peer::agent(pid, edition)?;
-        stream.deadline = std::time::Instant::now() + timeout;
+        stream.deadline = stream.deadline.min(deadline);
         write_frame(&mut stream, request)?;
         (crate::frame_limit(&mut stream,if request["op"]=="broker_cache_source"{2*1024*1024}else{1024*1024})?).ok_or_else(|| "agent response absent".into())
     }
     pub fn connect(channel: &str, access: Access) -> Result<DeadlineStream<ClientStream>> {
+        connect_until(channel, access, std::time::Instant::now() + std::time::Duration::from_secs(3))
+    }
+    pub(super) fn connect_until(channel: &str, access: Access, deadline: std::time::Instant) -> Result<DeadlineStream<ClientStream>> {
+        let deadline = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(3));
         let names = pipe_names(channel, access).map(|name| wide(&name));
         let open = |name: &[u16]| unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                CLIENT_ACCESS,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -1369,8 +1450,10 @@ mod windows {
         // Every instance taken by another client (a local process may connect and close in
         // a loop) or the name between two instances is not an absent agent: retried until
         // a bounded deadline, waiting for a free instance, before reporting unavailable.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let handle = loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("agent pipe connection deadline exceeded".into());
+            }
             let mut name = &names[0];
             let mut handle = open(name);
             let mut err = if handle == INVALID_HANDLE_VALUE { unsafe { GetLastError() } } else { 0 };
@@ -1388,9 +1471,9 @@ mod windows {
             // ERROR_FILE_NOT_FOUND: no instance at this instant; ERROR_PIPE_BUSY: all taken.
             if left.is_zero() || !(err == ERROR_PIPE_BUSY || err == 2) {
                 if err == ERROR_PIPE_BUSY {
-                    return Err("CreateFileW agent pipe busy: win32=231, access=0xc0000000".into());
+                    return Err("CreateFileW agent pipe busy: win32=231, access=0x0012019b".into());
                 }
-                return Err(format!("CreateFileW agent pipe failed: win32={err}, access=0xc0000000").into());
+                return Err(format!("CreateFileW agent pipe failed: win32={err}, access=0x0012019b").into());
             }
             if err == ERROR_PIPE_BUSY {
                 unsafe { WaitNamedPipeW(name.as_ptr(), (left.as_millis() as u32).clamp(1, NMPWAIT_TIMEOUT_MS)) };
@@ -1540,10 +1623,14 @@ mod unix {
                     let original_handler = handler.clone();
                     let rate_callers = callers.clone();
                     let rate_caller = caller.clone();
-                    let handler: Arc<Handler> = Arc::new(move |home, request| {
+                    let handler: Arc<Handler> = Arc::new(move |home, mut request| {
                         if !rate_callers.allow(&rate_caller) {
                             return Err("IPC request rate exceeded".into());
                         }
+                        // Numeric SO_PEERCRED identity, independent from display names.
+                        let caller = request.get_mut("caller").and_then(Value::as_object_mut)
+                            .ok_or("IPC caller absent")?;
+                        if let Some(uid) = uid { caller.insert("uid".into(), json!(uid)); }
                         original_handler(home, request)
                     });
                     let active_clone = active.clone();

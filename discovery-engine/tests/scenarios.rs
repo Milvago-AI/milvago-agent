@@ -2,6 +2,31 @@ use milvago_discovery_engine::*;
 use std::collections::BTreeMap;
 
 #[test]
+fn native_openclaw_gateway_titles_are_process_evidence_only_and_exact() {
+    let catalog: Catalog = serde_json::from_slice(include_bytes!("../catalog/factory.json")).unwrap();
+    assert!(catalog.revision >= 2);
+    let engine = Engine::compile(&catalog).unwrap();
+    for source in [Source::HostProcess, Source::GuestProcess, Source::ContainerProcess] {
+        for executable in ["openclaw-gateway", "openclaw-gateway.exe"] {
+            let input = snapshot(source, EntityKind::Process, &[(Field::Executable, &[executable])]);
+            let result = engine.evaluate(&input).unwrap();
+            assert!(result.identifications.iter().any(|row| row.application_id == "openclaw"
+                && row.signature_id == "openclaw.gateway" && row.state == State::Executed));
+            assert!(result.communications.is_empty());
+            assert!(result.queries.is_empty());
+        }
+        for executable in ["node", "openclaw-gateway-other", "openclaw-gatewa", "data:image/png", "OpenClaw-Gateway"] {
+            let input = snapshot(source, EntityKind::Process, &[(Field::Executable, &[executable])]);
+            assert!(!engine.evaluate(&input).unwrap().identifications.iter()
+                .any(|row| row.signature_id == "openclaw.gateway"));
+        }
+    }
+    let input = snapshot(Source::ContainerMetadata, EntityKind::Container,
+        &[(Field::ImageRepository, &["openclaw-gateway"])]);
+    assert!(engine.evaluate(&input).unwrap().identifications.iter().all(|row| row.state != State::Executed));
+}
+
+#[test]
 fn reviewed_julius_fingerprints_require_their_own_responses_and_reject_error_pages() {
     let catalog: Catalog =
         serde_json::from_slice(include_bytes!("../catalog/factory.json")).unwrap();
@@ -56,7 +81,7 @@ fn reviewed_julius_fingerprints_require_their_own_responses_and_reject_error_pag
         let found = matched(&input);
         assert_eq!(found.len(), 1, "positive {expected}");
         assert_eq!(found[0].evidence.len(), input.facts.len(), "{expected}");
-        for page in report::pages(&input, &engine.evaluate(&input).unwrap(), 1, 1).unwrap() {
+        for page in report::pages(&input, &engine.evaluate(&input).unwrap(), catalog.revision, 1).unwrap() {
             report::validate(&page, &catalog).unwrap();
         }
         for index in 0..input.facts.len() {
@@ -134,7 +159,7 @@ fn correlated_http_requires_each_response_on_one_endpoint_and_recent_atomic_fact
     let result = engine.evaluate(&input).unwrap();
     assert_eq!(result.identifications.len(), 1);
     assert_eq!(result.identifications[0].evidence.len(), 2);
-    let pages = report::pages(&input, &result, 1, 1).unwrap();
+    let pages = report::pages(&input, &result, catalog.revision, 1).unwrap();
     report::validate(&pages[0], &catalog).unwrap();
     assert!(!serde_json::to_string(&pages).unwrap().contains("alpha"));
     for mutation in 0..5 {
@@ -267,7 +292,7 @@ fn dns_query_is_neither_a_connection_nor_an_application_nor_a_guest_origin() {
     assert_eq!(result.queries[0].provider, "openai");
     assert!(result.communications.is_empty());
     assert!(result.identifications.is_empty());
-    let mut report = report::pages(&input, &result, 1, 1).unwrap().remove(0);
+    let mut report = report::pages(&input, &result, catalog.revision, 1).unwrap().remove(0);
     report::validate(&report, &catalog).unwrap();
     assert!(
         !serde_json::to_string(&report)
@@ -346,7 +371,7 @@ fn dns_query_pages_preserve_separate_contact_and_reject_forged_proofs() {
     let result = engine.evaluate(&input).unwrap();
     assert_eq!(result.communications.len(), 1);
     assert_eq!(result.queries.len(), 251);
-    let pages = report::pages(&input, &result, 1, 1).unwrap();
+    let pages = report::pages(&input, &result, catalog.revision, 1).unwrap();
     assert_eq!(pages.len(), 3);
     assert_eq!(
         pages.iter().map(|p| p.result.queries.len()).sum::<usize>(),
@@ -658,7 +683,7 @@ fn custom_provider_catalogue_uses_exact_hosts_without_identifying_a_guest_applic
     assert!(result.identifications.is_empty());
     assert_eq!(result.communications.len(), 1);
     assert_eq!(result.communications[0].provider, "internal_ai");
-    for page in report::pages(&input, &result, 1, 1).unwrap() {
+    for page in report::pages(&input, &result, catalog.revision, 1).unwrap() {
         report::validate(&page, &catalog).unwrap();
         let other = process_catalog(Source::GuestProcess);
         assert!(report::validate(&page, &other).is_err());
@@ -1307,7 +1332,7 @@ fn report_pages_minimize_process_inventory_and_keep_verified_ancestors() {
         });
     }
     let result = engine.evaluate(&input).unwrap();
-    let pages = report::pages(&input, &result, 1, 5).unwrap();
+    let pages = report::pages(&input, &result, catalog.revision, 5).unwrap();
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0].entities.len(), 2);
     assert_eq!(pages[0].relations.len(), 1);
@@ -1364,7 +1389,7 @@ fn multi_page_environment_inventory_is_independently_valid() {
         });
     }
     let result = Engine::compile(&catalog).unwrap().evaluate(&input).unwrap();
-    let pages = report::pages(&input, &result, 1, 5).unwrap();
+    let pages = report::pages(&input, &result, catalog.revision, 5).unwrap();
     assert!(pages.len() > 1);
     assert_eq!(pages.iter().map(|p| p.coverage.len()).sum::<usize>(), 40);
     for (number, page) in pages.iter().enumerate() {
@@ -1418,7 +1443,7 @@ fn a_hundred_observations_fit_one_request_and_large_proofs_split_by_wire_size() 
             }
         }
         let result = Engine::compile(&catalog).unwrap().evaluate(&input).unwrap();
-        let reports = report::pages(&input, &result, 1, 1).unwrap();
+        let reports = report::pages(&input, &result, catalog.revision, 1).unwrap();
         if long {
             assert!(reports.len() > 1);
         } else {
@@ -1474,7 +1499,7 @@ fn display_metadata_keeps_real_addresses_and_rejects_wrong_types_and_unbounded_l
         image: None,
     });
     let result = Engine::compile(&catalog).unwrap().evaluate(&input).unwrap();
-    let pages = report::pages(&input, &result, 1, 1).unwrap();
+    let pages = report::pages(&input, &result, catalog.revision, 1).unwrap();
     report::validate(&pages[0], &catalog).unwrap();
     assert_eq!(
         pages[0].entities[0]

@@ -24,6 +24,14 @@ struct Authorization {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     hosts: Arc<BTreeSet<String>>,
 }
+#[cfg(any(windows, target_os = "linux", test))]
+impl Authorization {
+    fn permits_existing(&self, catalog: &Catalog, epoch: u64, expires: i64, wall: i64, clock: Instant) -> bool {
+        let hosts: BTreeSet<_> = catalog.providers.iter().flat_map(|p|p.hosts.iter().cloned()).collect();
+        self.epoch == epoch && self.catalog_revision == catalog.revision && *self.hosts == hosts
+            && expires >= self.expires && self.expires > wall && self.deadline > clock
+    }
+}
 #[cfg(any(windows, test))]
 #[path = "discovery_network_windows.rs"]
 mod windows;
@@ -104,6 +112,11 @@ impl Observer {
             stop,
             thread: Some(thread),
         })
+    }
+    #[cfg(any(windows, target_os = "linux"))]
+    pub fn can_keep(&self, catalog: &Catalog, epoch: u64, expires: i64) -> bool {
+        self.thread.as_ref().is_some_and(|thread|!thread.is_finished())
+            && self.state.lock().is_ok_and(|state|state.authorization.permits_existing(catalog,epoch,expires,now(),Instant::now()))
     }
     pub fn authorize(&self, catalog: &Catalog, epoch: u64, expires: i64) -> bool {
         if self
@@ -1065,6 +1078,27 @@ mod tests {
             "TAP mapping/capture retained file descriptors"
         );
     }
+    #[test]
+    fn pending_refresh_can_only_preserve_unchanged_unexpired_authority() {
+        let catalog: Catalog = serde_json::from_slice(include_bytes!("../discovery-engine/catalog/factory.json")).unwrap();
+        let wall = now();
+        let clock = Instant::now();
+        let authorization = Authorization {
+            epoch: 7, catalog_revision: catalog.revision, expires: wall+60, deadline: clock+Duration::from_secs(60),
+            hosts: Arc::new(catalog.providers.iter().flat_map(|p|p.hosts.iter().cloned()).collect()),
+        };
+        assert!(authorization.permits_existing(&catalog,7,wall+120,wall,clock));
+        assert_eq!(authorization.expires,wall+60,"checking a pending refresh must never extend authority");
+        assert!(!authorization.permits_existing(&catalog,8,wall+120,wall,clock));
+        assert!(!authorization.permits_existing(&catalog,7,wall+59,wall,clock));
+        assert!(!authorization.permits_existing(&catalog,7,wall+120,wall+61,clock));
+        assert!(!authorization.permits_existing(&catalog,7,wall+120,wall,clock+Duration::from_secs(61)));
+        let mut changed = catalog.clone(); changed.providers.clear();
+        assert!(!authorization.permits_existing(&changed,7,wall+120,wall,clock));
+        changed = catalog.clone(); changed.revision += 1;
+        assert!(!authorization.permits_existing(&changed,7,wall+120,wall,clock));
+    }
+
     #[test]
     fn authorization_expires_and_epoch_changes_cannot_reuse_queued_metadata() {
         let catalog: Catalog =

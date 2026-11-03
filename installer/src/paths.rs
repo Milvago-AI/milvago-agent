@@ -162,7 +162,7 @@ fn aces_of(dacl: *mut c_void) -> Result<Vec<Ace>> {
             return fail("Installer path permissions unavailable");
         }
         let (kind, flags) = unsafe { (*ace.cast::<u8>(), *ace.cast::<u8>().add(1)) };
-        // Only the basic allow/deny ACEs exist on files; anything else is refused.
+        // Refuse ACE types whose access semantics and SID layout are unsupported.
         if kind > 1 {
             return fail("Installer path permissions unavailable");
         }
@@ -657,6 +657,20 @@ pub fn read_plain(source: &Path, limit: usize, too_large: &'static str) -> Resul
     Ok(bytes)
 }
 
+
+fn trusted_source_dacl(dacl: *mut c_void) -> Result<()> {
+    if dacl.is_null() {
+        return fail("Caller-supplied file permissions unavailable");
+    }
+    for ace in aces_of(dacl)? {
+        if ace.allow && !ace.inherit_only && ace.mask & WRITE_RIGHTS != 0
+            && ![SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER].contains(&ace.sid.as_str()) {
+            return fail("Caller-supplied file is writable by an untrusted principal");
+        }
+    }
+    Ok(())
+}
+
 /// Read a caller-named file (a deployment tool's staging folder: SCCM cache, Intune
 /// content, `C:\Deploy`) whose *ancestors* are not ours to judge. What is judged is the
 /// opened object itself, through the handle that is read, with writers denied for its
@@ -694,20 +708,7 @@ pub fn read_trusted_source(source: &Path, limit: usize) -> Result<Vec<u8>> {
         if dacl.is_null() || ![SYSTEM, ADMINISTRATORS].contains(&owner.as_str()) {
             return fail("Caller-supplied file has an untrusted owner");
         }
-        let count = unsafe { *dacl.cast::<u8>().add(4).cast::<u16>() };
-        for index in 0..u32::from(count) {
-            let mut ace = std::ptr::null_mut();
-            if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
-                return fail("Caller-supplied file permissions unavailable");
-            }
-            let (kind, flags) = unsafe { (*ace.cast::<u8>(), *ace.cast::<u8>().add(1)) };
-            let mask = unsafe { *ace.cast::<u8>().add(4).cast::<u32>() };
-            let sid = sid_text(unsafe { ace.cast::<u8>().add(8).cast() }).unwrap_or_default();
-            if kind == 0 && flags & 0x08 == 0 && mask & WRITE_RIGHTS != 0 && ![SYSTEM, ADMINISTRATORS, TRUSTED_INSTALLER].contains(&sid.as_str()) {
-                return fail("Caller-supplied file is writable by an untrusted principal");
-            }
-        }
-        Ok(())
+        trusted_source_dacl(dacl)
     })();
     unsafe { LocalFree(descriptor) };
     verdict?;
@@ -1304,6 +1305,23 @@ mod tests {
         let linked = assert_path(&dir, &[me.as_str(), SYSTEM, ADMINISTRATORS], true).unwrap_err();
         assert_eq!(linked.step, "Hard-linked installer child refused");
         assert!(linked.detail.ends_with("alias.bin") || linked.detail.ends_with("state.bin"), "{}", linked.detail);
+    }
+
+    #[test]
+    fn trusted_source_acl_rejects_unsupported_conditional_grants() {
+        for (sddl, allowed) in [
+            ("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;BU)", true),
+            ("D:P(A;;FA;;;SY)(A;;FW;;;BU)", false),
+            ("D:P(A;;FA;;;SY)(XA;;FW;;;BU;(Member_of {SID(S-1-5-32-545)}))", false),
+        ] {
+            let descriptor = descriptor(sddl).expect("Windows must parse the ACL fixture");
+            let (mut present, mut dacl, mut defaulted) = (0i32, std::ptr::null_mut(), 0i32);
+            assert_ne!(unsafe { GetSecurityDescriptorDacl(descriptor.0, &mut present, &mut dacl, &mut defaulted) }, 0);
+            assert_ne!(present, 0);
+            assert!(!dacl.is_null());
+            assert_eq!(trusted_source_dacl(dacl).is_ok(), allowed, "{sddl}");
+        }
+        assert!(trusted_source_dacl(std::ptr::null_mut()).is_err());
     }
 
     #[test]

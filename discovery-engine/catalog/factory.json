@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "revision": 1,
+  "revision": 2,
   "signatures": [
     {
       "id": "openclaw.process",
@@ -22,6 +22,27 @@
         ]
       },
       "provenance": "Milvago discovery catalog v1"
+    },
+    {
+      "id": "openclaw.gateway",
+      "application_id": "openclaw",
+      "name": "OpenClaw",
+      "revision": 1,
+      "sources": [
+        "host_process",
+        "guest_process",
+        "container_process"
+      ],
+      "state": "executed",
+      "condition": {
+        "op": "in",
+        "field": "executable",
+        "values": [
+          "openclaw-gateway",
+          "openclaw-gateway.exe"
+        ]
+      },
+      "provenance": "Milvago native qualification OpenClaw2026.10.9; exact runtime process title"
     },
     {
       "id": "openclaw.installation",

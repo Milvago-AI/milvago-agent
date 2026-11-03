@@ -69,10 +69,10 @@ test('a file approval never opens the window of an unreadable send',()=>{
 });
 
 // The worker.
-function worker({policy=masking,session={},responses={}}={}){
+function worker({policy=masking,session={},responses={},bridge:existingBridge}={}){
  let message,current=policy;const handlers={},listeners={},stored={},noop={addListener(){}};
  const on=name=>({addListener(fn){listeners[name]=fn;}});
- const bridge=managedBridge({browser_policy:()=>({online:true,policy:current}),browser_inspect:req=>({ok:true,action:'observe',text:req.text,labels:[]}),browser_submit:req=>({ok:true,action:'observe',text:req.text,recording_required:false}),browser_catalog:()=>({catalog:null,revision:0,catalog_state:'missing'}),browser_health:req=>({accepted_health_ids:[req.batch.id]}),...responses});
+ const bridge=existingBridge||managedBridge({browser_policy:()=>({online:true,policy:current}),browser_inspect:req=>({ok:true,action:'observe',text:req.text,labels:[]}),browser_submit:req=>({ok:true,action:'observe',text:req.text,recording_required:false}),browser_catalog:()=>({catalog:null,revision:0,catalog_state:'missing'}),browser_health:req=>({accepted_health_ids:[req.batch.id]}),...responses});
  globalThis.chrome={runtime:{onInstalled:noop,onStartup:noop,onMessage:{addListener(fn){message=fn;}},sendNativeMessage:bridge.sendNativeMessage},
   storage:{managed:{async get(){return {milvago_pin:JSON.stringify(bridge.pin)};}},local:{async get(k){return {[k]:stored[k]};},async set(v){Object.assign(stored,v);}},
    ...(session?{session:{async get(k){return {[k]:structuredClone(session[k])};},async set(v){Object.assign(session,structuredClone(v));}}}:{})},
@@ -85,7 +85,7 @@ function worker({policy=masking,session={},responses={}}={}){
  const metadata=(over={},request={})=>({requestId:'w'+serial++,tabId:1,frameId:0,documentId:'document-1',method:'POST',type:'xmlhttprequest',url:'https://chatgpt.com/backend-api/files',initiator:'https://chatgpt.com',requestBody:json(meta(over)),...request});
  return {
   async start(){await import('./background.js?approval-guard='+serial++);assert.deepEqual(await send({type:'refresh'},{}),{ok:true});},
-  send,sender,metadata,listeners,session,
+  send,sender,metadata,listeners,session,bridge,
   setPolicy(next){current=next;},
   allowed:details=>!handlers.onBeforeRequest(details).cancel,
   async paste(text,from){const reply=await send({type:'paste',text},from);assert.equal(reply.ok,true);return reply;},
@@ -187,7 +187,7 @@ test('approvals survive a worker restart, stored as fingerprints without their t
  const dump=JSON.stringify(session);
  assert.ok(dump.length>2&&!dump.includes('Synthetic')&&!dump.includes('Second line')&&!dump.includes('report'),'no text nor file name is stored');
  assert.ok(dump.length<4096,'entries stay small');
- const second=worker({session});
+ const second=worker({session,bridge:first.bridge});
  try{await second.start();
   assert.equal(second.allowed(second.metadata()),true,'the paste approved before the restart');
   assert.equal(second.allowed(second.metadata({file_name:'report.csv',file_size:1234,mime_type:'text/csv'})),true,'the file approved before the restart');
@@ -197,6 +197,40 @@ test('approvals survive a worker restart, stored as fingerprints without their t
   assert.equal(hostile.allowed(hostile.metadata({file_size:1})),false,'malformed stored entries are dropped');
  }finally{hostile.close();}
 });
+test('restored approvals cannot cross installation or full policy identity',async()=>{
+ for(const change of ['installation','configuration','version']){
+  const session={},first=worker({session});
+  try{await first.start();
+   const reply=await first.paste(PASTED);
+   assert.deepEqual(await first.send({type:'paste-confirm',token:reply.token}),{ok:true});
+   await first.send(uploadSubmit([{name:sha('report.csv'),size:1234}]));
+  }finally{first.close();}
+  await new Promise(resolve=>setTimeout(resolve,10));
+  assert.ok(session.approvals?.length,'the test must start with real saved approvals');
+  if(change==='configuration')first.setPolicy(policyFor({...masking.config,protection:{block_uploads:true}}));
+  if(change==='version')first.setPolicy({...masking,version:2});
+  const next=worker({session,...(change==='installation'?{}:{bridge:first.bridge})});
+  try{await next.start();
+   assert.equal(next.allowed(next.metadata()),false,change+' must invalidate paste custody');
+   assert.equal(next.allowed(next.metadata({file_name:'report.csv',file_size:1234,mime_type:'text/csv'})),false,change+' must invalidate file custody');
+  }finally{next.close();}
+ }
+});
+
+test('legacy saved approvals without an authority binding are discarded',async()=>{
+ const session={},first=worker({session});
+ try{await first.start();
+  const reply=await first.paste(PASTED);
+  assert.deepEqual(await first.send({type:'paste-confirm',token:reply.token}),{ok:true});
+ }finally{first.close();}
+ await new Promise(resolve=>setTimeout(resolve,10));
+ assert.ok(session.approvals?.length);
+ for(const entry of session.approvals)delete entry.binding;
+ const next=worker({session,bridge:first.bridge});
+ try{await next.start();assert.equal(next.allowed(next.metadata()),false);}
+ finally{next.close();}
+});
+
 test('without session storage the worker keeps its approvals in memory',async()=>{
  const state=worker({session:null});
  try{await state.start();

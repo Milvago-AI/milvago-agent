@@ -48,6 +48,7 @@ pub enum DetectorKind {
     Keyword { value: String, tier: String, exceptions: Vec<String> },
     Dictionary { values: Vec<String>, exceptions: Vec<String> },
     KeywordTier { dictionary: String, tier: String },
+    DictionaryContext { dictionary: String, minimum: usize },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

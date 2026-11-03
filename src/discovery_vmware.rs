@@ -49,6 +49,8 @@ struct Process {
 // business arguments. Ambiguous/missing entries keep coverage partial.
 #[cfg(any(windows, test))]
 fn entry(executable: &str, command: &str) -> Option<Vec<String>> {
+    let normalized = collector::host::executable_name(executable);
+    let executable = normalized.as_str();
     let interpreter = collector::host::is_interpreter(executable);
     if !interpreter {
         return Some(vec![]);
@@ -58,6 +60,10 @@ fn entry(executable: &str, command: &str) -> Option<Vec<String>> {
         || command.chars().any(char::is_control)
     {
         return None;
+    }
+    if matches!(command, "openclaw" | "openclaw-gateway") {
+        let tokens = collector::host::command_entry_tokens(executable, command.as_bytes());
+        return (!tokens.is_empty()).then_some(tokens);
     }
     let mut words = command.split_whitespace();
     if words
@@ -78,6 +84,20 @@ fn entry(executable: &str, command: &str) -> Option<Vec<String>> {
     }
     let tokens = collector::host::entry_tokens(executable, &args);
     (!tokens.is_empty()).then_some(tokens)
+}
+
+#[test]
+fn vmware_node_process_titles_keep_only_the_closed_gateway_token() {
+    for executable in ["node", "nodejs", "/usr/bin/node"] {
+        for title in ["openclaw", "openclaw-gateway"] {
+            assert_eq!(entry(executable, title), Some(vec!["openclaw".into()]));
+        }
+    }
+    for command in ["openclaw-gateway PRIVATE", "openclaw-gateway-other", "OpenClaw-Gateway", "data:image/png", "openclaw-gateway\0PRIVATE"] {
+        assert_eq!(entry("node", command), None);
+    }
+    assert_eq!(entry("python3", "openclaw-gateway"), None);
+    assert_eq!(entry("node", &"a".repeat(8193)), None);
 }
 
 // VIX_ERROR_CODE is the low 16 bits; tools and permission failures do not

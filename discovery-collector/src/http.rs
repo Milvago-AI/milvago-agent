@@ -98,7 +98,14 @@ pub fn collect_paths_with_connections(
             complete = false;
             continue;
         }
-        let Ok(timeout) = budget.remaining() else {
+        // A stalled service must leave time for other listeners, including VM
+        // endpoints. Keep all paths for a response group on this same deadline.
+        let target_budget = budget.child(std::time::Duration::from_secs(if targets.len() > 1 {
+            1
+        } else {
+            30
+        }));
+        let Ok(timeout) = target_budget.remaining() else {
             complete = false;
             break;
         };
@@ -118,6 +125,10 @@ pub fn collect_paths_with_connections(
         };
         let mut endpoint_scheme = None;
         for path in &paths {
+            if target_budget.check().is_err() {
+                complete = false;
+                break;
+            }
             let mut response = None;
             for scheme in ["http", "https"] {
                 if endpoint_scheme.is_some_and(|selected| selected != scheme) {
@@ -127,9 +138,9 @@ pub fn collect_paths_with_connections(
                     complete = false;
                     break 'targets;
                 }
-                let Ok(timeout) = budget.remaining() else {
+                let Ok(timeout) = target_budget.remaining() else {
                     complete = false;
-                    break 'targets;
+                    break;
                 };
                 attempts += 1;
                 if let Ok(found) = client
@@ -265,6 +276,97 @@ pub fn collect_paths_with_connections(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_endpoint_does_not_hide_a_later_service_or_split_its_response_group() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{Arc, atomic::AtomicBool},
+            time::Duration,
+        };
+        let stalled = TcpListener::bind("127.0.0.1:0").unwrap();
+        let healthy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let targets: Vec<_> = [&stalled, &healthy]
+            .into_iter()
+            .map(|listener| Target {
+                address: listener.local_addr().unwrap(),
+                origin: None,
+                published: false,
+            })
+            .collect();
+        let finished = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            for (listener, responds) in [(stalled, false), (healthy, true)] {
+                let finished = finished.clone();
+                scope.spawn(move || {
+                    listener.set_nonblocking(true).unwrap();
+                    let mut pending = vec![];
+                    while !finished.load(Ordering::Acquire) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                if responds {
+                                    stream.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                                    stream.set_write_timeout(Some(Duration::from_millis(500))).unwrap();
+                                    let mut request = [0; 4096];
+                                    let mut used = 0;
+                                    while used < request.len() {
+                                        let count = stream.read(&mut request[used..]).unwrap();
+                                        if count == 0 { break; }
+                                        used += count;
+                                        if request[..used].windows(4).any(|v| v == b"\r\n\r\n") { break; }
+                                    }
+                                    assert!(request[..used].starts_with(b"GET /"));
+                                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").unwrap();
+                                } else {
+                                    // Keep the socket open without returning headers or a body.
+                                    pending.push(stream);
+                                    assert!(pending.len() <= 4);
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    }
+                });
+            }
+            let stop = AtomicBool::new(false);
+            let mut snapshot = empty("endpoint", 1, 100);
+            let (consumed, _) = collect_paths_with_connections(
+                &mut snapshot,
+                &targets,
+                &[],
+                &["/".into(), "/health".into()],
+                &Budget::new(Duration::from_secs(3), &stop),
+            );
+            // Stop fixture threads before asserting, also on regression failure.
+            finished.store(true, Ordering::Release);
+            assert_eq!(consumed, 2);
+            let id = identity("endpoint", &["endpoint", &targets[1].address.to_string()]);
+            assert_eq!(snapshot.entities.len(), 1);
+            assert_eq!(snapshot.entities[0].id, id);
+            assert_eq!(snapshot.facts.len(), 2);
+            let paths: std::collections::BTreeSet<_> = snapshot
+                .facts
+                .iter()
+                .map(|fact| fact.fields[&Field::HttpPath][0].as_str())
+                .collect();
+            assert_eq!(paths, std::collections::BTreeSet::from(["/", "/health"]));
+            assert!(
+                snapshot
+                    .facts
+                    .iter()
+                    .all(|fact| fact.entity_id == id && fact.source == Source::Http)
+            );
+            assert!(snapshot.relations.is_empty());
+            assert_eq!(snapshot.coverage[0].status, CoverageStatus::Partial);
+            milvago_discovery_engine::validate_snapshot(&snapshot).unwrap();
+        });
+    }
+
     #[test]
     fn ipv6_metadata_services_are_denied_even_when_explicitly_allowed() {
         for literal in [

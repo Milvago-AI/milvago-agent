@@ -175,13 +175,9 @@ mod native {
     use windows_sys::{
         Win32::{
             Foundation::{
-                CloseHandle, ERROR_ACCESS_DENIED, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND,
-                HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+                ERROR_ACCESS_DENIED, ERROR_SUCCESS, ERROR_WMI_INSTANCE_NOT_FOUND,
             },
-            System::{
-                Diagnostics::Etw::*,
-                Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
-            },
+            System::Diagnostics::Etw::*,
         },
         core::GUID,
     };
@@ -204,38 +200,21 @@ mod native {
             && left.data4 == right.data4
     }
 
-    struct Controller(HANDLE);
+    struct Controller {
+        // Keep the verified directory open as well as the crash-released file lock.
+        _directory: crate::cache_windows::Directory,
+        _lock: std::fs::File,
+    }
     impl Controller {
         fn acquire() -> Result<Self, CoverageStatus> {
-            // A kernel mutex is released even when its owning process crashes.
-            // Another live controller is never displaced, including across editions.
-            let handle = unsafe {
-                CreateMutexW(
-                    std::ptr::null(),
-                    0,
-                    windows_sys::core::w!("Global\\MilvagoDiscoveryDNSController"),
-                )
-            };
-            if handle.is_null() {
-                return Err(CoverageStatus::Denied);
-            }
-            match unsafe { WaitForSingleObject(handle, 0) } {
-                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
-                _ => {
-                    unsafe {
-                        CloseHandle(handle);
-                    }
-                    Err(CoverageStatus::Unavailable)
-                }
-            }
-        }
-    }
-    impl Drop for Controller {
-        fn drop(&mut self) {
-            unsafe {
-                ReleaseMutex(self.0);
-                CloseHandle(self.0);
-            }
+            // Both installers provision this common parent for SYSTEM/admin only.
+            // A public named mutex can be precreated by an unrelated local user.
+            let root = std::env::var_os("ProgramData").ok_or(CoverageStatus::Denied)?;
+            let directory = crate::cache_windows::Directory::open(
+                &std::path::PathBuf::from(root).join("MilvagoDiscovery"), true,
+            ).map_err(|_| CoverageStatus::Denied)?;
+            let lock = directory.lock().map_err(|_| CoverageStatus::Unavailable)?;
+            Ok(Self { _directory: directory, _lock: lock })
         }
     }
 

@@ -58,6 +58,8 @@ jobs:
         if: runner.os == 'Linux'
       - run: sudo -E env "PATH=$PATH" TMPDIR=/milvago-test-tmp cargo test --locked --lib discovery_privileged::enrollment::tests::protected_registration_retries_delivery_and_never_adopts_bridge_state -- --ignored --exact
         if: runner.os == 'Linux'
+      - run: python3 -I -S tests/discovery_guest_http.py
+        if: runner.os == 'Linux'
       - run: sudo python3 deploy/discovery/test-install-discovery.py
         if: runner.os == 'Linux'
       # What that root run downloaded or built goes back to the runner user for the next steps.

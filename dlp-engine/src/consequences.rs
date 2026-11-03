@@ -21,7 +21,7 @@ fn guaranteed(expr:&Expr)->BTreeSet<String>{
 fn precise(policy:&Policy,id:&str)->bool{
  policy.detectors.iter().find(|d|d.id==id).is_some_and(|d|match &d.definition{
   DetectorKind::Builtin{category}=>!matches!(category.as_str(),"source_code"|"medical"),
-  DetectorKind::Keyword{..}=>false,
+  DetectorKind::Keyword{..}|DetectorKind::DictionaryContext{..}=>false,
   DetectorKind::KeywordTier{tier,..}=>tier!="fuzzy",
   _=>true
  })

@@ -1,17 +1,21 @@
 <!doctype html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Milvago</title>
+<script src="appearance.js"></script>
+<link rel="stylesheet" href="brand.css">
 <link rel="stylesheet" href="popup.css">
 </head>
-<body>
-<main>
-<img src="milvago-symbol-256.png" alt="" width="48" height="48">
-<h1 id="title">Service bloqué</h1>
-<p id="detail">Ce service est bloqué par votre organisation.</p>
-<p><code id="service"></code></p>
+<body class="blocked-page">
+<main class="blocked-card">
+<header class="brand-row"><div class="wordmark"><img class="logo-dark" src="milvago-logo-horizontal-inverse.svg" alt="Milvago" width="136" height="40"><img class="logo-light" src="milvago-logo-horizontal-mono-black.svg" alt="Milvago" width="136" height="40"></div><span class="section-label">Browser</span></header>
+<div class="decision-label" id="decision-label">Blocked</div>
+<h1 id="title">Service blocked</h1>
+<p id="detail">This service is blocked by your organization.</p>
+<code class="service-name" id="service"></code>
+<footer class="appearance-row"><label id="appearance-label" for="appearance">Appearance</label><select id="appearance"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></footer>
 </main>
 <script src="blocked.js"></script>
 </body>

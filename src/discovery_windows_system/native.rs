@@ -280,12 +280,20 @@ impl Collector {
         }
         let directory = &self.directory;
         let cache = &self.cache;
-        let decision = self.authority.authorize(
+        let observer = &mut self.observer;
+        let active = &mut self.active;
+        let decision = self.authority.authorize_with_revocation(
             &peer,
             &request.authorization,
             request.collect,
             Utc::now(),
             Instant::now(),
+            |policy| {
+                let keep = policy.configuration.network
+                    && active.as_ref().is_some_and(|(expires,deadline)| *expires>Utc::now() && *deadline>Instant::now() && policy.expires_at>=*expires)
+                    && observer.as_ref().is_some_and(|observer|observer.can_keep(&policy.catalog,policy.revision,policy.expires_at.timestamp()));
+                if !keep { *observer = None; *active = None; }
+            },
             |ledger| Self::save(directory, ledger, cache),
         )?;
         let (policy, status, retry, snapshot): (Policy, &str, u64, Option<Collected>) =

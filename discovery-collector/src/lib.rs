@@ -7,6 +7,7 @@ pub mod docker;
 #[cfg(target_os = "linux")]
 mod docker_socket;
 pub mod guest;
+pub mod guest_http;
 pub mod host;
 pub mod http;
 pub mod installation;
@@ -14,6 +15,7 @@ pub mod network;
 pub mod pipe;
 pub mod system;
 pub mod tls;
+pub mod user_vm;
 pub mod vm;
 pub mod vm_http;
 #[cfg(target_os = "linux")]

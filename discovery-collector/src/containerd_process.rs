@@ -299,7 +299,9 @@ fn project_at_kind(
     for address in &ports {
         let endpoint = identity("endpoint", &[&process, &address.to_string()]);
         snapshot.entities.push(Entity {
-            display: Some(EntityDisplay {
+            // A wildcard is a listener binding, not a displayable address.
+            // Keep its identity without poisoning the complete machine snapshot.
+            display: (!address.ip().is_unspecified() && !address.ip().is_multicast()).then(|| EntityDisplay {
                 address: Some(*address),
                 ..Default::default()
             }),
@@ -501,6 +503,29 @@ mod tests {
             .evaluate(&snapshot)
             .unwrap();
         assert_eq!(report.identifications[0].state, State::Executed);
+        let original_tcp = std::fs::read(root.join("123/net/tcp")).unwrap();
+        for (table, address) in [
+            ("tcp", "00000000:7531"),
+            ("tcp6", "00000000000000000000000000000000:7531"),
+            ("tcp", "010000E0:7531"),
+        ] {
+            std::fs::write(root.join("123/net/tcp"), "header\n").unwrap();
+            std::fs::write(root.join("123/net/tcp6"), "header\n").unwrap();
+            std::fs::write(root.join(format!("123/net/{table}")),
+                format!("header\n0: {address} 00000000:0000 0A 0 0 0 0 0 73\n")).unwrap();
+            let mut projected = make();
+            let projection_budget = Budget::new(Duration::from_secs(2), &stop);
+            let result = project_at(&mut projected, &peer, "container/fixture", "fixture", 123, &projection_budget, &root).unwrap();
+            assert!(result.complete);
+            assert!(result.listeners.is_empty(), "private netns must not acquire host targets");
+            let endpoints: Vec<_> = projected.entities.iter().filter(|e| e.kind == EntityKind::Endpoint).collect();
+            assert_eq!(endpoints.len(), 1);
+            assert!(endpoints[0].display.is_none());
+            milvago_discovery_engine::validate_snapshot(&projected).unwrap();
+            assert_eq!(Engine::compile(&factory).unwrap().evaluate(&projected).unwrap().identifications[0].state, State::Executed);
+        }
+        std::fs::write(root.join("123/net/tcp"), original_tcp).unwrap();
+        let budget = Budget::new(Duration::from_secs(2), &stop);
         std::fs::remove_file(root.join("123/net/tcp6")).unwrap();
         let mut without_ipv6 = make();
         let incomplete = project_at(

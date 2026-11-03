@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Request {
     Inventory {},
+    DesktopInventory { desktop: milvago_discovery_collector::user_vm::Desktop },
     Processes {
         owner_sid: String,
         distribution_id: String,
@@ -35,7 +36,7 @@ pub(crate) enum Request {
 impl Request {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         match self {
-            Self::Inventory {} => Ok(()),
+            Self::Inventory {} | Self::DesktopInventory { .. } => Ok(()),
             Self::Processes {
                 owner_sid,
                 distribution_id,
@@ -143,6 +144,7 @@ mod system_qualification;
 pub use system_qualification::run as qualify_system_transport;
 #[cfg(all(windows, feature = "windows-qualification"))]
 pub use system_qualification::{
+    desktop_inventory as qualify_desktop_inventory,
     handoff as qualify_system_handoff, handoff_probe as qualify_handoff_probe,
     owner_inventory as qualify_owner_inventory, owner_observe as qualify_owner_observe,
 };
@@ -158,7 +160,17 @@ pub fn probe() -> crate::Result<()> {
     request.validate()?;
     let stop = AtomicBool::new(false);
     let budget = milvago_discovery_collector::Budget::new(Duration::from_secs(5), &stop);
-    let output = native::query(request, &budget)?;
+    let output = match request {
+        Request::DesktopInventory { desktop } => {
+            use milvago_discovery_collector::system::{Reader, normalize};
+            let owner = native::owner()?;
+            let reader = crate::discovery_system::NativeReader;
+            let raw = reader.read(desktop.query(), &budget)?;
+            let normalized = normalize(desktop.query(), &raw, &reader, &budget)?;
+            milvago_discovery_collector::user_vm::scope(&normalized, &owner, desktop)?
+        }
+        request => native::query(request, &budget)?,
+    };
     std::io::stdout().write_all(&output)?;
     Ok(())
 }
@@ -286,6 +298,22 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_request_is_a_closed_metadata_operation_without_guest_credentials() {
+        for desktop in [milvago_discovery_collector::user_vm::Desktop::VirtualBox, milvago_discovery_collector::user_vm::Desktop::Vmware] {
+            let encoded = serde_json::to_vec(&Request::DesktopInventory { desktop }).unwrap();
+            serde_json::from_slice::<Request>(&encoded).unwrap().validate().unwrap();
+        }
+        for input in [
+            r#"{"operation":"desktop_inventory","desktop":"powershell"}"#,
+            r#"{"operation":"desktop_inventory","desktop":{"image":"payload"}}"#,
+            r#"{"operation":"desktop_inventory","desktop":"virtual_box","program":"cmd.exe"}"#,
+            r#"{"operation":"desktop_inventory","desktop":"vmware","credential_file":"secret.json"}"#,
+        ] {
+            assert!(serde_json::from_str::<Request>(input).is_err());
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

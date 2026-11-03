@@ -257,18 +257,25 @@ fn hyper_v_projection(bytes: &[u8]) -> Result<(String, Vec<u8>, bool), &'static 
 fn linux_projection(bytes: &[u8]) -> Result<(String, Vec<u8>, bool), &'static str> {
     guest_projection(bytes, false)
 }
-fn guest_projection(bytes: &[u8], vmware: bool) -> Result<(String, Vec<u8>, bool), &'static str> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Envelope {
-        boot: String,
-        processes: Vec<serde_json::Value>,
-        complete: bool,
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuestEnvelope {
+    boot: String,
+    processes: Vec<serde_json::Value>,
+    complete: bool,
+    #[serde(default)]
+    http: Option<collector::guest_http::Responses>,
+}
+fn guest_envelope(bytes: &[u8]) -> Result<GuestEnvelope, &'static str> {
     if bytes.len() > MAX_RESPONSE {
         return Err("response_limit");
     }
-    let input: Envelope = serde_json::from_slice(bytes).map_err(|_| "invalid_guest_response")?;
+    serde_json::from_slice(bytes).map_err(|_| "invalid_guest_response")
+}
+fn guest_projection(bytes: &[u8], vmware: bool) -> Result<(String, Vec<u8>, bool), &'static str> {
+    project_guest_envelope(guest_envelope(bytes)?, vmware)
+}
+fn project_guest_envelope(input: GuestEnvelope, vmware: bool) -> Result<(String, Vec<u8>, bool), &'static str> {
     let valid_boot = if vmware {
         input
             .boot
@@ -284,6 +291,7 @@ fn guest_projection(bytes: &[u8], vmware: bool) -> Result<(String, Vec<u8>, bool
     } else {
         input.boot.len() == 36 && uuid::Uuid::parse_str(&input.boot).is_ok()
     };
+    if input.http.is_some() { return Err("unexpected_guest_http_response"); }
     if !valid_boot {
         return Err("invalid_guest_response");
     }
@@ -297,13 +305,35 @@ fn guest_projection(bytes: &[u8], vmware: bool) -> Result<(String, Vec<u8>, bool
     ))
 }
 
+fn guest_http_projection(bytes: &[u8]) -> Result<((String, Vec<u8>, bool), (String, collector::guest_http::Responses)), &'static str> {
+    // The typed envelope rejects duplicate members before any projection.
+    // HTTP remains separate from the strict process-only channel.
+    let mut input = guest_envelope(bytes)?;
+    let responses = input.http.take().ok_or("invalid_guest_response")?;
+    let projection = project_guest_envelope(input, false)?;
+    let boot = projection.0.clone();
+    Ok((projection, (boot, responses)))
+}
+
 fn qga(
     reader: &impl Reader,
     vm: &str,
     budget: &Budget<'_>,
 ) -> Result<(String, Vec<u8>, bool), &'static str> {
+    let mut bytes = qga_response(reader, vm, Query::LibvirtGuestStart(vm.into()), budget)?;
+    let result = linux_projection(&bytes);
+    bytes.fill(0);
+    result
+}
+
+fn qga_response(
+    reader: &impl Reader,
+    vm: &str,
+    query: Query,
+    budget: &Budget<'_>,
+) -> Result<Vec<u8>, &'static str> {
     budget.check()?;
-    let mut start = reader.read(Query::LibvirtGuestStart(vm.into()), budget)?;
+    let mut start = reader.read(query, budget)?;
     let parsed = collector::bounded_json(&start);
     start.fill(0);
     let pid = parsed?
@@ -312,6 +342,7 @@ fn qga(
         .and_then(|v| v.as_u64())
         .filter(|p| *p > 0 && *p <= u32::MAX as u64)
         .ok_or("invalid_guest_response")? as u32;
+    let mut job = QgaJob { reader, vm, pid, reaped: false };
     loop {
         budget.check()?;
         let mut bytes = reader.read(
@@ -330,11 +361,13 @@ fn qga(
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 continue;
             }
-            Some(true) => (),
+            Some(true) => job.reaped = true,
             _ => return Err("invalid_guest_response"),
         }
+        budget.check()?;
         if data.get("exitcode").and_then(|v| v.as_u64()) != Some(0)
-            || data.get("out-truncated").and_then(|v| v.as_bool()) == Some(true)
+            || data.get("signal").is_some()
+            || data.get("out-truncated").is_some_and(|value| value.as_bool() != Some(false))
         {
             return Err("guest_query_failed");
         }
@@ -348,13 +381,64 @@ fn qga(
         };
         let decoded = STANDARD.decode(&encoded);
         zeroize::Zeroize::zeroize(&mut encoded);
-        let mut decoded = decoded.map_err(|_| "invalid_guest_response")?;
-        let result = linux_projection(&decoded);
-        decoded.fill(0);
-        return result;
+        return decoded.map_err(|_| "invalid_guest_response");
     }
 }
 
+struct QgaJob<'a, R: Reader> {
+    reader: &'a R,
+    vm: &'a str,
+    pid: u32,
+    reaped: bool,
+}
+
+impl<R: Reader> Drop for QgaJob<'_, R> {
+    fn drop(&mut self) {
+        if self.reaped { return; }
+        // QGA retains completed output until status is read. Cancellation must
+        // discard this already-started job, never start another guest command.
+        // The fixed probe has its own five-second alarm; cleanup is bounded even
+        // when the transport disappears. No cleanup output enters a snapshot.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let budget = Budget::new(std::time::Duration::from_secs(6), &stop);
+        let mut failures = 0;
+        while budget.check().is_ok() {
+            let bytes = self.reader.read(Query::LibvirtGuestStatus {
+                vm_id: self.vm.into(), pid: self.pid,
+            }, &budget);
+            let mut bytes = match bytes {
+                Ok(bytes) => zeroize::Zeroizing::new(bytes),
+                Err(_) => {
+                    failures += 1;
+                    if failures >= 2 { return; }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+            };
+            let parsed = collector::bounded_json(&bytes);
+            bytes.fill(0);
+            let Ok(mut parsed) = parsed else { return; };
+            let exited = parsed.get("return").and_then(|data| data.get("exited"))
+                .and_then(|value| value.as_bool());
+            // Output can contain HTTP body fragments, including on failure.
+            fn clear(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::String(text) => zeroize::Zeroize::zeroize(text),
+                    serde_json::Value::Array(values) => values.iter_mut().for_each(clear),
+                    serde_json::Value::Object(values) => values.values_mut().for_each(clear),
+                    _ => (),
+                }
+            }
+            clear(&mut parsed);
+            match exited {
+                Some(false) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                _ => return,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn collect_running_with(
     snapshot: &mut Snapshot,
     home: &Path,
@@ -364,6 +448,20 @@ fn collect_running_with(
     reader: &impl Reader,
     budget: &Budget<'_>,
     running: &BTreeSet<String>,
+) {
+    collect_running_http_with(snapshot, home, device, access, failures, reader, budget, running, None);
+}
+
+fn collect_running_http_with(
+    snapshot: &mut Snapshot,
+    home: &Path,
+    device: &str,
+    access: Access,
+    failures: &mut Vec<String>,
+    reader: &impl Reader,
+    budget: &Budget<'_>,
+    running: &BTreeSet<String>,
+    http_paths: Option<&[String]>,
 ) {
     if !access.read || !access.execute {
         collector::coverage(snapshot, "guest-tools", CoverageStatus::Denied, false);
@@ -391,12 +489,14 @@ fn collect_running_with(
         let offset = snapshot.sequence as usize % config.connections.len();
         config.connections.rotate_left(offset);
     }
+    let http_paths = http_paths.filter(|paths| collector::guest_http::valid_paths(paths));
     for connection in config.connections {
         if budget.check().is_err() {
             collector::coverage(snapshot, "guest-tools", CoverageStatus::Timeout, false);
             break;
         }
         let adapter = connection.hypervisor.adapter();
+        let guest_http_requested = matches!(connection.hypervisor, Hypervisor::VirtualBox | Hypervisor::Libvirt) && http_paths.is_some();
         let vm = collector::identity("vm", &[adapter, "local", &connection.vm_id]);
         if !running.contains(&vm)
             || !snapshot
@@ -431,11 +531,29 @@ fn collect_running_with(
         let credentialed = !matches!(connection.hypervisor, Hypervisor::Libvirt | Hypervisor::Wsl);
         failures.retain(|old| !old.starts_with(&prefix) || (credentialed && old == &key));
         let blocked = credentialed && failures.contains(&key);
+        let mut http_result = None;
         let result = if blocked {
             Err("guest_access_latched")
         } else {
             match connection.hypervisor {
-                Hypervisor::Libvirt => qga(reader, &connection.vm_id, budget),
+                Hypervisor::Libvirt => {
+                    if let Some(paths) = http_paths {
+                        let query = Query::LibvirtGuestStartHttp {
+                            vm_id: connection.vm_id.clone(), paths: paths.to_vec(),
+                            offset: (snapshot.sequence % u32::MAX as u64) as u32,
+                        };
+                        qga_response(reader, &connection.vm_id, query, budget).and_then(|mut bytes| {
+                            let result = guest_http_projection(&bytes).map(|(projection, responses)| {
+                                http_result = Some(responses);
+                                projection
+                            });
+                            bytes.fill(0);
+                            result
+                        })
+                    } else {
+                        qga(reader, &connection.vm_id, budget)
+                    }
+                }
                 Hypervisor::Wsl => {
                     let identity = crate::discovery_wsl::Identity::parse(&connection.vm_id);
                     match identity.and_then(|identity| {
@@ -475,18 +593,23 @@ fn collect_running_with(
                     }
                 }
                 Hypervisor::VirtualBox => {
-                    match reader.read(
-                        Query::VirtualBoxGuest {
-                            vm_id: connection.vm_id,
-                            username: connection.username.unwrap_or_default(),
-                            credential_file: credential
-                                .map(|p| p.to_string_lossy().into_owned())
-                                .unwrap_or_default(),
-                        },
-                        budget,
-                    ) {
+                    let vm_id = connection.vm_id;
+                    let username = connection.username.unwrap_or_default();
+                    let credential_file = credential.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                    let query = if let Some(paths) = http_paths {
+                        Query::VirtualBoxGuestHttp { vm_id, username, credential_file,
+                            paths: paths.to_vec(), offset: (snapshot.sequence % u32::MAX as u64) as u32 }
+                    } else {
+                        Query::VirtualBoxGuest { vm_id, username, credential_file }
+                    };
+                    match reader.read(query, budget) {
                         Ok(mut bytes) => {
-                            let result = linux_projection(&bytes);
+                            let result = if http_paths.is_some() {
+                                guest_http_projection(&bytes).map(|(projection, responses)| {
+                                    http_result = Some(responses);
+                                    projection
+                                })
+                            } else { linux_projection(&bytes) };
                             bytes.fill(0);
                             result
                         }
@@ -551,6 +674,22 @@ fn collect_running_with(
                 }
             }
         };
+        if guest_http_requested {
+            let http_status = if budget.check().is_err() {
+                Some(CoverageStatus::Timeout)
+            } else if let (Some(paths), Some((boot, responses))) = (http_paths, http_result) {
+                collector::guest_http::project(snapshot, &vm, &boot, responses, paths, access)
+                    .err().map(|_| CoverageStatus::Partial)
+            } else {
+                Some(status)
+            };
+            if let Some(status) = http_status.filter(|_| snapshot.coverage.len() < 256) {
+                snapshot.coverage.push(milvago_discovery_engine::Coverage {
+                    scope: vm.clone(), adapter: "guest-http".into(), status,
+                    checked_at: snapshot.observed_at, complete: false,
+                });
+            }
+        }
         if let Some(coverage) = snapshot
             .coverage
             .iter_mut()
@@ -589,8 +728,9 @@ pub fn collect(
     failures: &mut Vec<String>,
     budget: &Budget<'_>,
     running: &BTreeSet<String>,
+    http_paths: Option<&[String]>,
 ) {
-    collect_running_with(
+    collect_running_http_with(
         snapshot,
         home,
         device,
@@ -599,6 +739,7 @@ pub fn collect(
         &NativeReader,
         budget,
         running,
+        http_paths,
     );
 }
 
@@ -629,6 +770,167 @@ fn collect_with(
 mod tests {
     use super::*;
     const VM: &str = "11111111-1111-4111-8111-111111111111";
+    #[cfg(unix)]
+    #[test]
+    fn qga_private_http_requires_signed_permissions_and_retries_transient_failures() {
+        use std::{cell::Cell, os::unix::fs::PermissionsExt, sync::atomic::AtomicBool, time::Duration};
+        struct Fixture {
+            http: Cell<bool>,
+            http_calls: Cell<usize>,
+            process_calls: Cell<usize>,
+            transient: Cell<Option<&'static str>>,
+        }
+        impl Reader for Fixture {
+            fn read(&self, query: Query, _: &Budget<'_>) -> Result<Vec<u8>, &'static str> {
+                match query {
+                    Query::LibvirtGuestStartHttp { vm_id, paths, offset } => {
+                        assert_eq!(vm_id, VM);
+                        assert_eq!(paths, ["/"]);
+                        assert_eq!(offset, 1);
+                        self.http_calls.set(self.http_calls.get() + 1);
+                        if let Some(error) = self.transient.take() { return Err(error); }
+                        self.http.set(true);
+                        Ok(br#"{"return":{"pid":42}}"#.to_vec())
+                    }
+                    Query::LibvirtGuestStart(vm_id) => {
+                        assert_eq!(vm_id, VM);
+                        self.process_calls.set(self.process_calls.get() + 1);
+                        self.http.set(false);
+                        Ok(br#"{"return":{"pid":42}}"#.to_vec())
+                    }
+                    Query::LibvirtGuestStatus { vm_id, pid } => {
+                        assert_eq!(vm_id, VM);
+                        assert_eq!(pid, 42);
+                        let mut payload = serde_json::json!({"boot":VM,"complete":true,"processes":[]});
+                        if self.http.get() {
+                            payload["http"] = serde_json::json!({"complete":false,"responses":[{"port":32145,"path":"/","status":200,"content_type":"text/plain","body":"Ollama is running"}]});
+                        }
+                        let encoded = STANDARD.encode(serde_json::to_vec(&payload).unwrap());
+                        Ok(serde_json::to_vec(&serde_json::json!({"return":{"exited":true,"exitcode":0,"out-data":encoded}})).unwrap())
+                    }
+                    _ => panic!("QGA query escaped its fixed guest scope"),
+                }
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("config")).unwrap();
+        let config = home.path().join("config/discovery-guests.json");
+        std::fs::write(&config, serde_json::to_vec(&serde_json::json!({"version":1,"device_id":"device","connections":[{"hypervisor":"libvirt","vm_id":VM}]})).unwrap()).unwrap();
+        std::fs::set_permissions(config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let paths = vec!["/".into()];
+        let invalid = vec!["data:image/png".into()];
+        for mode in 0..9 {
+            let error = match mode { 6 => Some("timeout"), 7 => Some("unavailable"), 8 => Some("cancelled"), _ => None };
+            let reader = Fixture { http: Cell::new(false), http_calls: Cell::new(0), process_calls: Cell::new(0), transient: Cell::new(error) };
+            let stop = AtomicBool::new(false);
+            let mut failures = vec![];
+            let mut snapshot = collector::empty("endpoint", 1, 100);
+            let guests = collector::vm::inventory(&mut snapshot, collector::vm::Hypervisor::Libvirt, "local", format!(r#"[{{"uuid":"{VM}","running":true,"tools_available":true}}]"#).as_bytes()).unwrap();
+            let running = if mode == 4 { BTreeSet::new() } else { guests.iter().cloned().collect() };
+            let requested = match mode { 2 => None, 5 => Some(invalid.as_slice()), _ => Some(paths.as_slice()) };
+            let access = Access { read: mode != 0, execute: mode != 1 };
+            let rounds = if error.is_some() { 2 } else { 1 };
+            for round in 0..rounds {
+                collect_running_http_with(&mut snapshot, home.path(), "device", access,
+                    &mut failures, &reader, &Budget::new(Duration::from_secs(2), &stop), &running, requested);
+                assert!(failures.is_empty(), "QGA transport failures must never latch");
+                if error.is_some() && round == 0 {
+                    assert!(!snapshot.entities.iter().any(|row| row.kind == EntityKind::Endpoint));
+                    // A subsequent scan has its own coverage and sequence frame.
+                    snapshot.coverage.retain(|row| row.adapter != "guest-http");
+                }
+            }
+            let endpoints: Vec<_> = snapshot.entities.iter().filter(|row| row.kind == EntityKind::Endpoint).collect();
+            if mode == 3 || mode >= 6 {
+                assert_eq!(endpoints.len(), 1);
+                assert!(snapshot.relations.iter().any(|row| row.from == guests[0] && row.to == endpoints[0].id && row.kind == milvago_discovery_engine::RelationKind::ObservedOrigin));
+                assert!(snapshot.coverage.iter().any(|row| row.scope == guests[0] && row.adapter == "guest-http" && !row.complete));
+                assert_eq!(reader.http_calls.get(), rounds);
+            } else {
+                assert!(endpoints.is_empty());
+                assert_eq!(reader.http_calls.get(), 0);
+            }
+            assert_eq!(reader.process_calls.get(), usize::from(matches!(mode, 2 | 5)));
+            milvago_discovery_engine::validate_snapshot(&snapshot).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn virtualbox_private_http_requires_both_guest_permissions_and_the_signed_http_scope() {
+        use std::{cell::Cell, os::unix::fs::PermissionsExt, sync::atomic::AtomicBool, time::Duration};
+        struct Fixture { http_calls: Cell<usize>, process_calls: Cell<usize> }
+        impl Reader for Fixture {
+            fn read(&self, query: Query, _: &Budget<'_>) -> Result<Vec<u8>, &'static str> {
+                let mut output = serde_json::json!({"boot":VM,"complete":true,"processes":[]});
+                match query {
+                    Query::VirtualBoxGuestHttp { vm_id, username, paths, offset, .. } => {
+                        assert_eq!(vm_id, VM);
+                        assert_eq!(username, "fixture");
+                        assert_eq!(paths, ["/"]);
+                        assert_eq!(offset, 1);
+                        self.http_calls.set(self.http_calls.get() + 1);
+                        output["http"] = serde_json::json!({"complete":false,"responses":[{"port":32145,"path":"/","status":200,"content_type":"text/plain","body":"Ollama is running"}]});
+                    }
+                    Query::VirtualBoxGuest { vm_id, .. } => {
+                        assert_eq!(vm_id, VM);
+                        self.process_calls.set(self.process_calls.get() + 1);
+                    }
+                    _ => panic!("unexpected guest query"),
+                }
+                Ok(serde_json::to_vec(&output).unwrap())
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("config/discovery-secrets")).unwrap();
+        for (name, bytes) in [
+            ("config/discovery-guests.json", serde_json::to_vec(&serde_json::json!({"version":1,"device_id":"device","connections":[{"hypervisor":"virtualbox","vm_id":VM,"username":"fixture","credential_file":"fixture.password"}]})).unwrap()),
+            ("config/discovery-secrets/fixture.password", b"synthetic-fixture".to_vec()),
+        ] {
+            let path = home.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let fixture = Fixture { http_calls: Cell::new(0), process_calls: Cell::new(0) };
+        let stop = AtomicBool::new(false);
+        let paths = vec!["/".into()];
+        for mode in 0..5 {
+            let mut snapshot = collector::empty("endpoint", 1, 100);
+            let guests = collector::vm::inventory(&mut snapshot, collector::vm::Hypervisor::VirtualBox, "local",
+                format!(r#"[{{"uuid":"{VM}","running":true,"tools_available":true}}]"#).as_bytes()).unwrap();
+            let running = if mode == 4 { BTreeSet::new() } else { guests.iter().cloned().collect() };
+            collect_running_http_with(&mut snapshot, home.path(), "device",
+                Access { read: mode != 0, execute: mode != 1 }, &mut vec![], &fixture,
+                &Budget::new(Duration::from_secs(2), &stop), &running,
+                (mode != 2).then_some(paths.as_slice()));
+            let endpoints: Vec<_> = snapshot.entities.iter().filter(|entity| entity.kind == EntityKind::Endpoint).collect();
+            if mode == 3 {
+                assert_eq!(endpoints.len(), 1);
+                assert_eq!(fixture.http_calls.get(), 1);
+                assert!(snapshot.relations.iter().any(|r| r.from == guests[0] && r.to == endpoints[0].id
+                    && r.kind == milvago_discovery_engine::RelationKind::ObservedOrigin));
+                assert!(snapshot.coverage.iter().any(|row| row.scope == guests[0] && row.adapter == "guest-http" && !row.complete));
+            } else { assert!(endpoints.is_empty()); }
+            milvago_discovery_engine::validate_snapshot(&snapshot).unwrap();
+        }
+        assert_eq!(fixture.http_calls.get(), 1);
+        assert_eq!(fixture.process_calls.get(), 1);
+    }
+
+    #[test]
+    fn unsolicited_guest_http_cannot_enter_the_process_only_channel() {
+        let payload = serde_json::json!({"boot":VM,"processes":[],"complete":true,
+            "http":{"complete":true,"responses":[]}});
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        assert!(linux_projection(&bytes).is_err());
+        assert!(guest_http_projection(&bytes).is_ok());
+        let mut bad = payload;
+        bad["http"]["responses"] = "data:image/png".into();
+        assert!(guest_http_projection(&serde_json::to_vec(&bad).unwrap()).is_err());
+        let duplicate = format!(r#"{{"boot":"{VM}","boot":"{VM}","processes":[],"complete":true,"http":{{"complete":true,"responses":[]}}}}"#);
+        assert!(guest_http_projection(duplicate.as_bytes()).is_err());
+        let duplicate = format!(r#"{{"boot":"{VM}","processes":[],"complete":true,"http":{{"complete":true,"responses":[]}},"http":{{"complete":true,"responses":[]}}}}"#);
+        assert!(guest_http_projection(duplicate.as_bytes()).is_err());
+    }
     #[test]
     fn wsl_guest_configuration_binds_distribution_to_its_windows_owner() {
         let owner = "S-1-5-21-111-222-333-1001";
@@ -1246,6 +1548,9 @@ mod tests {
         for (field, value) in [
             ("exitcode", serde_json::json!(1)),
             ("out-truncated", serde_json::json!(true)),
+            ("out-truncated", serde_json::json!("false")),
+            ("out-truncated", serde_json::Value::Null),
+            ("signal", serde_json::json!(9)),
             ("out-data", serde_json::json!("data:image/png")),
             ("exited", serde_json::json!("true")),
         ] {
@@ -1258,6 +1563,75 @@ mod tests {
             qga(&Fixture { result: good }, VM, &budget).unwrap_err(),
             "cancelled"
         );
+    }
+
+    #[test]
+    fn qga_cancellation_reaps_only_the_started_job_and_discards_its_output() {
+        use std::{cell::Cell, sync::atomic::{AtomicBool, Ordering}, time::Duration};
+        struct Fixture<'a> {
+            stop: &'a AtomicBool,
+            starts: Cell<usize>,
+            statuses: Cell<usize>,
+            immediate_exit: bool,
+        }
+        impl Reader for Fixture<'_> {
+            fn read(&self, query: Query, budget: &Budget<'_>) -> Result<Vec<u8>, &'static str> {
+                budget.check()?;
+                let reply = match query {
+                    Query::LibvirtGuestStart(vm) if vm == VM => {
+                        self.starts.set(self.starts.get() + 1);
+                        serde_json::json!({"return":{"pid":42}})
+                    }
+                    Query::LibvirtGuestStatus { vm_id, pid } if vm_id == VM && pid == 42 => {
+                        self.statuses.set(self.statuses.get() + 1);
+                        if self.statuses.get() == 1 {
+                            self.stop.store(true, Ordering::Release);
+                            if self.immediate_exit {
+                                serde_json::json!({"return":{"exited":true,"exitcode":0,"out-data":"e30="}})
+                            } else { serde_json::json!({"return":{"exited":false}}) }
+                        } else {
+                            assert_eq!(self.statuses.get(), 2, "completed metadata was reaped twice");
+                            serde_json::json!({"return":{"exited":true,"exitcode":0,"out-data":"data:image/png"}})
+                        }
+                    }
+                    _ => panic!("cleanup must only read the exact started job"),
+                };
+                Ok(serde_json::to_vec(&reply).unwrap())
+            }
+        }
+        for immediate_exit in [false, true] {
+            let stop = AtomicBool::new(false);
+            let fixture = Fixture { stop: &stop, starts: Cell::new(0), statuses: Cell::new(0), immediate_exit };
+            let budget = Budget::new(Duration::from_secs(1), &stop);
+            assert_eq!(qga(&fixture, VM, &budget).unwrap_err(), "cancelled");
+            assert_eq!(fixture.starts.get(), 1);
+            assert_eq!(fixture.statuses.get(), if immediate_exit { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn qga_cleanup_is_bounded_when_the_transport_disappears() {
+        use std::{cell::Cell, sync::atomic::AtomicBool, time::{Duration, Instant}};
+        struct Fixture { calls: Cell<usize> }
+        impl Reader for Fixture {
+            fn read(&self, query: Query, budget: &Budget<'_>) -> Result<Vec<u8>, &'static str> {
+                budget.check()?;
+                match query {
+                    Query::LibvirtGuestStart(vm) if vm == VM => Ok(br#"{"return":{"pid":42}}"#.to_vec()),
+                    Query::LibvirtGuestStatus { vm_id, pid } if vm_id == VM && pid == 42 => {
+                        self.calls.set(self.calls.get() + 1);
+                        Err("unavailable")
+                    }
+                    _ => panic!("cleanup must not launch another command"),
+                }
+            }
+        }
+        let stop = AtomicBool::new(false);
+        let fixture = Fixture { calls: Cell::new(0) };
+        let started = Instant::now();
+        assert_eq!(qga(&fixture, VM, &Budget::new(Duration::from_secs(1), &stop)).unwrap_err(), "unavailable");
+        assert_eq!(fixture.calls.get(), 3);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]

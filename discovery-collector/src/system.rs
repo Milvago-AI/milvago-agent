@@ -30,12 +30,24 @@ pub enum Query {
         username: String,
         credential_file: String,
     },
+    VirtualBoxGuestHttp {
+        vm_id: String,
+        username: String,
+        credential_file: String,
+        paths: Vec<String>,
+        offset: u32,
+    },
     VMwareGuest {
         vm_id: String,
         vmx_file: String,
         credential_file: String,
     },
     LibvirtGuestStart(String),
+    LibvirtGuestStartHttp {
+        vm_id: String,
+        paths: Vec<String>,
+        offset: u32,
+    },
     LibvirtGuestStatus {
         vm_id: String,
         pid: u32,
@@ -43,6 +55,14 @@ pub enum Query {
 }
 pub trait Reader {
     fn read(&self, query: Query, budget: &Budget<'_>) -> Result<Vec<u8>, &'static str>;
+
+    fn owner_inventory(
+        &self,
+        _desktop: crate::user_vm::Desktop,
+        _budget: &Budget<'_>,
+    ) -> Option<Result<Vec<u8>, &'static str>> {
+        None
+    }
 }
 
 fn uuid(value: &str) -> bool {
@@ -159,7 +179,33 @@ pub fn virtual_machines(
             ),
         }
     }
+    owner_virtual_machines(snapshot, reader, budget);
     running
+}
+
+/// Session registrations supplement the service account's inventory. They do
+/// not replace its stable identifiers or authorize any guest operation.
+pub fn owner_virtual_machines(snapshot: &mut Snapshot, reader: &impl Reader, budget: &Budget<'_>) {
+    for desktop in [crate::user_vm::Desktop::VirtualBox, crate::user_vm::Desktop::Vmware] {
+        let adapter = format!("{}-user-session", desktop.hypervisor().adapter());
+        if budget.check().is_err() {
+            break;
+        }
+        let Some(result) = reader.owner_inventory(desktop, budget) else { continue; };
+        let status = match result {
+            Ok(bytes) => {
+                if crate::user_vm::validate(&bytes, None, desktop).is_ok() {
+                    let _ = vm::inventory(snapshot, desktop.hypervisor(), "local", &bytes);
+                }
+                // Only one signed-in owner is sampled per bounded pass.
+                CoverageStatus::Partial
+            }
+            Err("access_denied") => CoverageStatus::Denied,
+            Err("cancelled" | "timeout") => CoverageStatus::Timeout,
+            Err(_) => CoverageStatus::Unavailable,
+        };
+        coverage(snapshot, &adapter, status, false);
+    }
 }
 
 #[cfg(windows)]
@@ -366,7 +412,7 @@ fn vmware_label(path: &str) -> Option<String> {
     inventory_label(file.get(..file.len() - 4)?)
 }
 
-fn normalize(
+pub fn normalize(
     query: Query,
     bytes: &[u8],
     reader: &impl Reader,
@@ -385,6 +431,11 @@ fn normalize(
             }
             let rows:Vec<_>=rows.into_iter().map(|r|serde_json::json!({"uuid":r.uuid,"running":r.running,"tools_available":r.tools_available,"display_name":r.display_name})).collect();
             serde_json::to_vec(&rows).map_err(|_| "invalid_inventory")
+        }
+        Query::VirtualBox | Query::VMware if text.trim_start().starts_with('[') => {
+            let desktop = if matches!(query, Query::VirtualBox) { crate::user_vm::Desktop::VirtualBox } else { crate::user_vm::Desktop::Vmware };
+            crate::user_vm::validate(bytes, None, desktop)?;
+            Ok(bytes.to_vec())
         }
         Query::VirtualBox => {
             let mut rows = vec![];
@@ -469,6 +520,42 @@ fn normalize(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_inventory_supplements_legacy_identity_without_guest_authority() {
+        use super::*;
+        const VM: &str = "11111111-1111-4111-8111-111111111111";
+        const SID: &str = "S-1-5-21-1-2-3-1001";
+        struct Sessions { malformed: bool }
+        impl Reader for Sessions {
+            fn read(&self, query: Query, _: &Budget<'_>) -> Result<Vec<u8>, &'static str> {
+                if matches!(query, Query::VirtualBox) {
+                    Ok(format!("Name: Legacy registration\nUUID: {VM}\nState: running\n").into_bytes())
+                } else { Err("unavailable") }
+            }
+            fn owner_inventory(&self, desktop: crate::user_vm::Desktop, _: &Budget<'_>) -> Option<Result<Vec<u8>, &'static str>> {
+                if !matches!(desktop, crate::user_vm::Desktop::VirtualBox) { return None; }
+                Some(Ok(serde_json::to_vec(&serde_json::json!([{
+                    "uuid":format!("{SID}/{VM}"),"running":true,
+                    "tools_available":self.malformed,"display_name":"Owner registration",
+                }])).unwrap()))
+            }
+        }
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let budget = Budget::new(std::time::Duration::from_secs(2), &stop);
+        for malformed in [false, true] {
+            let mut snapshot = crate::empty("endpoint", 1, 100);
+            let running = virtual_machines(&mut snapshot, &Sessions { malformed }, &budget);
+            let legacy = vm::entity_id(vm::Hypervisor::VirtualBox, "local", VM);
+            let scoped = vm::entity_id(vm::Hypervisor::VirtualBox, "local", &format!("{SID}/{VM}"));
+            assert!(snapshot.entities.iter().any(|row| row.id == legacy));
+            assert_eq!(snapshot.entities.iter().any(|row| row.id == scoped), !malformed);
+            assert_eq!(running.len(), 1);
+            assert_eq!(running[0].entity, legacy);
+            assert!(snapshot.facts.is_empty());
+            assert!(snapshot.coverage.iter().any(|row| row.adapter == "virtualbox-user-session" && !row.complete));
+        }
+    }
+
     #[test]
     fn interpreter_metadata_cannot_create_or_reassign_a_kernel_process() {
         let mut snapshot = crate::empty("endpoint", 1, 100);

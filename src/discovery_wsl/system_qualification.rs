@@ -1,6 +1,6 @@
 //! Opt-in fixture driver; never part of the default agent's command surface.
 use super::{Identity, native::token_identity, user_context};
-use milvago_discovery_collector::{Budget, MAX_RESPONSE, system::Query};
+use milvago_discovery_collector::{Budget, MAX_RESPONSE, system::{Query, Reader}};
 use serde_json::Value;
 use std::{io::Read, path::PathBuf, sync::atomic::AtomicBool, time::Duration};
 use windows_sys::Win32::{
@@ -60,6 +60,88 @@ fn session_zero() -> crate::Result<()> {
 }
 
 const HANDOFF_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+fn desktop_fixture_kind(value: Option<&str>) -> crate::Result<milvago_discovery_collector::user_vm::Desktop> {
+    use milvago_discovery_collector::user_vm::Desktop;
+    match value {
+        Some("1") => Ok(Desktop::VirtualBox),
+        Some("vmware") => Ok(Desktop::Vmware),
+        _ => Err("explicit desktop fixture kind required".into()),
+    }
+}
+
+#[test]
+fn desktop_fixture_selector_rejects_unknown_or_missing_kind() {
+    use milvago_discovery_collector::user_vm::Desktop;
+    assert!(matches!(desktop_fixture_kind(Some("1")), Ok(Desktop::VirtualBox)));
+    assert!(matches!(desktop_fixture_kind(Some("vmware")), Ok(Desktop::Vmware)));
+    for value in [None, Some(""), Some("VMware"), Some("vmware\0"), Some("data:image/png;base64,AA=="), Some("../vmware")] {
+        assert!(desktop_fixture_kind(value).is_err());
+    }
+}
+
+/// Native Session 0 inventory of a VM visible to the actual limited WTS owner.
+/// Neither a stopped registration nor a running VM proves guest AI execution.
+pub fn desktop_inventory() -> crate::Result<()> {
+    fixture()?;
+    let image = std::env::current_exe()?;
+    let directory = crate::cache_windows::Directory::installed(image.parent().ok_or("fixture directory absent")?)?;
+    let mut file = directory.hold_file(std::ffi::OsStr::new("desktop-owner.sid"))?;
+    if file.metadata()?.len() > 80 { return Err("fixture owner exceeds limit".into()); }
+    let mut owner = String::new(); file.read_to_string(&mut owner)?;
+    if !milvago_discovery_collector::user_vm::valid_owner(&owner) {
+        return Err("invalid fixture owner".into());
+    }
+    let kind_value = std::env::var("MILVAGO_QA_DESKTOP").ok();
+    let desktop = desktop_fixture_kind(kind_value.as_deref())?;
+    let running = matches!(desktop, milvago_discovery_collector::user_vm::Desktop::Vmware);
+    let expected_id = if running {
+        let mut path = String::new();
+        let mut file = directory.hold_file(std::ffi::OsStr::new("desktop-vmware.path"))?;
+        if file.metadata()?.len() > 4096 { return Err("fixture VM path exceeds limit".into()); }
+        file.read_to_string(&mut path)?;
+        if path.is_empty() || path.chars().any(char::is_control) { return Err("invalid fixture VM path".into()); }
+        milvago_discovery_collector::identity("vmx", &[&path])
+    } else { HANDOFF_ID.to_owned() };
+    let query = || -> crate::Result<Vec<String>> {
+        let stop = AtomicBool::new(false);
+        let budget = Budget::new(Duration::from_secs(8), &stop);
+        let reader = crate::discovery_system::NativeReader;
+        let bytes = reader.owner_inventory(desktop, &budget)
+            .ok_or("desktop dispatcher absent")?
+            .map_err(|error| {
+                if let Some(code) = user_context::take_probe_exit() {
+                    format!("{error}; child_exit=0x{code:08x}")
+                } else { error.to_owned() }
+            })?;
+        milvago_discovery_collector::user_vm::validate(&bytes, Some(&owner), desktop)?;
+        let rows: Vec<Value> = serde_json::from_slice(&bytes)?;
+        if rows.len() != 1 || rows[0]["uuid"] != format!("{owner}/{expected_id}")
+            || rows[0]["running"] != running || rows[0]["tools_available"] != false {
+            return Err("actual limited-owner registration was not found".into());
+        }
+        let mut snapshot = milvago_discovery_collector::empty("desktop-native", 1, 1);
+        milvago_discovery_collector::system::owner_virtual_machines(&mut snapshot, &reader, &budget);
+        milvago_discovery_engine::validate_snapshot(&snapshot)?;
+        if !snapshot.facts.is_empty() || snapshot.entities.len() != 1 {
+            return Err("registration invented execution evidence".into());
+        }
+        Ok(snapshot.entities.into_iter().map(|row| row.id).collect())
+    };
+    let expected = query()?;
+    let before = handles()?;
+    for _ in 0..16 { if query()? != expected { return Err("desktop identity changed".into()); } }
+    let after = handles()?;
+    if after > before + 4 { return Err("desktop inventory retained handles".into()); }
+    use std::io::Write;
+    let mut proof = std::fs::OpenOptions::new().write(true).create_new(true)
+        .open(image.with_extension("desktop.json"))?;
+    proof.write_all(&serde_json::to_vec(&serde_json::json!({"owner_verified":true,
+        "registered_vm":true,"running":running,"execution_facts":0,"cycles":16,
+        "handles_before":before,"handles_after":after}))?)?;
+    proof.sync_all()?;
+    Ok(())
+}
 
 /// Fixture-only access to the production dispatcher, without enabling collection.
 pub fn owner_inventory(budget: &Budget<'_>) -> crate::Result<Vec<u8>> {

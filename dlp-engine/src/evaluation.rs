@@ -57,6 +57,9 @@ pub fn validate(policy: &Policy) -> Result<(), String> {
             DetectorKind::KeywordTier { dictionary, tier } => {
                 if !["exact","unicode","fuzzy"].contains(&tier.as_str()) || !policy.detectors.iter().any(|d| d.id == *dictionary && matches!(d.definition, DetectorKind::Dictionary { .. })) { return Err("Invalid dictionary reference".into()); }
             }
+            DetectorKind::DictionaryContext { dictionary, minimum } => {
+                if !(1..=200).contains(minimum) || !policy.detectors.iter().any(|d| d.id == *dictionary && matches!(d.definition, DetectorKind::Dictionary { .. })) { return Err("Invalid contextual dictionary reference or threshold".into()); }
+            }
         }
     }
     let mut ids = BTreeSet::new();
@@ -89,7 +92,7 @@ pub fn validate(policy: &Policy) -> Result<(), String> {
                 if let Some(Detector { definition: DetectorKind::Regex { pattern, ignore_case }, .. }) = policy.detectors.iter().find(|d| &d.id == detector) {
                     if regex(pattern, *ignore_case)?.is_match(label) { return Err("A mask label must not match its own detector".into()); }
                 }
-                if policy.detectors.iter().find(|d| &d.id == detector).is_some_and(|d| match &d.definition {DetectorKind::Keyword{..}=>true,DetectorKind::KeywordTier{tier,..}=>tier=="fuzzy",_=>false}) { return Err("Approximate dictionary matches cannot mask; choose exact or Unicode matching".into()); }
+                if policy.detectors.iter().find(|d| &d.id == detector).is_some_and(|d| match &d.definition {DetectorKind::Keyword{..}|DetectorKind::DictionaryContext{..}=>true,DetectorKind::KeywordTier{tier,..}=>tier=="fuzzy",_=>false}) { return Err("Contextual or approximate dictionary matches cannot mask; choose exact or Unicode matching".into()); }
             }
         }
     }
@@ -232,7 +235,7 @@ fn ranges(detector: &Detector, text: &str) -> Result<Vec<(usize, usize)>, String
             }
             return Ok(output);
         }
-        DetectorKind::Dictionary { .. } | DetectorKind::KeywordTier { .. } => return Err("Dictionary requires policy context".into()),
+        DetectorKind::Dictionary { .. } | DetectorKind::KeywordTier { .. } | DetectorKind::DictionaryContext { .. } => return Err("Dictionary requires policy context".into()),
     };
     // Built-in candidates can greedily absorb following words; retry bounded prefixes.
     if let DetectorKind::Builtin { category } = &detector.definition {
@@ -276,13 +279,27 @@ impl WorkBudget {
         Ok(())
     }
 }
-struct Env<'a> { input: &'a Input, markers: &'a [Marker], budget: usize, work: Option<WorkBudget> }
+struct Env<'a> { input: &'a Input, markers: &'a [Marker], budget: usize, work: Option<WorkBudget>, context_work: WorkBudget }
 impl Env<'_> {
     fn matches(&mut self, field: &str, detector: &Detector) -> Result<Option<Vec<(usize,usize,usize)>>, String> {
         let Some(texts) = self.input.texts.get(field) else { return Ok(None); };
         let mut found = Vec::new();
         for (index, text) in texts.iter().enumerate() {
-            let detected = if let DetectorKind::KeywordTier { dictionary,tier } = &detector.definition {
+            let detected = if let DetectorKind::DictionaryContext { dictionary,minimum } = &detector.definition {
+                let Some(Detector { definition:DetectorKind::Dictionary { values,exceptions }, .. }) = self.input.policy.detectors.iter().find(|d| d.id == *dictionary) else { return Err("Dictionary unavailable".into()); };
+                // Count distinct expressions within this one text value, never
+                // repetitions or expressions spread across independent values.
+                let lower=text.to_lowercase();
+                let excluded:BTreeSet<_>=exceptions.iter().map(|v|view(v,true,false).text).collect();
+                let terms:BTreeSet<_>=values.iter().filter(|v|!excluded.contains(&view(v,true,false).text)).map(|v|v.to_lowercase()).collect();
+                let mut hits=0;
+                for term in terms {
+                    self.context_work.charge(lower.len())?;
+                    if let Some(work)=&mut self.work {work.charge(lower.len())?;}
+                    if lower.contains(&term) { hits+=1; if hits>=*minimum {break;} }
+                }
+                if hits>=*minimum {vec![(0,text.len())]} else {vec![]}
+            } else if let DetectorKind::KeywordTier { dictionary,tier } = &detector.definition {
                 let Some(Detector { definition:DetectorKind::Dictionary { values,exceptions }, .. }) = self.input.policy.detectors.iter().find(|d| d.id == *dictionary) else { return Err("Dictionary unavailable".into()); };
                 let mut found=Vec::new();
                 for value in values {
@@ -375,7 +392,7 @@ fn application_truth(application:&Option<Application>,facts:&BTreeMap<String,Str
 }
 
 pub fn evaluate(input: &Input) -> Result<Output, String> {
-    evaluate_bounded(input,MAX_TEXT,256,None)
+    evaluate_bounded(input,MAX_TEXT,256,Some(WorkBudget::new()))
 }
 
 /// Inspect one complete larger structured unit, never independent fragments.
@@ -390,7 +407,7 @@ fn evaluate_bounded(input:&Input,max_text:usize,max_values:usize,work:Option<Wor
     if input.texts.len() > 2 || input.texts.keys().any(|k| !TEXT_FIELDS.contains(&k.as_str())) || input.texts.values().map(Vec::len).sum::<usize>() > max_values || input.texts.values().flatten().map(String::len).sum::<usize>() > max_text || input.facts.len() > FIELDS.len() || input.facts.iter().any(|(k,v)| !FIELDS.contains(&k.as_str()) || !bounded(v,256)) { return Err("Inspection input exceeds its limits or has unknown fields".into()); }
     let mut output = Output { action: "observe".into(), texts: input.texts.clone(), decisions: vec![], reason: String::new(), transformed: false, confirmation:false };
     if !input.policy.inspection || (input.policy.domain == Domain::Endpoint && input.facts.get("channel").is_some_and(|value| value == "native") && !input.policy.native_inspection) { return Ok(output); }
-    let mut env = Env { input, markers: &[], budget:8192, work };
+    let mut env = Env { input, markers: &[], budget:8192, work, context_work:WorkBudget::new() };
     let mut all = Vec::new(); let mut review = false;let mut notices:Vec<String>=vec![];
     let mut ordered: Vec<&Rule> = input.policy.rules.iter().collect(); ordered.sort_by(|a,b| (a.priority,&a.id).cmp(&(b.priority,&b.id)));
     for rule in &ordered {
@@ -459,7 +476,7 @@ fn evaluate_bounded(input:&Input,max_text:usize,max_values:usize,work:Option<Wor
     if output.texts.values().flatten().map(String::len).sum::<usize>() > max_text { return Err("Transformed content exceeds the limit".into()); }
     if output.transformed {
         let final_input = Input { policy:input.policy.clone(),texts:output.texts.clone(),facts:input.facts.clone(),upload:input.upload };
-        let mut final_env = Env { input:&final_input,markers:&markers,budget:8192,work:env.work };
+        let mut final_env = Env { input:&final_input,markers:&markers,budget:8192,work:env.work,context_work:env.context_work };
         for rule in &ordered {
             if rule.mode != Mode::Active {continue;}
             let target=application_truth(&rule.application,&input.facts);
@@ -493,10 +510,10 @@ fn evaluate_bounded(input:&Input,max_text:usize,max_values:usize,work:Option<Wor
 
 pub(crate) fn scope_allows_channel(policy:&Policy,scope:&Expr,channel:&str)->Result<bool,String>{
  let input=Input{policy:policy.clone(),texts:BTreeMap::new(),facts:BTreeMap::from([("channel".into(),channel.into())]),upload:None};
- let mut env=Env{input:&input,markers:&[],budget:8192,work:None};Ok(env.expr(scope)?!=Truth::False)
+ let mut env=Env{input:&input,markers:&[],budget:8192,work:None,context_work:WorkBudget::new()};Ok(env.expr(scope)?!=Truth::False)
 }
 pub(crate) fn mask_label_matches(policy:&Policy,detector:&str,label:&str)->Result<bool,String>{
  let input=Input{policy:policy.clone(),texts:BTreeMap::from([("prompt".into(),vec![format!("[{label}]")])]),facts:BTreeMap::new(),upload:None};
- let mut env=Env{input:&input,markers:&[],budget:8192,work:None};let target=policy.detectors.iter().find(|item|item.id==detector).ok_or("Detector unavailable")?;
+ let mut env=Env{input:&input,markers:&[],budget:8192,work:None,context_work:WorkBudget::new()};let target=policy.detectors.iter().find(|item|item.id==detector).ok_or("Detector unavailable")?;
  Ok(env.matches("prompt",target)?.is_some_and(|matches|!matches.is_empty()))
 }

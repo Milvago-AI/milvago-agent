@@ -60,7 +60,8 @@ const decisions=new Map(),reported=new Set();
 // A picked file lives as long as a paste: a provider may send it inline with the message, minutes later.
 const APPROVAL_MS=10000,FILE_APPROVAL_MS=30*60*1000,PASTE_APPROVAL_MS=30*60*1000,REVIEW_MS=10*60*1000,APPROVALS_PER_TAB=32,APPROVAL_TABS=64;
 const LIFETIME={send:APPROVAL_MS,file:FILE_APPROVAL_MS,paste:PASTE_APPROVAL_MS};
-const approvals=new Map(),approved=new Map();
+const approvals=new Map(),approved=new Map(),policyBindings=new WeakMap();
+const bindingFor=active=>active&&policyBindings.get(active);
 const textFields=text=>({exact:exactTextDigest(text),digest:textDigest(text),bytes:new TextEncoder().encode(text).length});
 function originOf(value){try{const origin=new URL(value).origin;return origin==='null'?null:origin;}catch{return null;}}
 // The document an approval belongs to: its `documentId`, or, where the browser gives none (Firefox
@@ -77,18 +78,18 @@ function persist(){if(!session){return;}restoring=restoring.then(()=>session.set
 function store(tabId,list){if(list.length){approvals.set(tabId,list);}else{approvals.delete(tabId);}persist();}
 const UUID=/^[0-9a-f]{8}-[0-9a-f]{4}-[1-58][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,DIGEST=/^[0-9a-f]{64}$/;
 const confirmedReceipts=new Map(),pendingConfirmations=new Map();
-function confirmationContext(entry,sender){return entry&&entry.expires>Date.now()&&entry.tabId===sender.tab.id&&entry.revision===policy.revision&&sameDocument(entry,sender.documentId,sender.frameId,sender.url);}
+function confirmationContext(entry,sender){return entry&&entry.expires>Date.now()&&entry.tabId===sender.tab.id&&entry.revision===policy.revision&&entry.binding===bindingFor(policy)&&sameDocument(entry,sender.documentId,sender.frameId,sender.url);}
 function rememberPendingConfirmation(reply,sender){
  if(reply?.confirmation!==true)return;
  if(!UUID.test(reply.dlp_receipt||''))throw new Error('confirmation receipt absent');
  const now=Date.now();for(const [id,value] of pendingConfirmations){if(value.expires<=now)pendingConfirmations.delete(id);}
  if(pendingConfirmations.size>=256)pendingConfirmations.delete(pendingConfirmations.keys().next().value);
- pendingConfirmations.set(reply.dlp_receipt,{tabId:sender.tab.id,...documentOf(sender),revision:policy.revision,expires:now+REVIEW_MS});
+ pendingConfirmations.set(reply.dlp_receipt,{tabId:sender.tab.id,...documentOf(sender),revision:policy.revision,binding:bindingFor(policy),expires:now+REVIEW_MS});
 }
 function rememberConfirmation(receipt,sender){
  const now=Date.now();for(const [id,value] of confirmedReceipts){if(value.expires<=now)confirmedReceipts.delete(id);}
  if(confirmedReceipts.size>=256)confirmedReceipts.delete(confirmedReceipts.keys().next().value);
- confirmedReceipts.set(receipt,{tabId:sender.tab.id,...documentOf(sender),revision:policy.revision,expires:now+REVIEW_MS});
+ confirmedReceipts.set(receipt,{tabId:sender.tab.id,...documentOf(sender),revision:policy.revision,binding:bindingFor(policy),expires:now+REVIEW_MS});
 }
 // A picked file: the SHA-256 of its name, computed in the page, and its size.
 const validFile=f=>!!f&&typeof f.name==='string'&&DIGEST.test(f.name)&&Number.isSafeInteger(f.size)&&f.size>=0;
@@ -98,7 +99,7 @@ function storedApproval(e,now){
  const pending=e.pending;
  if(pending!==undefined&&(e.kind!=='paste'||typeof pending!=='string'||!UUID.test(pending))){return null;}
  if(!Number.isFinite(e.expires)||e.expires<=now||e.expires>now+(pending?REVIEW_MS:LIFETIME[e.kind])){return null;}
- if(typeof e.platform!=='string'||e.platform.length>64||!Number.isSafeInteger(e.revision)){return null;}
+ if(typeof e.platform!=='string'||e.platform.length>64||!Number.isSafeInteger(e.revision)||!DIGEST.test(e.binding||'')){return null;}
  let place=null;
  if(typeof e.documentId==='string'&&e.documentId.length<=128){place={documentId:e.documentId};}
  else if(Number.isSafeInteger(e.frameId)&&e.frameId>=0&&typeof e.origin==='string'&&e.origin.length<=2048){place={frameId:e.frameId,origin:e.origin};}
@@ -113,7 +114,7 @@ function storedApproval(e,now){
   if(labels!==undefined&&(e.kind!=='paste'||!validLabels(labels))){return null;}
   body={...(DIGEST.test(e.exact||'')?{exact:e.exact}:{}),digest:e.digest,bytes:e.bytes,...(parts?{parts}:{}),...(labels?{labels:[...labels]}:{})};
  }
- return body?{tabId:e.tabId,entry:{...body,kind:e.kind,platform:e.platform,revision:e.revision,...place,expires:e.expires,...(pending?{pending}:{}),...(confirmations?{confirmations:[...confirmations]}:{})}}:null;
+ return body?{tabId:e.tabId,entry:{...body,kind:e.kind,platform:e.platform,revision:e.revision,binding:e.binding,...place,expires:e.expires,...(pending?{pending}:{}),...(confirmations?{confirmations:[...confirmations]}:{})}}:null;
 }
 function restoreApprovals(stored){
  const list=stored?.approvals,now=Date.now();if(!Array.isArray(list)){return;}
@@ -122,14 +123,14 @@ function restoreApprovals(stored){
   approvals.set(read.tabId,[read.entry,...(approvals.get(read.tabId)||[])].slice(-APPROVALS_PER_TAB));
  }
 }
-function samePolicyIdentity(left,right){return !!left&&!!right&&left.version===right.version&&left.revision===right.revision&&left.config?.dlp_control?.fingerprint===right.config?.dlp_control?.fingerprint;}
+function samePolicyIdentity(left,right){return !!bindingFor(left)&&bindingFor(left)===bindingFor(right);}
 function policyUnchanged(expected){return authorized()&&samePolicyIdentity(expected,policy);}
 function approve(sender,platform,fields,kind='send',expected=policy){
  if(!policyUnchanged(expected))return false;
  const tabId=sender?.tab?.id;if(typeof tabId!=='number'||tabId<0||typeof platform!=='string'||!Number.isSafeInteger(expected?.revision)){return false;}
  if(!approvals.has(tabId)&&approvals.size>=APPROVAL_TABS){approvals.delete(approvals.keys().next().value);}
  const now=Date.now(),kept=(approvals.get(tabId)||[]).filter(e=>e.expires>now&&(kind!=='send'||e.kind!=='send'));
- kept.push({...fields,kind,platform,revision:expected.revision,...documentOf(sender),expires:now+(fields.pending?REVIEW_MS:LIFETIME[kind])});
+ kept.push({...fields,kind,platform,revision:expected.revision,binding:bindingFor(expected),...documentOf(sender),expires:now+(fields.pending?REVIEW_MS:LIFETIME[kind])});
  store(tabId,kept.slice(-APPROVALS_PER_TAB));return true;
 }
 // An approval is valid for the tab, the document and the revision that obtained it: another tab, a
@@ -140,7 +141,7 @@ function approvalFor(details,platform){
  if(live.length!==list.length){store(details.tabId,live);}
  // A request WITHOUT a `documentId` — frame navigation, form, worker — does
  // not receive a document's approval: absence is not a match.
- return live.filter(e=>!e.pending&&e.platform===platform&&e.revision===policy?.revision&&sameDocument(e,details.documentId,details.frameId,details.documentUrl));
+ return live.filter(e=>!e.pending&&e.platform===platform&&e.revision===policy?.revision&&e.binding===bindingFor(policy)&&sameDocument(e,details.documentId,details.frameId,details.documentUrl));
 }
 function consume(tabId,used){store(tabId,(approvals.get(tabId)||[]).filter(e=>!used?.includes(e)));}
 // What a reviewed paste was found to hold (its labels, never its text), handed to the next network prompt
@@ -162,9 +163,9 @@ function takeLabels(details,platform){
 function confirmPaste(message,sender){
  const tabId=sender?.tab?.id,now=Date.now();
  if(typeof message.token!=='string'||!UUID.test(message.token)||typeof tabId!=='number'){return {ok:false};}
- const list=approvals.get(tabId)||[],entry=list.find(e=>e.pending===message.token&&e.expires>now&&sameDocument(e,sender.documentId,sender.frameId,sender.url));
+ const list=approvals.get(tabId)||[],entry=list.find(e=>e.pending===message.token&&e.expires>now&&e.binding===bindingFor(policy)&&sameDocument(e,sender.documentId,sender.frameId,sender.url));
  if(!entry){return {ok:false};}
- if(entry.confirmations?.some(id=>{const ack=confirmedReceipts.get(id);return !ack||ack.expires<=now||ack.tabId!==tabId||ack.revision!==policy.revision||!sameDocument(ack,sender.documentId,sender.frameId,sender.url);})){return {ok:false};}
+ if(entry.confirmations?.some(id=>{const ack=confirmedReceipts.get(id);return !ack||ack.expires<=now||ack.tabId!==tabId||ack.revision!==policy.revision||ack.binding!==bindingFor(policy)||!sameDocument(ack,sender.documentId,sender.frameId,sender.url);})){return {ok:false};}
  for(const id of entry.confirmations||[])confirmedReceipts.delete(id);delete entry.confirmations;
  delete entry.pending;entry.expires=now+PASTE_APPROVAL_MS;store(tabId,list);
  return {ok:true};
@@ -388,6 +389,7 @@ function routeVerdict(platformId,route,headers){
 function heldNow(platformId){return !!policy?.config?.services?.some(s=>s.enabled&&['block','redirect'].includes(s.mode)&&s.id===platformId);}
 function scopeFor(details){return (id,u)=>headerModelScope(detection.catalog(),id,details,u);}
 function pendingHeaders(details,pending,approvedSend=false){
+  if(!pending.binding||pending.binding!==bindingFor(policy)){return blockedWithoutPolicy(details);}
   const headers=details.requestHeaders||[],types=headers.filter(h=>h.name.toLowerCase()==='content-type'),enc=headers.filter(h=>h.name.toLowerCase()==='content-encoding');
   const rule=ruleFor(policy,pending.platform.id);
   // A scoped request is decided on its catalogue route's header, or not on a model at all.
@@ -435,7 +437,7 @@ function queueDecision(details,platform,decision){
   // A route body read whole with no text at its paths (a session opening): only the repeat check uses it.
   let textless=false;
   if(route){try{const w=wireFacts(details,detection.catalog(),new URL(details.url));textless=!!w.readable&&!w.malformed&&!w.prose&&!w.groups?.length&&!(w.texts||[]).some(t=>typeof t!=='string'||globalThis.MilvagoAdapters.layout(t)!=='');}catch{}}
-  decisions.set(details.requestId,{platform,model,revision:policy?.revision,scoped:!!decision?.scoped&&decision.platform_id===platform.id,route,body:details.requestBody,textless});
+  decisions.set(details.requestId,{platform,model,revision:policy?.revision,binding:bindingFor(policy),scoped:!!decision?.scoped&&decision.platform_id===platform.id,route,body:details.requestBody,textless});
  }
  return {};
 }
@@ -457,7 +459,7 @@ try{
    // The revision that approved it travels with it: the text was only ever inspected under
    // that one. The `Referer` removal, on the other hand, is not memorized: it is RECOMPUTED on
    // send, so that no queue saturation can make it forgotten.
-   if(decision.approved){consume(details.tabId,decision.consumed);lend(details,platform.id,decision.consumed);if(approved.size>=64){approved.delete(approved.keys().next().value);}approved.set(details.requestId,policy?.revision);}
+   if(decision.approved){consume(details.tabId,decision.consumed);lend(details,platform.id,decision.consumed);if(approved.size>=64){approved.delete(approved.keys().next().value);}approved.set(details.requestId,bindingFor(policy));}
    return {};
   }
   return queueDecision(details,platform,decision);
@@ -470,8 +472,8 @@ try{
   // authorization, however, survives neither the loss of the policy nor a change of
   // revision: the text was only ever inspected under the revision that approved it.
   if(approved.has(details.requestId)){
-   const revision=approved.get(details.requestId);approved.delete(details.requestId);
-   if(authorized()&&revision===policy?.revision){return decisions.has(details.requestId)?pendingHeaders(details,decisions.get(details.requestId),true):{};}
+   const binding=approved.get(details.requestId);approved.delete(details.requestId);
+   if(authorized()&&binding&&binding===bindingFor(policy)){return decisions.has(details.requestId)?pendingHeaders(details,decisions.get(details.requestId),true):{};}
    const covered=networkPlatform(details.url)||networkPlatform(details.initiator||details.originUrl||details.documentUrl);
    return cancel(details,{platform_id:covered?.id,provider:covered?.domain||'agent-unavailable',reason:'control_unavailable',revision:policy?.revision,quiet:!!covered&&heldNow(covered.id)});
   }
@@ -600,7 +602,11 @@ async function updatePolicy(run){
  // The browser travels with the poll so the agent knows which extensions are still
  // running: a user who disables one must not simply vanish from the console.
  const guardedAnswer=await guarded('browser_policy',{tool},{op:'policy_v3',tool});live();adopt(guardedAnswer);if(!guardedAnswer.legacy&&(mode==='blocked'||guardedAnswer.mode==='blocked')){throw new Error('Broker blocked');}const answer=guardedAnswer.legacy?guardedAnswer.reply:{ok:true,online:guardedAnswer.reply.online,policy:guardedAnswer.reply.policy};if(![2,3,4].includes(answer.policy?.version)||!validPolicy(answer.policy)){throw new Error('Invalid policy');}
- const previousPolicy=policy;policy=answer.policy;transientFailures=0;
+ const previousPolicy=policy;
+ // Bind custody to the authenticated installation and the entire enforcement
+ // configuration. Numeric revisions alone can coincide across installations.
+ policyBindings.set(answer.policy,exactTextDigest(JSON.stringify([guardedAnswer.authority,answer.policy.version,answer.policy.revision,answer.policy.config])));
+ policy=answer.policy;transientFailures=0;
  // Every approval was inspected under the revision it names: none survives a new one.
  if(previousPolicy&&!samePolicyIdentity(previousPolicy,policy)){approvals.clear();pendingConfirmations.clear();confirmedReceipts.clear();persist();}
  await within(detection.refresh(),CATALOG_MS).catch(()=>{});live();

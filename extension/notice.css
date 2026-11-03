@@ -1,0 +1,41 @@
+/* Embedded into capture.js; identity tests prevent these sources from drifting. */
+:host{color-scheme:dark;font-family:MilvagoInter,Inter,system-ui,sans-serif}
+:host([data-theme=light]){color-scheme:light}
+@media(prefers-color-scheme:light){:host(:not([data-theme=dark])){color-scheme:light}}
+*{box-sizing:border-box}
+dialog{position:fixed;inset:0;margin:0;padding:0;border:0;width:100%;height:100%;max-width:none;max-height:none;background:transparent;color:var(--mv-text);font:14px/1.55 MilvagoInter,Inter,system-ui,sans-serif}
+dialog::backdrop{background:transparent}
+.shade{position:fixed;inset:0;display:grid;place-items:center;padding:24px;background:rgba(5,10,18,.64)}
+.card{display:flex;flex-direction:column;width:min(560px,100%);max-height:calc(100vh - 48px);max-height:calc(100dvh - 48px);background:var(--mv-surface);border:1px solid var(--mv-border-strong);border-radius:var(--mv-radius-l);overflow:hidden;box-shadow:0 24px 64px #0004;animation:notice-enter var(--mv-dur-base) var(--mv-ease-out)}
+.notice-header{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:18px 24px;border-bottom:1px solid var(--mv-border);background:var(--mv-surface)}
+.wordmark{display:block;flex:none;font-size:23px;font-weight:650;letter-spacing:-.04em}
+.wordmark img{display:block;width:122px;height:36px;object-fit:contain}
+.wordmark .logo-light{display:none}
+:host([data-theme=light]) .wordmark .logo-dark{display:none}
+:host([data-theme=light]) .wordmark .logo-light{display:block}
+@media(prefers-color-scheme:light){:host(:not([data-theme=dark])) .wordmark .logo-dark{display:none}:host(:not([data-theme=dark])) .wordmark .logo-light{display:block}}
+.section-label{font:10px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--mv-text-2);text-align:right}
+.notice-body{padding:26px 24px;overflow:auto;min-height:0;overscroll-behavior:contain}
+.decision-mark{display:block;width:40px;height:40px;border-radius:var(--mv-radius-m);border:1px solid var(--mv-border-strong);background:var(--mv-surface-2);color:var(--mv-text-2);position:relative;margin-bottom:18px}
+.decision-mark::before{content:'';position:absolute;left:18px;top:10px;width:2px;height:12px;background:currentColor}
+.decision-mark::after{content:'';position:absolute;left:18px;top:25px;width:2px;height:2px;background:currentColor}
+.card[data-decision=blocked] .decision-mark{color:var(--mv-blocked);background:var(--mv-blocked-bg);border-color:var(--mv-blocked)}
+.card[data-decision=masked] .decision-mark{color:var(--mv-masked);background:var(--mv-masked-bg);border-color:var(--mv-masked)}
+.card[data-decision=allowed] .decision-mark{color:var(--mv-allowed);background:var(--mv-allowed-bg);border-color:var(--mv-allowed)}
+.card[data-decision=allowed] .decision-mark::before{left:14px;top:10px;width:8px;height:14px;background:transparent;border-right:2px solid currentColor;border-bottom:2px solid currentColor;transform:rotate(45deg)}
+.card[data-decision=allowed] .decision-mark::after{display:none}
+h2{font-size:23px;line-height:1.3;font-weight:650;letter-spacing:-.035em;margin:0 0 12px;color:var(--mv-text);overflow-wrap:anywhere}
+.description{white-space:pre-wrap;color:var(--mv-text-2);margin:0;font-size:14px;line-height:1.65;overflow-wrap:anywhere}
+.review-label{display:block;margin:24px 0 9px;font:10px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace;letter-spacing:.1em;text-transform:uppercase;color:var(--mv-text-2)}
+textarea{display:block;width:100%;min-height:154px;max-height:32vh;resize:vertical;box-sizing:border-box;background:var(--mv-bg);color:var(--mv-text);border:1px solid var(--mv-border-strong);border-radius:var(--mv-radius-m);padding:14px;font:13px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:2}
+.card[data-decision=masked] textarea{border-left:3px solid var(--mv-masked)}
+.actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:10px;padding:18px 24px;background:var(--mv-surface);border-top:1px solid var(--mv-border)}
+button{min-height:42px;padding:10px 16px;border:1px solid var(--mv-border-strong);border-radius:var(--mv-radius-m);background:var(--mv-surface);color:var(--mv-text);font:500 13px/1.5 MilvagoInter,Inter,system-ui,sans-serif;cursor:pointer;transition:background var(--mv-dur-fast) var(--mv-ease-out)}
+button:hover{background:var(--mv-surface-2)}
+button.primary{background:var(--mv-accent-solid);border-color:var(--mv-accent-solid);color:#fff;font-weight:600}
+button.primary:hover{background:#1B3FD6;border-color:#1B3FD6}
+button:focus-visible,textarea:focus-visible{outline:2px solid var(--mv-accent-text);outline-offset:3px}
+.signature{margin:0;padding:0 24px 16px;color:var(--mv-text-2);text-align:right;font-size:11px}
+@keyframes notice-enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@media(max-width:480px){.shade{padding:12px}.card{max-height:calc(100vh - 24px);max-height:calc(100dvh - 24px)}.notice-header{padding:16px 18px;gap:12px}.notice-body{padding:22px 18px}.actions{padding:16px 18px;gap:8px}button{padding:10px 12px}h2{font-size:21px}.signature{padding:0 18px 14px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important;scroll-behavior:auto!important}}

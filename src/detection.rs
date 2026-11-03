@@ -1129,7 +1129,7 @@ mod tests {
     }
 }
 
-fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<(String, String)>> {
+fn legacy_delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<(String, String)>> {
     let Some(token) = request.get("delivery_id") else {
         return Ok(None);
     };
@@ -1147,6 +1147,24 @@ fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<
         crate::sha256_hex(serde_json::to_vec(event)?),
     )))
 }
+// New receipts bind kernel identity. A legacy display-name digest alone
+// cannot prove ownership after migration; only a matching durable owner can.
+fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<(String, String)>> {
+    let Some((_, hash)) = legacy_delivery_key(state, request, event)? else { return Ok(None) };
+    let owner = crate::browser_queue_quota::caller_owner(request)?;
+    let key = json!(["kernel-principal-v1", state.device_id, state.server_url,
+        state.public_key, request["tool"], owner, request["delivery_id"]]);
+    Ok(Some((crate::sha256_hex(serde_json::to_vec(&key)?), hash)))
+}
+fn matching_delivery<'a>(state: &'a State, request: &Value, event: &Value, key: &str) -> Result<Option<&'a Value>> {
+    if let Some(row) = state.detection.event_receipts.iter().find(|row| row[0] == key) { return Ok(Some(row)) }
+    let Some((legacy, _)) = legacy_delivery_key(state, request, event)? else { return Ok(None) };
+    let owner = crate::browser_queue_quota::caller_owner(request)?;
+    Ok(state.detection.event_receipts.iter().find(|row|
+        row.as_array().is_some_and(|fields|fields.len() == 3) && row[0] == legacy
+            && row[2].as_str().and_then(|raw|uuid::Uuid::parse_str(raw).ok())
+                .and_then(|id|state.browser_queue_owners.get(&id)).is_some_and(|stored|stored == &owner)))
+}
 pub fn delivery_receipt(
     state: &State,
     request: &Value,
@@ -1155,7 +1173,7 @@ pub fn delivery_receipt(
     let Some((key, hash)) = delivery_key(state, request, event)? else {
         return Ok(None);
     };
-    let Some(row) = state.detection.event_receipts.iter().find(|r| r[0] == key) else {
+    let Some(row) = matching_delivery(state, request, event, &key)? else {
         return Ok(None);
     };
     if row[1] != hash {
@@ -1175,7 +1193,7 @@ pub fn completed_delivery(state: &State, request: &Value) -> Result<Option<uuid:
     let Some((key, _)) = delivery_key(state, request, &json!({}))? else {
         return Ok(None);
     };
-    let Some(row) = state.detection.event_receipts.iter().find(|r| r[0] == key) else {
+    let Some(row) = matching_delivery(state, request, &json!({}), &key)? else {
         return Ok(None);
     };
     Ok(Some(uuid::Uuid::parse_str(
@@ -1189,7 +1207,17 @@ pub fn remember_delivery(
     id: uuid::Uuid,
 ) -> Result<()> {
     if let Some((key, hash)) = delivery_key(state, request, event)? {
-        state.detection.event_receipts.push(json!([key, hash, id]));
+        let owner = crate::browser_queue_quota::caller_owner(request)?;
+        // ACKed rows no longer occupy the event queue. Retain their independent
+        // kernel identity here so one account cannot churn the whole history.
+        // Legacy entries have no provable owner and keep the bounded global ring.
+        while state.detection.event_receipts.iter().filter(|row|
+            row[4].as_str().unwrap_or("unknown") == owner).count() >= crate::browser_broker::PRINCIPAL_EVENTS {
+            let oldest = state.detection.event_receipts.iter().position(|row|
+                row[4].as_str().unwrap_or("unknown") == owner).ok_or("receipt owner count changed")?;
+            state.detection.event_receipts.remove(oldest);
+        }
+        state.detection.event_receipts.push(json!([key, hash, id, "kernel-principal-v1", owner]));
         let excess = state.detection.event_receipts.len().saturating_sub(4096);
         state.detection.event_receipts.drain(..excess);
     }
@@ -1207,7 +1235,7 @@ mod delivery_tests {
             public_key: "fixture-anchor".into(),
             ..State::default()
         };
-        let request = json!({"delivery_id":uuid::Uuid::new_v4(),"tool":"chrome","caller":{"user":"synthetic-account"}});
+        let request = json!({"delivery_id":uuid::Uuid::new_v4(),"tool":"chrome","caller":{"user":"synthetic-account","sid":"S-1-5-21-1000"}});
         let event = json!({"provider":"fixture.test","characters":12});
         let id = uuid::Uuid::new_v4();
         remember_delivery(&mut state, &request, &event, id).unwrap();
@@ -1223,8 +1251,11 @@ mod delivery_tests {
             )
             .is_err()
         );
+        let mut renamed = request.clone();
+        renamed["caller"]["user"] = json!("renamed-account");
+        assert_eq!(delivery_receipt(&state, &renamed, &event).unwrap(), Some(id));
         let mut other = request.clone();
-        other["caller"]["user"] = json!("other-account");
+        other["caller"]["sid"] = json!("S-1-5-21-1001");
         assert!(delivery_receipt(&state, &other, &event).unwrap().is_none());
         state.server_url = "https://other-instance.test".into();
         assert!(
@@ -1320,5 +1351,66 @@ mod corpus_tests {
             seen > 0,
             "no corpus fixtures found in {dir}: an empty corpus must not read as a pass"
         );
+    }
+}
+
+#[cfg(test)]
+mod kernel_receipt_tests {
+    use super::*;
+    #[test]
+    fn renamed_display_account_keeps_receipt_but_another_kernel_account_does_not() {
+        let mut state=State {device_id:uuid::Uuid::new_v4().to_string(),server_url:"https://synthetic.test".into(),
+            public_key:"synthetic-anchor".into(),..Default::default()};
+        let event=json!({"kind":"presence","characters":0});
+        let id=uuid::Uuid::new_v4();
+        let mut request=json!({"tool":"chrome","delivery_id":uuid::Uuid::new_v4(),
+            "caller":{"sid":"S-1-5-21-1000","user":"old-display-name"}});
+        remember_delivery(&mut state,&request,&event,id).unwrap();
+        request["caller"]["user"]=json!("new-display-name");
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),Some(id));
+        assert_eq!(completed_delivery(&state,&request).unwrap(),Some(id));
+        assert!(delivery_receipt(&state,&request,&json!({"kind":"presence","characters":1})).is_err());
+        request["caller"]["sid"]=json!("S-1-5-21-1001");
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),None);
+        assert_eq!(completed_delivery(&state,&request).unwrap(),None);
+    }
+    #[test]
+    fn one_accounts_completed_stream_cannot_evict_another_accounts_lost_ack() {
+        let mut state=State {device_id:uuid::Uuid::new_v4().to_string(),server_url:"https://synthetic.test".into(),
+            public_key:"synthetic-anchor".into(),..Default::default()};
+        let event=json!({"kind":"presence","characters":0});
+        let id=uuid::Uuid::new_v4();
+        let victim=json!({"tool":"chrome","delivery_id":uuid::Uuid::new_v4(),
+            "caller":{"sid":"S-1-5-21-1001","user":"victim-display"}});
+        remember_delivery(&mut state,&victim,&event,id).unwrap();
+        for index in 0..4097 {
+            let request=json!({"tool":if index%2==0 {"chrome"} else {"edge"},"delivery_id":uuid::Uuid::new_v4(),
+                "caller":{"sid":"S-1-5-21-1000","user":format!("renamed-{index}")}});
+            // Each prior event has already been ACKed: no queued row is needed
+            // to preserve the receipt's quota identity across restart.
+            remember_delivery(&mut state,&request,&event,uuid::Uuid::new_v4()).unwrap();
+        }
+        assert_eq!(state.detection.event_receipts.len(),crate::browser_broker::PRINCIPAL_EVENTS+1);
+        assert!(state.shadow_queue.is_empty() && state.browser_queue_owners.is_empty());
+        let home=tempfile::tempdir().unwrap();
+        { let store=crate::Store::open(home.path()).unwrap();store.save(&state).unwrap(); }
+        let state=crate::Store::open(home.path()).unwrap().load().unwrap();
+        assert_eq!(delivery_receipt(&state,&victim,&event).unwrap(),Some(id));
+        assert_eq!(completed_delivery(&state,&victim).unwrap(),Some(id));
+    }
+
+    #[test]
+    fn unowned_legacy_display_digest_cannot_manufacture_kernel_ownership() {
+        let mut state=State::default();
+        let event=json!({"kind":"presence"});let id=uuid::Uuid::new_v4();
+        let request=json!({"tool":"chrome","delivery_id":uuid::Uuid::new_v4(),
+            "caller":{"sid":"S-1-5-21-1000","user":"legacy-name"}});
+        let (key,hash)=legacy_delivery_key(&state,&request,&event).unwrap().unwrap();
+        state.detection.event_receipts.push(json!([key,hash,id]));
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),None);
+        assert_eq!(completed_delivery(&state,&request).unwrap(),None);
+        assert!(state.browser_queue_owners.is_empty());
+        let next=uuid::Uuid::new_v4();remember_delivery(&mut state,&request,&event,next).unwrap();
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),Some(next));
     }
 }

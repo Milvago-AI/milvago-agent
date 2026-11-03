@@ -209,13 +209,18 @@ impl Collector {
         }
         let state = &self.state;
         let persist = |ledger: &Ledger| state.write("authority.json", &serde_json::to_vec(ledger)?);
-        let decision = if request.collect {
-            self.authority
-                .authorize(stream, &request.authorization, persist)?
-        } else {
-            self.authority
-                .refresh(stream, &request.authorization, persist)?
-        };
+        let observer = &mut self.observer;
+        let active = &mut self.active;
+        let decision = self.authority.authorize_with_revocation(
+            stream, &request.authorization, request.collect,
+            |policy| {
+                let keep = policy.configuration.network
+                    && active.as_ref().is_some_and(|(old, deadline)| old.expires_at>Utc::now() && *deadline>Instant::now() && policy.expires_at>=old.expires_at)
+                    && observer.as_ref().is_some_and(|observer| observer.can_keep(
+                        &policy.catalog, policy.revision, policy.expires_at.timestamp()));
+                if !keep { *observer = None; *active = None; }
+            }, persist,
+        )?;
         let (policy, status, retry, snapshot) = match decision {
             Decision::Disabled { policy } => {
                 self.observer = None;

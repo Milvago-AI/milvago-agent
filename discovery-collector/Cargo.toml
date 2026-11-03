@@ -7,10 +7,15 @@ license = "Apache-2.0"
 
 [features]
 runtime-qualification = []
+http-qualification = []
 
 [[test]]
 name = "native_runtime"
 required-features = ["runtime-qualification"]
+
+[[test]]
+name = "native_http"
+required-features = ["http-qualification"]
 
 [dependencies]
 milvago-discovery-engine = { path = "../discovery-engine" }

@@ -14,6 +14,15 @@ use windows_sys::Win32::{
     System::{JobObjects::*, RemoteDesktop::*, Threading::*},
 };
 type Result<T> = std::result::Result<T, &'static str>;
+#[cfg(feature = "windows-qualification")]
+std::thread_local! {
+    static PROBE_EXIT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "windows-qualification")]
+pub(super) fn take_probe_exit() -> Option<u32> {
+    PROBE_EXIT.with(|value| value.take())
+}
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn CreatePipe(
@@ -231,6 +240,8 @@ fn launch_with_input(
     budget: &Budget<'_>,
     input: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
+    #[cfg(feature = "windows-qualification")]
+    PROBE_EXIT.with(|value| value.set(None));
     budget.check()?;
     request.validate()?;
     if token_identity(token.0)? != expected {
@@ -275,6 +286,10 @@ fn launch_with_input(
     );
     if let Some(section) = &section {
         environment.insert("MILVAGO_OBSERVER_INPUT".into(), section.descriptor());
+    }
+    if matches!(request, Request::DesktopInventory { .. }) {
+        // Resolve from the selected OS token, never an ambient user's environment.
+        environment.extend(crate::discovery_system::desktop_profile_environment(token.0)?);
     }
     let mut block = Vec::new();
     for (key, value) in environment {
@@ -430,11 +445,35 @@ fn launch_with_input(
         match unsafe { WaitForSingleObject(process.process.0, 0) } {
             WAIT_OBJECT_0 => {
                 let mut code = 1;
-                if unsafe { GetExitCodeProcess(process.process.0, &mut code) } == 0 || code != 0 {
+                if unsafe { GetExitCodeProcess(process.process.0, &mut code) } == 0 {
+                    return Err("guest_query_failed");
+                }
+                if code != 0 {
+                    #[cfg(feature = "windows-qualification")]
+                    {
+                    PROBE_EXIT.with(|value| value.set(Some(code)));
+                    return Err(match code {
+                        41 => "qa_desktop_tool_unavailable",
+                        42 => "qa_desktop_query_failed",
+                        43 => "qa_desktop_profile_unavailable",
+                        44 => "qa_desktop_access_denied",
+                        45 => "qa_desktop_timeout",
+                        46 => "qa_desktop_cancelled",
+                        47 => "qa_desktop_stdout_failed",
+                        48 => "qa_desktop_response_limit",
+                        49 => "qa_desktop_invalid_inventory",
+                        50 => "qa_desktop_invalid_owner",
+                        _ => "guest_query_failed",
+                    });
+                    }
+                    #[cfg(not(feature = "windows-qualification"))]
                     return Err("guest_query_failed");
                 }
                 if matches!(request, Request::Inventory {}) {
                     super::validate_inventory_owner(&output, expected)?;
+                }
+                if let Request::DesktopInventory { desktop } = request {
+                    milvago_discovery_collector::user_vm::validate(&output, Some(expected), desktop)?;
                 }
                 return Ok(output);
             }
@@ -445,7 +484,7 @@ fn launch_with_input(
 }
 
 pub(crate) fn system_query(operation: &Query, budget: &Budget<'_>) -> Option<Result<Vec<u8>>> {
-    if !matches!(operation, Query::WslUserInventory | Query::WslGuest { .. }) {
+    if !matches!(operation, Query::WslUserInventory | Query::WslGuest { .. } | Query::VirtualBox | Query::VMware) {
         return None;
     }
     let mut token = std::ptr::null_mut();
@@ -461,6 +500,17 @@ pub(crate) fn system_query(operation: &Query, budget: &Budget<'_>) -> Option<Res
     Some((|| {
         let tokens = session_tokens()?;
         match operation {
+            Query::VirtualBox | Query::VMware => {
+                // Both SDKs passed their native limited-owner SCM recipes.
+                static NEXT_VBOX: AtomicUsize = AtomicUsize::new(0);
+                static NEXT_VMWARE: AtomicUsize = AtomicUsize::new(0);
+                if tokens.is_empty() { return Err("unavailable"); }
+                let (desktop, next) = if matches!(operation, Query::VirtualBox) {
+                    (milvago_discovery_collector::user_vm::Desktop::VirtualBox, &NEXT_VBOX)
+                } else { (milvago_discovery_collector::user_vm::Desktop::Vmware, &NEXT_VMWARE) };
+                let (sid, token) = &tokens[next.fetch_add(1, Ordering::Relaxed) % tokens.len()];
+                launch(token, sid, Request::DesktopInventory { desktop }, budget)
+            }
             Query::WslUserInventory => {
                 static NEXT: AtomicUsize = AtomicUsize::new(0);
                 if tokens.is_empty() {

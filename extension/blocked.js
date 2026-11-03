@@ -4,4 +4,5 @@ const TEXT={fr:['Service bloqué','Ce service est bloqué par votre organisation
 const language=(navigator.language||'fr').slice(0,2).toLowerCase(),[title,detail]=TEXT[language]||TEXT.fr;
 document.documentElement.lang=language in TEXT?language:'fr';document.title=title;
 document.getElementById('title').textContent=title;document.getElementById('detail').textContent=detail;
+document.getElementById('decision-label').textContent=({fr:'Bloqué',en:'Blocked',es:'Bloqueado',pt:'Bloqueado'})[language]||'Bloqué';
 document.getElementById('service').textContent=(new URLSearchParams(location.search).get('service')||'').slice(0,253);

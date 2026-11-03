@@ -110,10 +110,28 @@ fn program(names: &[&str]) -> Result<(PathBuf, Lease), &'static str> {
 
 fn query(query: Query) -> Result<(Command, Lease), &'static str> {
     #[cfg(windows)]
+    let desktop_inventory = matches!(query, Query::VirtualBox | Query::VMware);
+    // Signatures supply paths, never a program or guest shell command.
+    let (query, mut http) = match query {
+        Query::VirtualBoxGuestHttp { vm_id, username, credential_file, paths, offset } => {
+            if !milvago_discovery_collector::guest_http::valid_paths(&paths) {
+                return Err("invalid_guest_http_request");
+            }
+            (Query::VirtualBoxGuest { vm_id, username, credential_file }, Some((paths, offset)))
+        }
+        Query::LibvirtGuestStartHttp { vm_id, paths, offset } => {
+            if !milvago_discovery_collector::guest_http::valid_paths(&paths) {
+                return Err("invalid_guest_http_request");
+            }
+            (Query::LibvirtGuestStart(vm_id), Some((paths, offset)))
+        }
+        query => (query, None),
+    };
+    #[cfg(windows)]
     let mut guest_input: Option<String> = None;
     #[cfg(windows)]
     let mut credential_guard = None;
-    let (name, args): (&str, Vec<String>) = match query {
+    let (name, mut args): (&str, Vec<String>) = match query {
         Query::VirtualBox => ("vbox", vec!["list".into(), "--long".into(), "vms".into()]),
         Query::VMware => ("vmrun", vec!["list".into()]),
         Query::Libvirt => (
@@ -203,7 +221,7 @@ fn query(query: Query) -> Result<(Command, Lease), &'static str> {
             if id.len() != 36 || uuid::Uuid::parse_str(&id).is_err() {
                 return Err("invalid_vm_identity");
             }
-            let call=serde_json::json!({"execute":"guest-exec","arguments":{"path":"/usr/bin/python3","arg":["-I","-S","-c",include_str!("discovery_guest_linux.py")],"capture-output":true}}).to_string();
+            let call = libvirt_guest_start_request(http.take())?;
             (
                 "virsh",
                 vec![
@@ -330,9 +348,18 @@ fn query(query: Query) -> Result<(Command, Lease), &'static str> {
                 Some(serde_json::to_string(&request).map_err(|_| "invalid_vmware_request")?);
             ("self", vec!["discovery-vmware-probe".into()])
         }
+        Query::VirtualBoxGuestHttp { .. } | Query::LibvirtGuestStartHttp { .. } => {
+            return Err("invalid_guest_http_request");
+        }
         #[cfg(not(windows))]
         _ => return Err("unavailable"),
     };
+    if let Some((paths, offset)) = http {
+        if name != "vbox" {
+            return Err("invalid_guest_http_request");
+        }
+        append_guest_http(&mut args, &paths, offset)?;
+    }
     let (path, lease) = program(&[name])?;
     #[cfg(windows)]
     let mut lease = lease;
@@ -371,7 +398,7 @@ fn query(query: Query) -> Result<(Command, Lease), &'static str> {
             .env("PATH", PathBuf::from(&windows).join("System32"))
             .env(
                 "PSModulePath",
-                PathBuf::from(windows).join("System32/WindowsPowerShell/v1.0/Modules"),
+                PathBuf::from(&windows).join("System32/WindowsPowerShell/v1.0/Modules"),
             )
             .creation_flags(0x08000000);
         // The isolated VMware helper discovers only protected installed SDKs.
@@ -380,11 +407,140 @@ fn query(query: Query) -> Result<(Command, Lease), &'static str> {
                 command.env(name, value);
             }
         }
+        if desktop_inventory {
+            // vmrun requires this even for `list`. Derive the system volume
+            // from the controlled Windows root, never the owner's home or an
+            // ambient SystemDrive override.
+            command.env("SystemDrive", desktop_system_drive(&windows)?);
+            use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::{GetCurrentProcess, OpenProcessToken}};
+            let mut token = std::ptr::null_mut();
+            if unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) } == 0 {
+                return Err("desktop_profile_unavailable");
+            }
+            let profile = desktop_profile_environment(token);
+            unsafe { CloseHandle(token); }
+            command.envs(profile?);
+        }
     }
     Ok((command, lease))
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
+fn desktop_system_drive(windows: &std::ffi::OsStr) -> Result<std::ffi::OsString, &'static str> {
+    let bytes = windows.as_encoded_bytes();
+    if bytes.len() < 4 || bytes.len() > 4096 || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':' || bytes[2] != b'\\' || bytes.contains(&0) {
+        return Err("desktop_profile_unavailable");
+    }
+    Ok(format!("{}:", char::from(bytes[0].to_ascii_uppercase())).into())
+}
+
+#[cfg(windows)]
+pub(crate) fn desktop_profile_environment(
+    token: windows_sys::Win32::Foundation::HANDLE,
+) -> Result<std::collections::BTreeMap<String, String>, &'static str> {
+    #[link(name = "userenv")]
+    unsafe extern "system" {
+        fn GetUserProfileDirectoryW(token: windows_sys::Win32::Foundation::HANDLE, directory: *mut u16, size: *mut u32) -> i32;
+    }
+    let mut profile = [0u16; 4096];
+    let mut size = profile.len() as u32;
+    if unsafe { GetUserProfileDirectoryW(token, profile.as_mut_ptr(), &mut size) } == 0
+        || size < 2 || size as usize > profile.len() || profile[size as usize - 1] != 0 {
+        return Err("desktop_profile_unavailable");
+    }
+    let profile = String::from_utf16(&profile[..size as usize - 1])
+        .map_err(|_| "desktop_profile_unavailable")?;
+    desktop_profile_values(&profile)
+}
+
+#[cfg(windows)]
+fn desktop_profile_values(profile: &str) -> Result<std::collections::BTreeMap<String, String>, &'static str> {
+    // Vendor tools need the selected account's profile, never ambient overrides.
+    let bytes = profile.as_bytes();
+    if bytes.len() < 4 || bytes.len() > 4000 || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':' || bytes[2] != b'\\'
+        || profile.chars().any(char::is_control)
+        || profile[3..].split('\\').any(|part| part.is_empty() || part == "." || part == ".."
+            || part.ends_with(['.', ' ']) || part.contains([':', '/', '*', '?', '"', '<', '>', '|'])) {
+        return Err("desktop_profile_unavailable");
+    }
+    let local = format!("{profile}\\AppData\\Local");
+    Ok([
+        ("USERPROFILE".into(), profile.into()),
+        ("APPDATA".into(), format!("{profile}\\AppData\\Roaming")),
+        ("LOCALAPPDATA".into(), local.clone()),
+        ("TEMP".into(), format!("{local}\\Temp")),
+        ("TMP".into(), format!("{local}\\Temp")),
+    ].into_iter().collect())
+}
+
+#[cfg(all(test, windows))]
+mod desktop_profile_tests {
+    use super::*;
+    #[test]
+    fn desktop_profile_environment_is_token_scoped_and_rejects_hostile_paths() {
+        for (windows, expected) in [("C:\\Windows", "C:"), ("d:\\Win dows", "D:"), ("E:\\Wíndows", "E:")] {
+            assert_eq!(desktop_system_drive(std::ffi::OsStr::new(windows)).unwrap(), std::ffi::OsString::from(expected));
+        }
+        for windows in ["", "C:", "C:\\", "C:Windows", "Windows", "C:/Windows", "\\\\server\\Windows", "\\\\?\\C:\\Windows", "C:\\Win\0dows", "1:\\Windows"] {
+            assert!(desktop_system_drive(std::ffi::OsStr::new(windows)).is_err(), "accepted invalid Windows root");
+        }
+        assert!(desktop_system_drive(std::ffi::OsStr::new(&format!("C:\\{}", "x".repeat(4094)))).is_err());
+        let expected = desktop_profile_values("C:\\Users\\Synthetic User").unwrap();
+        assert_eq!(expected.len(), 5);
+        assert_eq!(expected["USERPROFILE"], "C:\\Users\\Synthetic User");
+        assert_eq!(expected["APPDATA"], "C:\\Users\\Synthetic User\\AppData\\Roaming");
+        assert_eq!(expected["LOCALAPPDATA"], "C:\\Users\\Synthetic User\\AppData\\Local");
+        assert_eq!(expected["TEMP"], "C:\\Users\\Synthetic User\\AppData\\Local\\Temp");
+        assert_eq!(expected["TMP"], expected["TEMP"]);
+        assert!(desktop_profile_values("D:\\Users\\Équipe").is_ok());
+        for path in ["", "C:", "C:\\", "relative", "\\\\server\\share", "\\\\?\\C:\\Users\\a",
+            "C:\\Users\\..\\other", "C:\\Users\\.\\other", "C:\\Users\\a:stream", "C:\\Users/a",
+            "C:\\Users\\a\\", "C:\\Users\\a.", "C:\\Users\\a ", "C:\\Users\\a\n"] {
+            assert!(desktop_profile_values(path).is_err(), "accepted invalid profile");
+        }
+        assert!(desktop_profile_values(&format!("C:\\{}", "x".repeat(4000))).is_err());
+        assert!(desktop_profile_environment(std::ptr::null_mut()).is_err());
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::{GetCurrentProcess, OpenProcessToken, GetProcessHandleCount}};
+        let mut before = 0;
+        assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut before) }, 0);
+        for _ in 0..32 {
+            let mut token = std::ptr::null_mut();
+            assert_ne!(unsafe { OpenProcessToken(GetCurrentProcess(), 8, &mut token) }, 0);
+            let actual = desktop_profile_environment(token);
+            unsafe { CloseHandle(token); }
+            let actual = actual.unwrap();
+            assert_eq!(actual, desktop_profile_values(&actual["USERPROFILE"]).unwrap());
+        }
+        let mut after = 0;
+        assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut after) }, 0);
+        assert!(after <= before + 2, "profile queries leaked handles");
+    }
+}
+
+fn libvirt_guest_start_request(http: Option<(Vec<String>, u32)>) -> Result<String, &'static str> {
+    let mut args = vec!["-I".into(), "-S".into(), "-c".into(), include_str!("discovery_guest_linux.py").into()];
+    if let Some((paths, offset)) = http {
+        append_guest_http(&mut args, &paths, offset)?;
+    }
+    Ok(serde_json::json!({"execute":"guest-exec","arguments":{
+        "path":"/usr/bin/python3","arg":args,"capture-output":true
+    }}).to_string())
+}
+
+fn append_guest_http(args: &mut Vec<String>, paths: &[String], offset: u32) -> Result<(), &'static str> {
+    if !milvago_discovery_collector::guest_http::valid_paths(paths)
+        || args.last().is_none_or(|probe| probe != include_str!("discovery_guest_linux.py"))
+    {
+        return Err("invalid_guest_http_request");
+    }
+    args.last_mut().ok_or("invalid_guest_http_request")?
+        .push_str(include_str!("discovery_guest_http_linux.py"));
+    args.push(serde_json::json!({"paths":paths,"offset":offset}).to_string());
+    Ok(())
+}
+
 fn virtualbox_guest_arguments(
     vm: &str,
     user: &str,
@@ -425,6 +581,42 @@ fn virtualbox_guest_arguments(
 #[cfg(test)]
 mod guest_command_tests {
     use super::*;
+    #[test]
+    fn qga_http_request_retains_the_fixed_program_and_carries_paths_only_as_data() {
+        let legacy: serde_json::Value = serde_json::from_str(&libvirt_guest_start_request(None).unwrap()).unwrap();
+        assert_eq!(legacy["execute"], "guest-exec");
+        assert_eq!(legacy["arguments"]["path"], "/usr/bin/python3");
+        assert_eq!(legacy["arguments"]["capture-output"], true);
+        assert_eq!(legacy["arguments"]["arg"], serde_json::json!(["-I", "-S", "-c", include_str!("discovery_guest_linux.py")]));
+        let current: serde_json::Value = serde_json::from_str(&libvirt_guest_start_request(Some((vec!["/".into(), "/health".into()], 7))).unwrap()).unwrap();
+        assert_eq!(current["arguments"]["path"], legacy["arguments"]["path"]);
+        let args = current["arguments"]["arg"].as_array().unwrap();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[3], format!("{}{}", include_str!("discovery_guest_linux.py"), include_str!("discovery_guest_http_linux.py")));
+        let request: serde_json::Value = serde_json::from_str(args[4].as_str().unwrap()).unwrap();
+        assert_eq!(request, serde_json::json!({"paths":["/","/health"],"offset":7}));
+        assert!(current["arguments"].get("env").is_none());
+        assert!(current["arguments"].get("input-data").is_none());
+        for paths in [vec![], vec!["//remote/".into()], vec!["/../secret".into()], vec!["data:image/png".into()]] {
+            assert!(libvirt_guest_start_request(Some((paths, 0))).is_err());
+        }
+    }
+    #[test]
+    fn guest_http_paths_are_data_after_a_fixed_probe_and_invalid_paths_do_not_mutate_it() {
+        let original = vec!["-I".into(), "-S".into(), "-c".into(), include_str!("discovery_guest_linux.py").into()];
+        let mut args = original.clone();
+        append_guest_http(&mut args, &["/".into(), "/api/tags".into()], u32::MAX).unwrap();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[3], format!("{}{}", include_str!("discovery_guest_linux.py"), include_str!("discovery_guest_http_linux.py")));
+        let request: serde_json::Value = serde_json::from_str(&args[4]).unwrap();
+        assert_eq!(request, serde_json::json!({"paths":["/","/api/tags"],"offset":u32::MAX}));
+        for paths in [vec![], vec!["//host/".into()], vec!["/../secret".into()], vec!["/".into(), "/".into()], vec!["data:image/png".into()]] {
+            let mut args = original.clone();
+            assert!(append_guest_http(&mut args, &paths, 0).is_err());
+            assert_eq!(args, original);
+        }
+        assert!(append_guest_http(&mut vec!["arbitrary".into()], &["/".into()], 0).is_err());
+    }
     #[test]
     fn only_explicit_guest_authentication_errors_use_the_sticky_failure_protocol() {
         assert_eq!(
@@ -608,10 +800,22 @@ fn guest_diagnostic(
 }
 
 impl Reader for NativeReader {
+    fn owner_inventory(
+        &self,
+        desktop: milvago_discovery_collector::user_vm::Desktop,
+        budget: &Budget<'_>,
+    ) -> Option<Result<Vec<u8>, &'static str>> {
+        #[cfg(windows)]
+        { crate::discovery_wsl::system_query(&desktop.query(), budget) }
+        #[cfg(not(windows))]
+        { let _ = (desktop, budget); None }
+    }
+
     fn read(&self, operation: Query, budget: &Budget<'_>) -> Result<Vec<u8>, &'static str> {
         budget.check()?;
         #[cfg(windows)]
-        if let Some(result) = crate::discovery_wsl::system_query(&operation, budget) {
+        if !matches!(operation, Query::VirtualBox | Query::VMware)
+            && let Some(result) = crate::discovery_wsl::system_query(&operation, budget) {
             return result;
         }
         #[cfg(windows)]
@@ -620,7 +824,7 @@ impl Reader for NativeReader {
         } else {
             None
         };
-        let vbox = matches!(&operation, Query::VirtualBoxGuest { .. });
+        let vbox = matches!(&operation, Query::VirtualBoxGuest { .. } | Query::VirtualBoxGuestHttp { .. });
         let structured = matches!(
             &operation,
             Query::HyperVGuest { .. } | Query::VMwareGuest { .. }

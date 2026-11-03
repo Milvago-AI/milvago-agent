@@ -3,6 +3,7 @@
 import json
 import os
 import signal
+import sys
 import time
 
 signal.alarm(5)
@@ -36,7 +37,13 @@ for entry in os.scandir('/proc'):
             with open(path + '/cmdline', 'rb') as stream:
                 arguments = stream.read(8193)
             if len(arguments) <= 8192:
-                arguments = arguments.split(b'\0')[1:3]
+                arguments = arguments.split(b'\0')
+                if executable in ('node', 'nodejs') and arguments[0] in (b'openclaw', b'openclaw-gateway'):
+                    if not any(arguments[1:]):
+                        tokens.append('openclaw')
+                    arguments = []
+                else:
+                    arguments = arguments[1:3]
                 first = arguments[0].decode('utf-8', errors='strict') if arguments else ''
                 module = first == '-m' and executable.startswith('python')
                 value = arguments[1].decode('utf-8', errors='strict') if module and len(arguments) > 1 else first
@@ -59,7 +66,18 @@ for entry in os.scandir('/proc'):
         continue
     except (OSError, ValueError, IndexError, UnicodeError):
         complete = False
-payload = json.dumps(dict(boot=boot, processes=rows, complete=complete), separators=(',', ':'))
-if len(payload.encode('utf-8')) > 1024 * 1024:
-    raise RuntimeError('projection_limit')
-print(payload)
+payload = dict(boot=boot, processes=rows, complete=complete)
+
+
+def emit(payload):
+    encoded = json.dumps(payload, separators=(',', ':'))
+    if len(encoded.encode('utf-8')) > 1024 * 1024 and 'http' in payload:
+        payload['http'] = dict(complete=False, responses=[])
+        encoded = json.dumps(payload, separators=(',', ':'))
+    if len(encoded.encode('utf-8')) > 1024 * 1024:
+        raise RuntimeError('projection_limit')
+    print(encoded)
+
+
+if len(sys.argv) == 1:
+    emit(payload)

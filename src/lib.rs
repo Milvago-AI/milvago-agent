@@ -65,8 +65,13 @@ pub mod shadow;
 mod shadow_tests;
 pub mod update;
 pub mod update_host;
+#[cfg(any(windows, test))]
+pub(crate) mod cache_replay;
+#[cfg(any(windows, test))]
+pub(crate) mod cache_replay_authority;
 pub mod browser_cache;
 pub mod browser_broker;
+mod browser_queue_quota;
 #[cfg(windows)]
 pub mod cache_windows;
 #[cfg(windows)]
@@ -182,6 +187,9 @@ pub struct State {
     pub browsers: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub shadow_queue: Vec<shadow::ShadowEvent>,
+    /// Internal kernel-principal quota ownership, never a telemetry identity.
+    #[serde(default)]
+    pub browser_queue_owners: std::collections::BTreeMap<Uuid, String>,
     /// Completions waiting for the server: what an outgoing request said about an
     /// exchange the server has already accepted. An event still in `shadow_queue` is
     /// completed there instead, so nothing here can outrun the event it names.
@@ -561,9 +569,11 @@ impl Store {
                 },
             )
             .map_err(|_| "state integrity check failed")?;
-        let parsed = serde_json::from_slice(&plain);
+        let parsed: std::result::Result<State, _> = serde_json::from_slice(&plain);
         plain.zeroize();
-        Ok(parsed?)
+        let mut state = parsed?;
+        browser_queue_quota::prune(&mut state);
+        Ok(state)
     }
     pub fn save(&self, state: &State) -> Result<()> {
         let mut plain = serde_json::to_vec(state)?;

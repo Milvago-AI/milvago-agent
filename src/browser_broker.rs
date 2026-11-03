@@ -16,6 +16,10 @@ pub fn capabilities() -> Value {
 }
 pub const MAX_EVENTS: usize = 1000;
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+// Only the actual serialized true markers receive this bounded format allowance.
+const TRANSFER_MARKER_BYTES:usize = br#","transfer_started":true"#.len();
+pub(crate) const MAX_TRANSFER_FORMAT_BYTES:usize=MAX_EVENTS*TRANSFER_MARKER_BYTES;
+fn transfer_not_started(value:&bool)->bool{!*value}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -269,6 +273,9 @@ pub struct Pending {
     pub sequence: u64,
     pub generation: u64,
     pub event: ShadowEvent,
+    /// Durable before the first transfer: a missing ACK does not prove local ownership.
+    #[serde(default, skip_serializing_if = "transfer_not_started")]
+    pub transfer_started: bool,
     /// The OS principal that admitted it, for its share of the machine-wide queue.
     #[serde(default)]
     pub principal: String,
@@ -367,6 +374,7 @@ impl Queue {
         let Some(index) = self.pending.iter().position(|p| p.event.id == completion.id) else {
             return false;
         };
+        if self.pending[index].principal.is_empty()||self.pending[index].transfer_started { return false; }
         // A completion that would take the queue past its bounds is not placed: kept in
         // memory, it would fail every later save and wedge the queue for all accounts.
         let before = self.pending[index].event.clone();
@@ -398,9 +406,13 @@ impl Queue {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        if self.pending.len()>MAX_EVENTS||self.health.len()>MAX_EVENTS||self.pending.len().checked_add(self.health.len()).is_none_or(|count|count>MAX_EVENTS){
+            return Err("browser queue invalid".into());
+        }
+        let marker_bytes=self.pending.iter().filter(|pending|pending.transfer_started).count().saturating_mul(TRANSFER_MARKER_BYTES).min(MAX_TRANSFER_FORMAT_BYTES);
         if self.len() > MAX_EVENTS
             || self.receipts.len() > MAX_EVENTS
-            || crate::shadow::serialized_size(self)? > MAX_BYTES
+            || crate::shadow::serialized_size(self)? > MAX_BYTES.saturating_add(marker_bytes)
             || self
                 .pending
                 .iter()
@@ -499,6 +511,7 @@ impl Queue {
             sequence,
             generation: journal.generation,
             event,
+            transfer_started:false,
             principal: parsed.principal.clone(),
         });
         next.keep_receipt(Receipt { key, hash, id, principal: parsed.principal.clone() });
@@ -684,6 +697,7 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         });
         return Ok(json!({"ok":true,"durable":true,"id":id}));
     }
+    let owner = crate::browser_queue_quota::broker_owner(request)?;
     let mut event: ShadowEvent = serde_json::from_value(request["event"].clone())?;
     *changed |= crate::shadow::discard_unpermitted(state);
     if let Some(receipt) = &state.browser_broker_receipt {
@@ -745,6 +759,9 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         prepared.dlp=event.dlp.clone();
         let size=crate::shadow::fit_event(&mut prepared)?;
         crate::config::current().queue.check(state,1,size)?;
+        if state.shadow_queue.iter().any(|queued| queued.id == id) {
+            return Err("browser queue identity collision".into());
+        }
         let generated=prepared.id;
         state.shadow_queue.push(prepared);
         let received = state
@@ -757,8 +774,8 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         received.user = user;
         received.policy_revision = revision;
         // OS attribution is added after parsing; include it in the admission budget.
-        if let Err(error) = crate::config::current().queue.check(state, 0, 0) {
-            state.shadow_queue.pop();
+        if let Err(error) = crate::browser_queue_quota::claim(state, id, owner) {
+            crate::browser_queue_quota::rollback(state, id);
             return Err(error);
         }
     }

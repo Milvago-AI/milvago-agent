@@ -218,12 +218,17 @@ pub fn native_message(home: &std::path::Path, request: Value) -> Result<Value> {
         #[cfg(feature = "model-control")]
         "enforcement" => enterprise::enforcement(&request, store, state),
         "event_v2" => {
+            let owner = crate::browser_queue_quota::caller_owner(&request)?;
             let event = request.get("event").ok_or("missing event")?.clone();
             if let Some(id)=crate::detection::delivery_receipt(&state,&request,&event)? {
                 return Ok(json!({"ok":true,"id":id,"delivered":0}));
             }
             let queued = crate::shadow::enqueue_browser(&mut state, event.clone()).and_then(|id| {
                 attribute(&mut state, id, caller_user(&request))?;
+                if let Err(error) = crate::browser_queue_quota::claim(&mut state, id, owner) {
+                    crate::browser_queue_quota::rollback(&mut state, id);
+                    return Err(error);
+                }
                 Ok(id)
             });
             // A refused event changes nothing worth a rewrite of the whole store.
