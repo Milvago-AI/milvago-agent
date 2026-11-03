@@ -35,6 +35,33 @@ class NativeHosts(unittest.TestCase):
     def register(self):
         registration.register(self.chromium, self.firefox, "/opt/milvago-commercial/milvago-commercial-bridge", root=self.root)
 
+    def _verify_standard_user_access(self, paths):
+        """Assertions run after dropping privileges; the caller reports failure to the parent."""
+        for path in paths:
+            document = json.loads(path.read_text())
+            assert document["path"] == "/opt/milvago-commercial/milvago-commercial-bridge"
+            assert document.get("allowed_extensions", document.get("allowed_origins")) in [
+                [self.firefox], ["chrome-extension://" + self.chromium + "/"],
+            ]
+            try:
+                with path.open("wb"):
+                    pass
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("Standard user could replace the manifest")
+        for folder in registration.MANAGED:
+            path = self.root / folder / (self.firefox + ".json")
+            value = json.loads(path.read_text())
+            assert value["name"] == self.firefox and value["type"] == "storage" and value["data"] == {}
+            try:
+                with path.open("wb"):
+                    pass
+            except PermissionError:
+                pass
+            else:
+                raise AssertionError("Standard user could change managed authority")
+
     def test_standard_user_can_read_but_not_change_the_installed_manifests(self):
         self.register()
         paths = [self.root / folder / registration.NAME for folder in registration.CHROMIUM + registration.FIREFOX]
@@ -46,30 +73,7 @@ class NativeHosts(unittest.TestCase):
                 os.setgroups([])
                 os.setgid(1001)
                 os.setuid(1001)
-                for path in paths:
-                    document = json.loads(path.read_text())
-                    assert document["path"] == "/opt/milvago-commercial/milvago-commercial-bridge"
-                    assert document.get("allowed_extensions", document.get("allowed_origins")) in [
-                        [self.firefox], ["chrome-extension://" + self.chromium + "/"],
-                    ]
-                    try:
-                        with path.open("wb"):
-                            pass
-                    except PermissionError:
-                        pass
-                    else:
-                        raise AssertionError("Standard user could replace the manifest")
-                for folder in registration.MANAGED:
-                    path = self.root / folder / (self.firefox + ".json")
-                    value = json.loads(path.read_text())
-                    assert value["name"] == self.firefox and value["type"] == "storage" and value["data"] == {}
-                    try:
-                        with path.open("wb"):
-                            pass
-                    except PermissionError:
-                        pass
-                    else:
-                        raise AssertionError("Standard user could change managed authority")
+                self._verify_standard_user_access(paths)
                 os.write(write, b"passed")
                 os._exit(0)
             except BaseException:

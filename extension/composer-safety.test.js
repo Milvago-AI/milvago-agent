@@ -64,7 +64,7 @@ test('an image alone in the composer is not a text send and is not swallowed',as
  try{await delay(0);const click=trusted('click',p.button);await p.controller.handle(click);assert.equal(click.prevented,false);assert.deepEqual(p.inspected(),[]);}finally{p.close();}
 });
 test('control characters and binary-looking text reach inspection unchanged',async()=>{
- const odd='a\u0000b‮c�😀';
+ const odd='a\u0000b\u202ec�😀';
  const p=page(`${box('')}${SEND}`,approve);
  try{await delay(0);p.doc.querySelector('[role="textbox"]').textContent=odd;await p.controller.handle(trusted('click',p.button));assert.deepEqual(p.inspected(),[odd]);}finally{p.close();}
 });
