@@ -713,6 +713,8 @@ fn every_local_event_preparation_branch_suspends_outside_authority() {
         let (mut target, mut response, mut policy, boot) = if case < 2 { memory_authority() } else { memory_dlp_authority() };
         if case == 3 {
             policy.config["dlp"]["rules"][0]["consequence"] = json!({"action":"block"});
+            // A block has no interactive transformation to review.
+            policy.config["dlp"]["rules"][0]["review"] = json!(false);
             policy.revision += 1; policy.issued_at += Duration::milliseconds(1); policy.expires_at += Duration::milliseconds(1);
             let key = SigningKey::from_bytes(&[73;32]); let envelope = signed(&key,&policy);
             cache::prepare(&mut target.stored.journal,&target.stored.keys,&envelope,&live_catalog(&key)).unwrap();
@@ -958,13 +960,14 @@ fn full_valid_data_budget_can_persist_marker_and_drain_without_metadata_headroom
 fn local_pending_quota_refusal_never_forwards_before_handoff_and_absent_row_still_forwards(){
     use std::sync::{Arc,Mutex};use std::cell::Cell;
     let(mut target,_,policy,boot)=memory_authority();let delivery=uuid::Uuid::new_v4();
-    for index in 0..128{
+    // Keep each prompt within the receiver limit while saturating total custody.
+    for index in 0..256{
         let mut parsed=event_request(if index==0{delivery}else{uuid::Uuid::new_v4()});
-        parsed.principal=format!("S-1-5-21-1-2-3-{}",1001+index/32);
+        parsed.principal=format!("S-1-5-21-1-2-3-{}",1001+index/64);
         target.stored.queue.admit(&target.stored.journal,&policy,&parsed).unwrap();
     }
-    for row in &mut target.stored.queue.pending{row.event.prompt=Some(String::new());row.event.characters=65536;}
-    let spare=broker::MAX_BYTES-shadow::serialized_size(&target.stored.queue).unwrap();let part=spare/128;let rest=spare%128;assert!(part+1<=65536);
+    for row in &mut target.stored.queue.pending{row.event.prompt=Some(String::new());row.event.characters=32768;}
+    let spare=broker::MAX_BYTES-shadow::serialized_size(&target.stored.queue).unwrap();let part=spare/256;let rest=spare%256;assert!(part+1<=32768);
     for(index,row)in target.stored.queue.pending.iter_mut().enumerate(){let length=part+usize::from(index<rest);row.event.prompt=Some("x".repeat(length));row.event.characters=length.try_into().unwrap();}
     assert_eq!(shadow::serialized_size(&target.stored.queue).unwrap(),broker::MAX_BYTES);target.stored.queue.validate().unwrap();
     let id=target.stored.queue.pending[0].event.id;assert!(!target.stored.queue.pending[0].transfer_started);
@@ -1004,6 +1007,7 @@ fn local_pending_quota_refusal_never_forwards_before_handoff_and_absent_row_stil
         let packet=json!({"op":"broker_event","caller":{"system":true},"installation":target.stored.journal.pin.installation,
             "sequence":pending.sequence,"event":pending.event,"quota_principal":pending.principal});
         let ack=crate::native::native_message(home.path(),packet).unwrap();assert_eq!(ack["durable"],true);assert_eq!(ack["id"],json!(id));
+        {let store=crate::Store::open(home.path()).unwrap();let state=store.load().unwrap();assert!(state.shadow_queue.iter().any(|event|event.id==id),"handoff must retain the valid event before remote completion");}
         target.stored.queue.pending.clear();target.save().unwrap();}
     let parsed=complete(json!({"body_bytes":42}));let deadline=Instant::now()+std::time::Duration::from_secs(10);
     let reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed,boot,deadline},deadline,
