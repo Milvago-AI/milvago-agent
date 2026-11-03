@@ -78,6 +78,9 @@ impl Fixture {
                 requests.fetch_add(1, Ordering::AcqRel);
                 if let Some(cancel) = &cancel {
                     cancel.store(true, Ordering::Release);
+                    // Cancellation can close the client before any response is written.
+                    // End this fixture connection without racing a write against that close.
+                    continue;
                 }
                 let line = std::str::from_utf8(&input).unwrap().lines().next().unwrap();
                 let body = if line.starts_with("GET /info ") {
