@@ -133,3 +133,20 @@ test('a Community seal drops platform blocks and still seals covered services',a
  assert.equal(storage.seal_failed,false,'the seal holds');
  assert.deepEqual(rules.map(r=>r.id).sort((a,b)=>a-b),[20000,20001]);
 });
+
+
+test('a closed popup refresh response cannot reject the worker or revoke a live policy',async t=>{
+ t.after(()=>{delete globalThis.chrome;});
+ const bridge=managedBridge(policyHandlers),storage={};let listener;
+ globalThis.chrome=fakeChrome(bridge,storage,{onMessage:fn=>{listener=fn;}});
+ await import('./background.js?case=closed-refresh-response');
+ await settled(storage);
+ assert.equal(storage.status?.connected,true);
+ let attempts=0;
+ assert.equal(listener({type:'refresh'},{},()=>{attempts++;throw new Error('synthetic popup port closed');}),true);
+ const until=Date.now()+10000;while(!attempts&&Date.now()<until){await new Promise(resolve=>setTimeout(resolve,5));}
+ for(let i=0;i<5;i++){await new Promise(resolve=>setImmediate(resolve));}
+ assert.ok(attempts>0,'the worker actually attempted the refresh reply');
+ assert.equal(storage.status?.connected,true,'a closed popup is not an authorization failure');
+ // node:test also fails this case if the rejected response escapes as unhandledRejection.
+});

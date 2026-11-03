@@ -801,7 +801,7 @@ api.runtime.onMessage.addListener((message,sender,respond)=>{
  // The content script receives the catalog already filtered by this edition
  // (detection-runtime `cover`), never the broker's raw payload.
  if(message?.type==='catalog'&&sender.frameId===0&&sender.tab){respond({ok:true,catalog:detection.catalog()});return false;}
- if(message?.type==='refresh'&&!sender.tab){refresh().then(()=>respond({ok:authorized()}));return true;}
+ if(message?.type==='refresh'&&!sender.tab){void refresh().then(()=>respond({ok:authorized()})).catch(()=>{try{respond({ok:false});}catch{/* A popup closed before its refresh reply. */}});return true;}
  const provider=sender.frameId===0&&sender.tab?trustedProvider(sender.url):null;if(!provider){respond({ok:false});return false;}
  (async()=>{const active=await currentPolicy();
   if(message?.type==='policy'){return {ok:true,policy:active,tool};}

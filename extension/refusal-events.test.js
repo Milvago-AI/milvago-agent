@@ -10,7 +10,7 @@ await import('./adapters.js');await import('./capture.js');
 const A=globalThis.MilvagoAdapters;
 const policy={version:3,revision:4,expires_at:'2099-01-01T00:00:00Z',config:{collection:{enabled:true,store_content:false,store_file_names:true},services:[{id:'chatgpt',enabled:true,mode:'observe',domains:['chatgpt.com']}],model_access:[]}};
 
-function page(inspect){
+function page(inspect,eventReply){
  const dom=new JSDOM('<form><textarea id="mobile-composer-prompt"></textarea><button type="submit">Send</button><input type="file"></form>',{url:'https://chatgpt.com/'}),doc=dom.window.document;
  Object.defineProperty(dom.window.crypto,'subtle',{value:webcrypto.subtle});
  doc.documentElement.lang='fr';
@@ -19,7 +19,7 @@ function page(inspect){
  dom.window.Element.prototype.attachShadow=function(init){const root=attach.call(this,{...init,mode:'open'});shadows.push(root);return root;};
  const controller=globalThis.MilvagoCapture.start(doc,dom.window.location,async msg=>{
   if(msg.type==='policy'){return {ok:true,policy};}if(msg.type==='inspect'){return inspect(msg);}
-  if(msg.type==='event'){events.push(msg.event);return {ok:true};}return {ok:true};
+  if(msg.type==='event'){events.push(msg.event);return eventReply?eventReply(msg):{ok:true};}return {ok:true};
  });
  return {dom,doc,controller,events,get notices(){return shadows.map(s=>s.textContent);},close(){controller.dispose();dom.window.close();}};
 }
@@ -72,4 +72,28 @@ test('a DLP upload refusal already journaled by the broker is not duplicated by 
   await new Promise(r=>setImmediate(r));assert.equal(p.events.filter(e=>e.action==='blocked').length,0);
   assert.ok(p.notices.some(text=>text.includes('Fichier refusé')));
  }finally{p.close();}
+});
+
+
+test('blocked and redirected notices do not wait for best effort recording, including rejection',async()=>{
+ for(const action of ['block','redirect']){
+  let rejectDelivery;
+  const delivery=new Promise((_,reject)=>{rejectDelivery=reject;});
+  delivery.catch(()=>{}); // The fixture may dispose before an event subscribes.
+  let offered=false;
+  const p=page(()=>({ok:true,action,text:'x',labels:[],reason:'Synthetic refusal',redirect_url:'https://synthetic.example/'}),message=>{
+   if(message.event.action===(action==='block'?'blocked':'redirected')){offered=true;return delivery;}return {ok:true};
+  });
+  try{
+   await new Promise(resolve=>setImmediate(resolve));
+   await A.write(p.doc.querySelector('textarea'),'Synthetic blocked content');
+   await p.controller.handle({type:'click',target:p.doc.querySelector('button'),isTrusted:true,preventDefault(){},stopImmediatePropagation(){}});
+   assert.ok(p.notices.some(text=>text.includes(action==='block'?'Envoi bloqué':'Service autorisé')),'the notice is visible before delivery resolves');
+   const until=Date.now()+2000;while(!offered&&Date.now()<until){await new Promise(resolve=>setTimeout(resolve,5));}
+   assert.equal(offered,true,'the best effort record was actually attempted');
+   rejectDelivery(new Error('synthetic observation transport refusal'));
+   for(let i=0;i<5;i++){await new Promise(resolve=>setImmediate(resolve));}
+   assert.ok(p.notices.some(text=>text.includes(action==='block'?'Envoi bloqué':'Service autorisé')),'delivery failure does not dismiss the refusal');
+  }finally{rejectDelivery(new Error('fixture disposed'));p.close();}
+ }
 });

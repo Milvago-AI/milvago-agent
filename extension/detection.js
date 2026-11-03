@@ -588,7 +588,8 @@ function proseStrings(body){
 function draftEndpoint(details,url){
  const page=globalThis.MilvagoAdapters?.resolve(details.initiator||details.originUrl||details.documentUrl||'');
  if(!page?.drafts?.length||!details.requestBody){return null;}
- const host=hostOf(url),path=routedPath(url.pathname).toLowerCase().replace(/\/+$/,'');
+ // routedPath has already collapsed every slash run, including a trailing run.
+ const host=hostOf(url),path=routedPath(url.pathname).toLowerCase().replace(/\/$/,'');
  return page.drafts.find(d=>d.host===host&&glob(d.path.toLowerCase(),path))||null;
 }
 // The last segment of each text path of a rule: the field name its text travels under.

@@ -186,7 +186,7 @@
     return !seen;
    }catch{return true;}
   }
-  function navigation(){if(!policy){return;}const context=A.context(location.href),url=context?.url;if(url===lastUrl){return;}const old=A.context(lastUrl);const newlyAssigned=correlation&&!old?.conversation_id&&context?.conversation_id;if(lastUrl&&!newlyAssigned){receipts.length=0;chipTexts.length=0;}lastUrl=url;if(!newlyAssigned){correlation=null;resetResponses();}draftEpoch++;attached.clear();draftCorrelation=null;if(!context){return;}const id=correlation;void firstNavigation(context).then(first=>{if(first&&!disposed){emit('navigation','','observed',[],id);}});}
+  function navigation(){if(!policy){return;}const context=A.context(location.href),url=context?.url;if(url===lastUrl){return;}const old=A.context(lastUrl);const newlyAssigned=correlation&&!old?.conversation_id&&context?.conversation_id;if(lastUrl&&!newlyAssigned){receipts.length=0;chipTexts.length=0;}lastUrl=url;if(!newlyAssigned){correlation=null;resetResponses();}draftEpoch++;attached.clear();draftCorrelation=null;if(!context){return;}const id=correlation;void firstNavigation(context).then(first=>first&&!disposed?emit('navigation','','observed',[],id):false).catch(()=>false);}
   // A failed poll (slow agent, slow network) is not a policy change: we
   // keep the last known one. Clearing it used to change the pending send's snapshot, which
   // then failed with "Final validation or durable recording failed." The background rejects inspect/submit anyway
@@ -259,9 +259,10 @@
     continuation=resubmitted?{form:resubmitted,editor,text,until:Date.now()+2000}:null;
    }finally{pending=false;}
   }
-  function onBlockedInspection(answer,text,labels,title='Envoi bloqué'){if(!answer.dlp_recorded){emit('prompt',text,'blocked',labels,win.crypto.randomUUID(),undefined,labels.includes('keyword')?{decision_reason:'keyword'}:{});}const found=typeof answer.evidence==='string'&&answer.evidence.length<=200?`\n\nDétecté : ${answer.evidence}`:'';notice(title,(answer.reason||'La politique locale bloque cet envoi.')+found);}
+  function onBlockedInspection(answer,text,labels,title='Envoi bloqué'){if(!answer.dlp_recorded){void emit('prompt',text,'blocked',labels,win.crypto.randomUUID(),undefined,labels.includes('keyword')?{decision_reason:'keyword'}:{}).catch(()=>false);}const found=typeof answer.evidence==='string'&&answer.evidence.length<=200?`\n\nDétecté : ${answer.evidence}`:'';notice(title,(answer.reason||'La politique locale bloque cet envoi.')+found);}
   function onRedirectInspection(answer,text,labels){
-    emit('prompt',text,'redirected',labels,win.crypto.randomUUID());let target;try{target=new URL(answer.redirect_url);if(target.protocol!=='https:'||target.username||target.password){throw new Error('Invalid redirect target');}}catch{notice('Redirection refusée','La destination de la politique est invalide.');return;}
+    // Refusal observations are best effort; the notice must not wait for delivery.
+    void emit('prompt',text,'redirected',labels,win.crypto.randomUUID()).catch(()=>false);let target;try{target=new URL(answer.redirect_url);if(target.protocol!=='https:'||target.username||target.password){throw new Error('Invalid redirect target');}}catch{notice('Redirection refusée','La destination de la politique est invalide.');return;}
     notice('Service autorisé',`${answer.reason||'Utilisez le service prévu par votre organisation.'}\n${target.origin}`,undefined,()=>location.assign(target.href),'Ouvrir le service');
   }
   function warningReceipts(answer){const ids=Array.isArray(answer.dlp_receipts)?answer.dlp_receipts:[answer.dlp_receipt];return ids.length>0&&ids.length<=32&&ids.every(validReceipt)?ids:null;}
