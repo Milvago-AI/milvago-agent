@@ -23,7 +23,10 @@ export function detectTool(nav=globalThis.navigator){
  return 'chrome';
 }
 export function trustedProvider(value){return globalThis.MilvagoAdapters.resolve(value)?.domain||null;}
-export function validPolicy(policy,now=Date.now()){return !!policy&&[1,2,3].includes(policy.version)&&modelRulesValid(policy)&&Number.isInteger(policy.revision)&&Number.isFinite(Date.parse(policy.expires_at))&&Date.parse(policy.expires_at)>now;}
+export function validPolicy(policy,now=Date.now()){return !!policy&&[1,2,3,4].includes(policy.version)&&modelRulesValid(policy)&&Number.isInteger(policy.revision)&&Number.isFinite(Date.parse(policy.expires_at))&&Date.parse(policy.expires_at)>now;}
+// The notice page is served under the extension's fixed id (`use_dynamic_url: false` in the manifest):
+// `extensionPath` resolves to that id. Under a per-session id, Chrome installed by policy gave the fixed
+// id from `runtime.getURL` and refused it for the page (real campaign 0.7.6).
 export function networkRules(policy,now=Date.now()){
  if(!validPolicy(policy,now)){throw new Error('Policy unavailable');}
  const rules=policy.version===1?policy.rules:policy.config.services.flatMap(s=>(s.domains||[]).map(domain=>({...s,domain,action:s.mode})));
@@ -31,7 +34,12 @@ export function networkRules(policy,now=Date.now()){
  const unknownRules=policy.version===1?[]:(policy.config.model_access||[]).filter(r=>r.channel==='browser'&&r.mode!=='off'&&!factoryCatalog.providers.some(p=>p.id===r.platform_id)).flatMap((r,i)=>(policy.config.services||[]).filter(s=>s.id===r.platform_id).flatMap(s=>[{id:30000+i*2,priority:200,action:{type:'block'},condition:{requestDomains:s.domains}},{id:30001+i*2,priority:200,action:{type:'block'},condition:{initiatorDomains:s.domains}}]));
  // Known platforms the organization blocks: an Enterprise rule set, empty in Community.
  const platformRules=policy.version===1?[]:platformBlockRules(policy);
- return [...apiRules,...unknownRules,...platformRules,...rules.filter(r=>r.enabled&&r.action==='block'&&(policy.version!==1||providers.includes(r.domain))&&typeof r.domain==='string'&&/^[a-z0-9.-]{1,253}$/.test(r.domain)).map((r,index)=>({id:index+1,priority:1,action:{type:'block'},condition:{requestDomains:[r.domain],resourceTypes:['main_frame','sub_frame','xmlhttprequest','websocket']}}))];
+ return [...apiRules,...unknownRules,...platformRules,...rules.filter(r=>r.enabled&&r.action==='block'&&(policy.version!==1||providers.includes(r.domain))&&typeof r.domain==='string'&&/^[a-z0-9.-]{1,253}$/.test(r.domain)).flatMap((r,index)=>[
+  // The page shows the extension's notice instead of the browser's error (also where the blocking
+  // handler is absent); everything else the service loads is cut.
+  {id:2*index+1,priority:1,action:{type:'redirect',redirect:{extensionPath:'/blocked.html?service='+r.domain}},condition:{requestDomains:[r.domain],resourceTypes:['main_frame']}},
+  {id:2*index+2,priority:1,action:{type:'block'},condition:{requestDomains:[r.domain],resourceTypes:['sub_frame','xmlhttprequest','websocket']}},
+ ])];
 }
 function validObservedEvent(input){
  return ['navigation','prompt','response'].includes(input?.kind)&&
@@ -56,13 +64,15 @@ function eventContext(input,senderUrl,policy){
  const context=live&&live.provider===frame.provider?live:frame;
  return policy.config.services.some(s=>s.enabled&&s.domains.includes(context.provider))?context:null;
 }
-export function eventForPolicy(input,senderUrl,tool,policy){
- if(!validPolicy(policy)||![2,3].includes(policy.version)||!policy.config.collection.enabled){return null;}
+export function eventForPolicy(input,senderUrl,tool,policy,dlpSubmission=false){
+ if(!validPolicy(policy)||![2,3,4].includes(policy.version)||(!policy.config.collection.enabled&&!(dlpSubmission&&policy.config.dlp_control?.journal))){return null;}
  const context=eventContext(input,senderUrl,policy);
  if(!context){return null;}
  if(!validObservedEvent(input)){return null;}
  const event={...context,source:'browser',tool,kind:input.kind,action:input.action,characters:input.kind==='navigation'?0:input.characters,labels:Array.isArray(input.labels)?input.labels.filter(s=>typeof s==='string'&&/^[a-z0-9_-]{1,64}$/i.test(s)).slice(0,32):[],policy_revision:policy.revision};
  if(typeof input.correlation_id==='string'&&/^[a-zA-Z0-9_-]{1,200}$/.test(input.correlation_id)){event.correlation_id=input.correlation_id;}
+ // The only reasons a page may state, on the prompt it refused: a protected word, a refused file.
+ if(input.kind==='prompt'&&input.action==='blocked'&&['keyword','upload_blocked'].includes(input.decision_reason)){event.decision_reason=input.decision_reason;}
  // No model here on purpose: it is never supplied by the document. It is read from the
  // outgoing request by the service worker and attached there, so a compromised page
  // cannot name the model its own traffic is attributed to.

@@ -73,12 +73,10 @@ test('fusion requires digest and document, handles two close prompts and keeps u
 test('candidate signal is shape only and factory matches cover every factory domain',async()=>{
  assert.deepEqual(await candidateSignals(request('{"input":"synthetic","model":"fixture"}'),catalog),['json_keys']);assert.deepEqual(await candidateSignals(request('{"input":"synthetic"}'),catalog),[]);
  const manifest=JSON.parse(await readFile(new URL('./manifest.json',import.meta.url)));const matches=manifest.content_scripts.flatMap(s=>s.matches);
- const factory=JSON.parse(await readFile(new URL('./detection-factory.json',import.meta.url)));const notebook=factory.providers.find(p=>p.id==='notebooklm');
- // The hostname Google actually serves is `notebook.google.com`. It must be in
- // `domains`, not `aliases`: `enrichDetectionPolicy` only copies `Domains` into
- // the signed policy, and `eventForPolicy` compares the tab's REAL hostname. An
- // alias left in `aliases` silently drops every DOM event from that site.
- assert.deepEqual(notebook.domains,['notebook.google.com','notebooklm.google.com']);assert.deepEqual(notebook.aliases,[]);assert.ok(matches.includes('https://notebook.google.com/*'));
+ const factory=JSON.parse(await readFile(new URL('./detection-factory.json',import.meta.url)));
+ // Community captures ChatGPT and Claude: its content script is injected there and nowhere else.
+ assert.deepEqual(factory.providers.map(p=>p.id),['chatgpt','claude']);
+ assert.deepEqual([...matches].sort(),['https://chat.openai.com/*','https://chatgpt.com/*','https://claude.ai/*']);
  for(const provider of factory.providers){for(const domain of [...provider.domains,...provider.aliases]){assert.ok(matches.includes('https://'+domain+'/*'));}}
  globalThis.MilvagoAdapters.applyCatalog(null);for(const a of globalThis.MilvagoAdapters.adapters){assert.ok(matches.includes('https://'+a.domain+'/*'));}
  for(const domain of Object.keys(globalThis.MilvagoAdapters.aliases)){assert.ok(matches.includes('https://'+domain+'/*'));}
@@ -94,16 +92,10 @@ test('Claude completion scalar fixture qualifies only the declared route, not co
  const hit=await observeRequest(req,factory,true);assert.equal(hit.characters,11);assert.equal(hit.model,'fixture-model');
  assert.equal(await observeRequest({...req,url:'https://claude.ai/api/organizations/fixture-org/chat_conversations/fixture-chat'},factory,true),null);
  // Providers carrying a network rule, named rather than counted: a count
- // alone doesn't say which one was lost. Measured on their real routes on 2026-09-14;
- // the other seven don't have one yet, and an empty field there is a fact, not an oversight.
- assert.deepEqual(factory.providers.filter(p=>p.network.length).map(p=>p.id).sort(),['chatgpt','claude','perplexity']);
- // Perplexity has no DOM path at all: its network rule is its ONLY observation. If it
- // disappears, the provider goes completely silent without any other test
- // noticing — hence these named assertions.
- const px=factory.providers.find(p=>p.id==='perplexity');
- assert.deepEqual([px.dom.editor,px.dom.send,px.dom.response],['','','']);
- assert.equal(px.network[0].model_path,'params.model_preference');
- assert.deepEqual(px.network[0].text_paths,['query_str','params.dsl_query']);
+ // alone doesn't say which one was lost. Measured on their real routes on 2026-09-14.
+ assert.deepEqual(factory.providers.filter(p=>p.network.length).map(p=>p.id).sort(),['chatgpt','claude']);
+ // Any other assistant's send is not read: no text, no model, not even a character count.
+ for(const url of ['https://gemini.google.com/app/abcdefgh12345678','https://www.perplexity.ai/rest/sse/perplexity_ask']){assert.equal(await observeRequest({...req,url},factory,true),null,url);}
  const gpt=factory.providers.find(p=>p.id==='chatgpt').network[0];
  assert.equal(gpt.model_path,'model');assert.equal(gpt.effort_path,'thinking_effort');
  assert.deepEqual(gpt.text_paths,['messages[*].content.parts[*]']);

@@ -12,7 +12,7 @@ let serial=0;
 // (fail-closed). This bench therefore pins the install — the object under test remains the
 // network guard, against a real loopback receiver.
 async function worker(initial,{blocking=true}={}){
- let policy=initial,message;const handlers={},stored={},reloaded=[],rules=[];
+ let policy=initial,message;const handlers={},stored={},reloaded=[],rules=[],notices=[];
  const noop={addListener(){}};
  const bridge=managedBridge({
   browser_policy:()=>({online:true,policy}),
@@ -25,7 +25,7 @@ async function worker(initial,{blocking=true}={}){
   runtime:{onInstalled:noop,onStartup:noop,onMessage:{addListener(fn){message=fn;}},sendNativeMessage:bridge.sendNativeMessage},
   storage:{managed:{async get(){return{milvago_pin:JSON.stringify(bridge.pin)};}},local:{async get(k){return {[k]:stored[k]};},async set(value){Object.assign(stored,value);}}},
   alarms:{create(){},onAlarm:noop},
-  tabs:{async query(){return [{id:1,url:'https://chatgpt.com/'},{id:2,url:'https://unrelated.test/'}];},async reload(id){reloaded.push(id);},async sendMessage(){}},
+  tabs:{async query(){return [{id:1,url:'https://chatgpt.com/'},{id:2,url:'https://unrelated.test/'}];},async reload(id){reloaded.push(id);},async sendMessage(tab,msg){notices.push(msg);}},
   declarativeNetRequest:{async getDynamicRules(){return rules;},async updateDynamicRules({addRules}){rules.splice(0,rules.length,...addRules);}},
   webRequest:Object.fromEntries(['onBeforeRequest','onBeforeSendHeaders','onCompleted','onErrorOccurred'].map(k=>[k,{addListener(fn){if(!blocking){throw Error('Permission not granted');}handlers[k]=fn;}}])),
  };
@@ -33,7 +33,7 @@ async function worker(initial,{blocking=true}={}){
  const send=(msg,sender={})=>new Promise(resolve=>message(msg,sender,resolve));
  assert.deepEqual(await send({type:'refresh'}),{ok:true});
  assert.equal(stored.status.connected,true,'worker must have installed the fixture policy');
- return {handlers,stored,rules,reloaded,send,async refresh(next){policy=next;assert.deepEqual(await send({type:'refresh'}),{ok:true});assert.equal(stored.status.revision,next.revision);}};
+ return {handlers,stored,rules,reloaded,send,notices,calls:bridge.calls,async refresh(next){policy=next;assert.deepEqual(await send({type:'refresh'}),{ok:true});assert.equal(stored.status.revision,next.revision);}};
 }
 const body='{"model":"synthetic-model","input":"synthetic text"}';
 const request=(overrides={})=>({
@@ -120,4 +120,17 @@ test('DNR fallback covers private destinations and foreign destinations initiate
   assert.equal(blocked('https://chat.openai.com/transfer','https://unrelated.test','xmlhttprequest'),true,'aliases remain covered');
   assert.equal(blocked('https://unrelated.test/transfer','https://another.test','xmlhttprequest'),false);
  }finally{delete globalThis.chrome;}
+});
+
+test('page traffic caught by a revision change is cancelled without a blocked prompt',async()=>{
+ const initial=policyFor({privacy:{enabled:true},collection:{enabled:true},services:[{id:'chatgpt',enabled:true,mode:'observe',domains:['chatgpt.com']}]});
+ const state=await worker(initial);
+ // In flight when the policy moves on: neither a catalogue prompt route nor naming a model.
+ const traffic=request({url:'https://chatgpt.com/backend-api/synthetic-telemetry',initiator:'https://chatgpt.com',requestBody:{raw:[{bytes:new TextEncoder().encode('{"events":[]}').buffer}]}});
+ assert.equal(state.handlers.onBeforeRequest(traffic).cancel,undefined);
+ await state.refresh({...initial,revision:2});
+ assert.equal(state.handlers.onBeforeSendHeaders(withHeaders(traffic)).cancel,true,'still cancelled');
+ for(let n=0;n<20;n++){await new Promise(r=>setTimeout(r,0));}
+ assert.equal(state.notices.length,0,'no notice for page traffic');
+ assert.equal(state.calls.filter(c=>c.op==='browser_event').length,0,'no blocked prompt recorded');
 });

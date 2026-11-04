@@ -8,6 +8,7 @@ licensor of every component in this repository.
 | Endpoint agent (Rust) | `src/`, `tests/`, `fuzz/` | Apache-2.0 |
 | Detection and masking engine | `browser-engine/` | Apache-2.0 |
 | Browser extension | `extension/` | Apache-2.0 |
+| Windows installer custom actions | `installer/` | Apache-2.0 |
 
 Full text: `LICENSE`.
 
@@ -31,5 +32,5 @@ filter components) is proprietary and is **not** part of this repository.
 
 ## Third-party dependencies
 
-They keep their own licenses; they are pinned in `Cargo.lock`, `browser-engine/Cargo.lock`
-and `extension/package-lock.json`.
+They keep their own licenses; they are pinned in `Cargo.lock`, `browser-engine/Cargo.lock`,
+`installer/Cargo.lock` and `extension/package-lock.json`.

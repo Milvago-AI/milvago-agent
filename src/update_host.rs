@@ -10,8 +10,6 @@
 use crate::{Result, ipc, update};
 use serde_json::{Value, json};
 use std::{path::Path, sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}}, time::{Duration, Instant}};
-#[cfg(windows)]
-use std::sync::TryLockError;
 
 fn update_request(request: &Value) -> bool {
     request.as_object().is_some_and(|object| {
@@ -20,37 +18,6 @@ fn update_request(request: &Value) -> bool {
     })
 }
 struct Lifecycle { busy: bool, last_request: Instant, stopping: bool, failed: bool }
-
-#[cfg(windows)]
-fn with_cache<T>(slot:&Mutex<Option<crate::cache_service::Authority>>,edition:&str,
-    action:impl FnOnce(&mut crate::cache_service::Authority)->Result<T>)->Result<T> {
-    let mut slot=slot.lock().map_err(|_|"cache authority unavailable")?;
-    // A transient startup read/lock failure must not poison this service forever.
-    // open() can only load the current committed epoch; it never provisions or resets it.
-    if slot.is_none(){*slot=Some(crate::cache_service::Authority::open(edition)?);}
-    action(slot.as_mut().ok_or("cache authority unavailable")?)
-}
-#[cfg(windows)]
-fn with_cache_until<T>(slot:&Mutex<Option<crate::cache_service::Authority>>,edition:&str,
-    deadline:Instant, action:impl FnOnce(&mut crate::cache_service::Authority)->Result<T>)->Result<T> {
-    let mut slot = loop {
-        match slot.try_lock() {
-            Ok(slot) => break slot,
-            Err(TryLockError::Poisoned(_)) => return Err("cache authority unavailable".into()),
-            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(TryLockError::WouldBlock) => return Err("browser operation deadline exceeded".into()),
-        }
-    };
-    if slot.is_none() {
-        *slot = Some(crate::cache_service::Authority::open(edition)?);
-    }
-    if Instant::now() >= deadline {
-        return Err("browser operation deadline exceeded".into());
-    }
-    action(slot.as_mut().ok_or("cache authority unavailable")?)
-}
 
 /// Paths and edition come exclusively from the installer's SCM command line.
 pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicBool>) -> Result<()> {
@@ -61,6 +28,14 @@ pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicB
     let authority = Arc::new(Mutex::new(crate::cache_service::Authority::open(edition).ok()));
     #[cfg(windows)]
     let prepare_authority = authority.clone();
+    #[cfg(windows)]
+    let cache_admission = Arc::new(crate::cache_replay::Admission::default());
+    #[cfg(windows)]
+    let prepare_admission = cache_admission.clone();
+    #[cfg(windows)]
+    let cache_ownership = Arc::new(crate::cache_replay::Ownership::default());
+    #[cfg(windows)]
+    let prepare_ownership = cache_ownership.clone();
     let work_home = home.to_path_buf();
     let work_target = target.to_path_buf();
     let work_edition = edition.to_owned();
@@ -75,7 +50,11 @@ pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicB
             { let mut lifecycle = work_lifecycle.lock().map_err(|_| "update lifecycle unavailable")?;
                 if lifecycle.stopping { return Err("update service stopping".into()); }
                 lifecycle.last_request = Instant::now(); }
-            return with_cache(&prepare_authority, &work_edition, |authority| authority.prepare(&request));
+            let deadline = Instant::now() + Duration::from_secs(6);
+            let boot = crate::cache_windows::boot(&work_edition, true)?;
+            return crate::cache_service::run_replayed(&prepare_authority, &prepare_admission, &prepare_ownership,
+                &work_edition, "trusted-agent", false,
+                crate::cache_service::Operation::Prepare { request, boot }, deadline);
         }
         if !update_request(&request) { return Ok(json!({"ok":false,"protocol":1,"error":"operation_refused"})); }
         let mut state = work_lifecycle.lock().map_err(|_| "update lifecycle unavailable")?;
@@ -108,6 +87,8 @@ pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicB
     let cache_server = {
         let cache_home = home.to_path_buf(); let cache_stop = stop.clone();
         let cache_lifecycle = lifecycle.clone(); let cache_authority = authority.clone();
+        let cache_admission = cache_admission.clone();
+        let cache_ownership = cache_ownership.clone();
         let cache_channel = crate::cache_service::channel(edition);
         let cache_edition = edition.to_owned();
         let handler: Arc<ipc::Handler> = Arc::new(move |_, request| {
@@ -115,13 +96,18 @@ pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicB
                 if lifecycle.stopping { return Err("cache service stopping".into()); }
                 lifecycle.last_request = Instant::now(); }
             let deadline = Instant::now() + Duration::from_secs(6);
-            with_cache_until(&cache_authority, &cache_edition, deadline,
-                |authority| authority.browser(&request, deadline))
+            let parsed = crate::browser_broker::parse(&request)?;
+            let principal = parsed.principal.clone();
+            let boot = crate::cache_windows::boot(&cache_edition, true)?;
+            crate::cache_service::run_replayed(&cache_authority, &cache_admission, &cache_ownership, &cache_edition,
+                &principal, false, crate::cache_service::Operation::Browser { parsed, boot, deadline }, deadline)
         });
         std::thread::spawn(move || ipc::serve(&cache_home, &cache_channel, ipc::Access::CacheBrowser, cache_stop, handler))
     };
     #[cfg(windows)]
     let mut last_maintenance: Option<Instant> = None;
+    #[cfg(windows)]
+    let mut maintenance_worker: Option<std::thread::JoinHandle<()>> = None;
     #[cfg(windows)]
     let launched = own_command(edition);
     #[cfg(windows)]
@@ -131,13 +117,21 @@ pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicB
     loop {
         #[cfg(windows)]
         if last_maintenance.is_none_or(|last| last.elapsed() >= Duration::from_millis(100)) {
-            if let Ok(mut slot) = authority.try_lock() {
-                if slot.is_none() {
-                    *slot = crate::cache_service::Authority::open(edition).ok();
-                }
-                if let Some(authority) = slot.as_mut() {
-                    let _ = authority.maintenance();
-                }
+            if maintenance_worker.as_ref().is_some_and(|worker| worker.is_finished()) {
+                if let Some(worker) = maintenance_worker.take() { let _ = worker.join(); }
+            }
+            if maintenance_worker.is_none() {
+                let authority = authority.clone();
+                let admission = cache_admission.clone();
+                let ownership = cache_ownership.clone();
+                let edition = edition.to_owned();
+                maintenance_worker = std::thread::Builder::new().name("milvago-cache-work".into()).spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(6);
+                    if let Ok(boot) = crate::cache_windows::boot(&edition, true) {
+                        let _ = crate::cache_service::run_replayed(&authority, &admission, &ownership, &edition,
+                            "maintenance", true, crate::cache_service::Operation::Maintenance { boot, owner:None }, deadline);
+                    }
+                }).ok();
             }
             last_maintenance = Some(Instant::now());
         }
@@ -170,6 +164,8 @@ pub fn run(home: &Path, target: &Path, edition: &str, requested_stop:Arc<AtomicB
     }
     stop.store(true, Ordering::Release);
     let result = server.join().map_err(|_| "update IPC worker failed")?;
+    #[cfg(windows)]
+    if let Some(worker) = maintenance_worker.take() { let _ = worker.join(); }
     #[cfg(windows)]
     cache_server.join().map_err(|_| "cache IPC worker failed")??;
     result?;

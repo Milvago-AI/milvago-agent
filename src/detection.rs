@@ -5,9 +5,14 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, io::Read, path::Path};
-pub const ENGINE_VERSION: &str = "0.5.0";
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    path::Path,
+};
+// Catalog capability level; the signed server floor must match this generation.
+pub const ENGINE_VERSION: &str = "0.7.0";
 #[derive(Default, Serialize, Deserialize)]
 pub struct Cache {
     pub revision: u64,
@@ -53,21 +58,27 @@ pub struct Network {
     #[serde(default)]
     pub text_path: String,
     /// Candidate paths for the prompt text, tried in order, the first that yields text
-    /// winning. One route can carry two body shapes - Le Chat names it
+    /// winning. One route can carry two body shapes - a provider may name it
     /// `content[*].text` when a thread opens and `messageInput[*].text` afterwards -
     /// and two rules cannot settle that: they match on method, host and path alone,
     /// and two matches make the observation ambiguous rather than picking one. When
     /// this list is not empty it supersedes `text_path` entirely.
     #[serde(default)]
     pub text_paths: Vec<String>,
+    /// The text paths that hold an attachment or a pasted block rather than the typed
+    /// draft (claude.ai's `2.15.4`). Content control lets a confirmed paste cover these,
+    /// and only these: the draft is covered by the send just approved. Each one is also
+    /// one of `text_paths`. Omitted when empty, for the reason `effort_path` records below.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachment_paths: Vec<String>,
     #[serde(default)]
     pub model_path: String,
     /// Where the request states the reasoning effort it asked for. Providers name it
     /// differently (`effort`, `thinking_effort`), so it is a path like the others.
     /// Tolerated before any catalog uses it: `Dom` and `Network` refuse unknown
     /// fields, so a catalog published with a field an older agent does not know is
-    /// rejected outright, and `min_engine` does not protect against that - it compares
-    /// both of its fields to one frozen constant. Field first, catalog afterwards.
+    /// rejected outright. The signed `min_engine` floor is checked before content;
+    /// declare and ship new fields with the matching engine before the catalogue.
     #[serde(default)]
     pub effort_path: String,
     #[serde(default)]
@@ -95,6 +106,8 @@ pub struct Network {
     /// which content control holds to the approved text. "file": an upload, which the
     /// file-send block seals and which observation ignores — observing it would produce
     /// a request event of zero characters.
+    /// "paste": the upload a provider makes at paste time for a long paste, which content
+    /// control holds to a paste the agent approved and which observation ignores too.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
     /// The account state the route itself implies: "signed_out" for a send route only
@@ -104,6 +117,24 @@ pub struct Network {
     /// records above.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub session: String,
+    /// A form field carrying the whole message as one JSON document, which then becomes
+    /// the body every path of the rule reads, as in `<field>=<json>`. Its name may
+    /// hold a dot, which no path segment can name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub form_field: String,
+    /// A request header holding JSON from which `model_path` reads the model instead of
+    /// the body, for a provider that states it nowhere else. Lower case.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub model_header: String,
+    /// Opaque model identifiers mapped to canonical names. An identifier the map does not
+    /// know is reported as `<provider>:<id>`, so the canonical names never hold `:`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_map: BTreeMap<String, String>,
+    /// "protobuf" for a route that sends one binary protobuf message (claude.ai's
+    /// `PerformAction`): its paths then name field numbers, every field read as a list.
+    /// Omitted when empty, for the reason `effort_path` records above.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body_format: String,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +240,28 @@ pub(crate) fn path(v: &str) -> bool {
             && v.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"/_.*-".contains(&b))
             && v.matches('*').count() <= 8)
+}
+// The form field, model header and model map of a network rule, bounded like the
+// engine and the server bound them. A header named without a path would read nothing.
+fn model_source_ok(n: &Network) -> bool {
+    let name = |v: &str, extra: &[u8]| {
+        !v.is_empty()
+            && v.len() <= 64
+            && v.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || extra.contains(&b))
+    };
+    let reserved = |v: &str| matches!(v, "__proto__" | "constructor" | "prototype");
+    let header = |v: &str| v.bytes().all(|b| !b.is_ascii_uppercase());
+    (n.form_field.is_empty() || (name(&n.form_field, b"._-") && !reserved(&n.form_field)))
+        && (n.model_header.is_empty()
+            || (name(&n.model_header, b"-") && header(&n.model_header) && !n.model_path.is_empty()))
+        && n.model_map.len() <= 32
+        && n.model_map.iter().all(|(id, canonical)| {
+            name(id, b"._-")
+                && !reserved(id)
+                && name(canonical, b"._-")
+                && canonical.as_bytes()[0].is_ascii_alphanumeric()
+        })
 }
 fn json_path(v: &str) -> bool {
     if v.is_empty() {
@@ -370,10 +423,13 @@ pub fn validate(c: &Content) -> Result<()> {
                 // skipped: it would shorten the list without saying so.
                 || n.text_paths.len() > 4
                 || n.text_paths.iter().any(String::is_empty)
+                || n.attachment_paths.len() > 4
+                || n.attachment_paths.iter().any(|a| !n.text_paths.contains(a))
                 || n.conversation_url_segment.is_some_and(|s| s > 16)
                 || !json_path(&n.files_path)
-                || !matches!(n.kind.as_str(), "" | "prompt" | "file")
+                || !matches!(n.kind.as_str(), "" | "prompt" | "file" | "paste")
                 || !matches!(n.session.as_str(), "" | "signed_in" | "signed_out")
+                || !matches!(n.body_format.as_str(), "" | "protobuf")
                 // A field name, not a path: unwrapping only ever applies at the root of
                 // the body, where a form puts its fields. The reserved names are refused
                 // here as the engine refuses them.
@@ -384,6 +440,7 @@ pub fn validate(c: &Content) -> Result<()> {
                         || !f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                         || matches!(f.as_str(), "__proto__" | "constructor" | "prototype")
                 })
+                || !model_source_ok(n)
             {
                 return Err("invalid network rule".into());
             }
@@ -445,7 +502,7 @@ pub fn verify(
         return Err("catalog requires newer engine".into());
     }
     let raw = STANDARD.decode(&h.content)?;
-    let hash = format!("{:x}", Sha256::digest(&raw));
+    let hash = crate::sha256_hex(&raw);
     if raw.len() > 512 * 1024
         || hash != h.content_hash
         || (h.revision == minimum && !held_hash.is_empty() && hash != held_hash)
@@ -719,7 +776,6 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     fn signed(content: Content, revision: u64, now: DateTime<Utc>) -> (Envelope, String, Header) {
-        let key = SigningKey::from_bytes(&[67; 32]);
         let raw = serde_json::to_vec(&content).unwrap();
         let h = Header {
             kind: "detection_catalog".into(),
@@ -728,12 +784,16 @@ mod tests {
             issued_at: now,
             expires_at: now + chrono::Duration::hours(1),
             min_engine: Engines {
-                extension: "0.5.0".into(),
-                bridge: "0.5.0".into(),
+                extension: ENGINE_VERSION.into(),
+                bridge: ENGINE_VERSION.into(),
             },
-            content_hash: format!("{:x}", Sha256::digest(&raw)),
+            content_hash: crate::sha256_hex(&raw),
             content: STANDARD.encode(raw),
         };
+        signed_header(h)
+    }
+    fn signed_header(h: Header) -> (Envelope, String, Header) {
+        let key = SigningKey::from_bytes(&[67; 32]);
         let bytes = serde_json::to_vec(&h).unwrap();
         (
             Envelope {
@@ -752,7 +812,7 @@ mod tests {
         let now = Utc::now();
         let (env, key, h) = signed(factory(), 3, now);
         let c = verify(&env, &key, 3, &h.content_hash, now).unwrap();
-        assert_eq!(c.content.providers.len(), 9);
+        assert_eq!(c.content.providers.len(), 2);
         assert!(verify(&env, &key, 4, "", now).is_err());
         assert!(verify(&env, &key, 3, "wrong", now).is_err());
         assert!(
@@ -769,6 +829,48 @@ mod tests {
         changed.signature = STANDARD.encode([0; 64]);
         assert!(verify(&changed, &key, 0, "", now).is_err());
         assert!(verify(&env, &STANDARD.encode([1; 32]), 0, "", now).is_err());
+    }
+    #[test]
+    fn signed_engine_floors_are_enforced_before_content() {
+        let now = Utc::now();
+        let (_, _, original) = signed(factory(), 3, now);
+        assert_eq!(ENGINE_VERSION, "0.7.0");
+        for (extension, bridge, accepted) in [
+            ("0.5.0", "0.5.0", true),
+            ("0.7.0", "0.7.0", true),
+            ("9.9.9", "0.7.0", false),
+            ("0.7.0", "9.9.9", false),
+            ("0.7", "0.7.0", false),
+            ("0.7.0", "0.7", false),
+        ] {
+            let mut header = original.clone();
+            header.min_engine = Engines {
+                extension: extension.into(),
+                bridge: bridge.into(),
+            };
+            let (envelope, key, _) = signed_header(header.clone());
+            let result = verify(&envelope, &key, 3, "", now);
+            if accepted {
+                assert!(result.is_ok(), "compatible floor {extension}/{bridge}");
+            } else {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    "catalog requires newer engine"
+                );
+                // Correctly hash and sign invalid content: the floor, not its parser,
+                // must reject this envelope first.
+                header.content = STANDARD.encode(b"not-json");
+                header.content_hash = crate::sha256_hex(b"not-json");
+                let (envelope, key, _) = signed_header(header);
+                assert_eq!(
+                    verify(&envelope, &key, 3, "", now)
+                        .err()
+                        .unwrap()
+                        .to_string(),
+                    "catalog requires newer engine"
+                );
+            }
+        }
     }
     #[test]
     fn same_revision_may_renew_expiry_but_never_change_content() {
@@ -792,6 +894,7 @@ mod tests {
             path: "/(a+)+".into(),
             text_path: "input".into(),
             text_paths: vec![],
+            attachment_paths: vec![],
             model_path: "".into(),
             effort_path: "".into(),
             conversation_path: "".into(),
@@ -800,6 +903,10 @@ mod tests {
             files_path: "".into(),
             kind: "".into(),
             session: "".into(),
+            form_field: "".into(),
+            model_header: "".into(),
+            body_format: "".into(),
+            model_map: BTreeMap::new(),
         });
         // providers[0] now carries its own measured network rule: targeting index 0
         // would mutate THAT ONE instead of the rule added here, and the test would
@@ -830,6 +937,13 @@ mod tests {
         // without saying so, and the server refuses it at publication too.
         c.providers[0].network[ajoutee].text_paths = vec!["content[*].text".into(), "".into()];
         assert!(validate(&c).is_err());
+        // An attachment path is one of the text paths, never a path of its own.
+        c.providers[0].network[ajoutee].text_paths = vec!["msg.body".into(), "chip.text".into()];
+        c.providers[0].network[ajoutee].attachment_paths = vec!["chip.text".into()];
+        assert!(validate(&c).is_ok());
+        c.providers[0].network[ajoutee].attachment_paths = vec!["other.text".into()];
+        assert!(validate(&c).is_err());
+        c.providers[0].network[ajoutee].attachment_paths = vec![];
         c.providers[0].network[ajoutee].text_paths = vec![];
         // The file-name path is a path like the others, and the fields to unwrap are
         // names, bounded and held away from the prototype. Both reach devices only
@@ -852,6 +966,8 @@ mod tests {
         // A route says what it carries, or says nothing and carries a prompt. Anything
         // else is refused rather than read as one of the two.
         c.providers[0].network[ajoutee].kind = "file".into();
+        assert!(validate(&c).is_ok());
+        c.providers[0].network[ajoutee].kind = "paste".into();
         assert!(validate(&c).is_ok());
         c.providers[0].network[ajoutee].kind = "upload".into();
         assert!(validate(&c).is_err());
@@ -888,6 +1004,48 @@ mod tests {
         c.providers[0].network[ajoutee].conversation_url_segment = Some(17);
         assert!(validate(&c).is_err());
         c.providers[0].network[ajoutee].conversation_url_segment = None;
+        // A form field, a model header and a model map are bounded names, never paths or
+        // prototype keys, and a header is only accepted with the path that reads it.
+        c.providers[0].network[ajoutee].form_field = "msg.body".into();
+        c.providers[0].network[ajoutee].model_header = "x-synthetic-ext-jspb".into();
+        c.providers[0].network[ajoutee].model_path = "4".into();
+        c.providers[0].network[ajoutee].model_map =
+            BTreeMap::from([("0123456789abcdef".into(), "synthetic-fast".into())]);
+        assert!(validate(&c).is_ok());
+        for bad in ["__proto__", "msg body", "msg[body]", &"f".repeat(65)] {
+            c.providers[0].network[ajoutee].form_field = bad.into();
+            assert!(validate(&c).is_err(), "form field {bad}");
+        }
+        c.providers[0].network[ajoutee].form_field = "msg.body".into();
+        for bad in ["X-Upper", "x_ext", "x ext", &"x".repeat(65)] {
+            c.providers[0].network[ajoutee].model_header = bad.into();
+            assert!(validate(&c).is_err(), "model header {bad}");
+        }
+        c.providers[0].network[ajoutee].model_header = "x-synthetic-ext-jspb".into();
+        c.providers[0].network[ajoutee].model_path = "".into();
+        assert!(validate(&c).is_err(), "a header with no path reads nothing");
+        c.providers[0].network[ajoutee].model_path = "4".into();
+        for (id, name) in [
+            ("__proto__", "x"),
+            ("", "x"),
+            ("a b", "x"),
+            ("k", "bad:name"),
+            ("k", ""),
+            ("k", "-lead"),
+            ("k", &"n".repeat(65)),
+        ] {
+            c.providers[0].network[ajoutee].model_map =
+                BTreeMap::from([(id.to_string(), name.to_string())]);
+            assert!(validate(&c).is_err(), "model map {id} -> {name}");
+        }
+        c.providers[0].network[ajoutee].model_map = (0..33)
+            .map(|i| (format!("id{i}"), "n".to_string()))
+            .collect();
+        assert!(validate(&c).is_err());
+        c.providers[0].network[ajoutee].model_map = BTreeMap::new();
+        c.providers[0].network[ajoutee].model_header = "".into();
+        c.providers[0].network[ajoutee].form_field = "".into();
+        c.providers[0].network[ajoutee].model_path = "".into();
         let duplicate = c.providers[1].domains[0].clone();
         c.providers[0].aliases.push(duplicate);
         assert!(validate(&c).is_err());
@@ -1017,7 +1175,7 @@ mod tests {
     }
 }
 
-fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<(String, String)>> {
+fn legacy_delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<(String, String)>> {
     let Some(token) = request.get("delivery_id") else {
         return Ok(None);
     };
@@ -1031,9 +1189,27 @@ fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<
         token
     ]);
     Ok(Some((
-        format!("{:x}", Sha256::digest(serde_json::to_vec(&key)?)),
-        format!("{:x}", Sha256::digest(serde_json::to_vec(event)?)),
+        crate::sha256_hex(serde_json::to_vec(&key)?),
+        crate::sha256_hex(serde_json::to_vec(event)?),
     )))
+}
+// New receipts bind kernel identity. A legacy display-name digest alone
+// cannot prove ownership after migration; only a matching durable owner can.
+fn delivery_key(state: &State, request: &Value, event: &Value) -> Result<Option<(String, String)>> {
+    let Some((_, hash)) = legacy_delivery_key(state, request, event)? else { return Ok(None) };
+    let owner = crate::browser_queue_quota::caller_owner(request)?;
+    let key = json!(["kernel-principal-v1", state.device_id, state.server_url,
+        state.public_key, request["tool"], owner, request["delivery_id"]]);
+    Ok(Some((crate::sha256_hex(serde_json::to_vec(&key)?), hash)))
+}
+fn matching_delivery<'a>(state: &'a State, request: &Value, event: &Value, key: &str) -> Result<Option<&'a Value>> {
+    if let Some(row) = state.detection.event_receipts.iter().find(|row| row[0] == key) { return Ok(Some(row)) }
+    let Some((legacy, _)) = legacy_delivery_key(state, request, event)? else { return Ok(None) };
+    let owner = crate::browser_queue_quota::caller_owner(request)?;
+    Ok(state.detection.event_receipts.iter().find(|row|
+        row.as_array().is_some_and(|fields|fields.len() == 3) && row[0] == legacy
+            && row[2].as_str().and_then(|raw|uuid::Uuid::parse_str(raw).ok())
+                .and_then(|id|state.browser_queue_owners.get(&id)).is_some_and(|stored|stored == &owner)))
 }
 pub fn delivery_receipt(
     state: &State,
@@ -1043,7 +1219,7 @@ pub fn delivery_receipt(
     let Some((key, hash)) = delivery_key(state, request, event)? else {
         return Ok(None);
     };
-    let Some(row) = state.detection.event_receipts.iter().find(|r| r[0] == key) else {
+    let Some(row) = matching_delivery(state, request, event, &key)? else {
         return Ok(None);
     };
     if row[1] != hash {
@@ -1063,7 +1239,7 @@ pub fn completed_delivery(state: &State, request: &Value) -> Result<Option<uuid:
     let Some((key, _)) = delivery_key(state, request, &json!({}))? else {
         return Ok(None);
     };
-    let Some(row) = state.detection.event_receipts.iter().find(|r| r[0] == key) else {
+    let Some(row) = matching_delivery(state, request, &json!({}), &key)? else {
         return Ok(None);
     };
     Ok(Some(uuid::Uuid::parse_str(
@@ -1077,7 +1253,17 @@ pub fn remember_delivery(
     id: uuid::Uuid,
 ) -> Result<()> {
     if let Some((key, hash)) = delivery_key(state, request, event)? {
-        state.detection.event_receipts.push(json!([key, hash, id]));
+        let owner = crate::browser_queue_quota::caller_owner(request)?;
+        // ACKed rows no longer occupy the event queue. Retain their independent
+        // kernel identity here so one account cannot churn the whole history.
+        // Legacy entries have no provable owner and keep the bounded global ring.
+        while state.detection.event_receipts.iter().filter(|row|
+            row[4].as_str().unwrap_or("unknown") == owner).count() >= crate::browser_broker::PRINCIPAL_EVENTS {
+            let oldest = state.detection.event_receipts.iter().position(|row|
+                row[4].as_str().unwrap_or("unknown") == owner).ok_or("receipt owner count changed")?;
+            state.detection.event_receipts.remove(oldest);
+        }
+        state.detection.event_receipts.push(json!([key, hash, id, "kernel-principal-v1", owner]));
         let excess = state.detection.event_receipts.len().saturating_sub(4096);
         state.detection.event_receipts.drain(..excess);
     }
@@ -1095,7 +1281,7 @@ mod delivery_tests {
             public_key: "fixture-anchor".into(),
             ..State::default()
         };
-        let request = json!({"delivery_id":uuid::Uuid::new_v4(),"tool":"chrome","caller":{"user":"synthetic-account"}});
+        let request = json!({"delivery_id":uuid::Uuid::new_v4(),"tool":"chrome","caller":{"user":"synthetic-account","sid":"S-1-5-21-1000"}});
         let event = json!({"provider":"fixture.test","characters":12});
         let id = uuid::Uuid::new_v4();
         remember_delivery(&mut state, &request, &event, id).unwrap();
@@ -1111,8 +1297,11 @@ mod delivery_tests {
             )
             .is_err()
         );
+        let mut renamed = request.clone();
+        renamed["caller"]["user"] = json!("renamed-account");
+        assert_eq!(delivery_receipt(&state, &renamed, &event).unwrap(), Some(id));
         let mut other = request.clone();
-        other["caller"]["user"] = json!("other-account");
+        other["caller"]["sid"] = json!("S-1-5-21-1001");
         assert!(delivery_receipt(&state, &other, &event).unwrap().is_none());
         state.server_url = "https://other-instance.test".into();
         assert!(
@@ -1208,5 +1397,66 @@ mod corpus_tests {
             seen > 0,
             "no corpus fixtures found in {dir}: an empty corpus must not read as a pass"
         );
+    }
+}
+
+#[cfg(test)]
+mod kernel_receipt_tests {
+    use super::*;
+    #[test]
+    fn renamed_display_account_keeps_receipt_but_another_kernel_account_does_not() {
+        let mut state=State {device_id:uuid::Uuid::new_v4().to_string(),server_url:"https://synthetic.test".into(),
+            public_key:"synthetic-anchor".into(),..Default::default()};
+        let event=json!({"kind":"presence","characters":0});
+        let id=uuid::Uuid::new_v4();
+        let mut request=json!({"tool":"chrome","delivery_id":uuid::Uuid::new_v4(),
+            "caller":{"sid":"S-1-5-21-1000","user":"old-display-name"}});
+        remember_delivery(&mut state,&request,&event,id).unwrap();
+        request["caller"]["user"]=json!("new-display-name");
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),Some(id));
+        assert_eq!(completed_delivery(&state,&request).unwrap(),Some(id));
+        assert!(delivery_receipt(&state,&request,&json!({"kind":"presence","characters":1})).is_err());
+        request["caller"]["sid"]=json!("S-1-5-21-1001");
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),None);
+        assert_eq!(completed_delivery(&state,&request).unwrap(),None);
+    }
+    #[test]
+    fn one_accounts_completed_stream_cannot_evict_another_accounts_lost_ack() {
+        let mut state=State {device_id:uuid::Uuid::new_v4().to_string(),server_url:"https://synthetic.test".into(),
+            public_key:"synthetic-anchor".into(),..Default::default()};
+        let event=json!({"kind":"presence","characters":0});
+        let id=uuid::Uuid::new_v4();
+        let victim=json!({"tool":"chrome","delivery_id":uuid::Uuid::new_v4(),
+            "caller":{"sid":"S-1-5-21-1001","user":"victim-display"}});
+        remember_delivery(&mut state,&victim,&event,id).unwrap();
+        for index in 0..4097 {
+            let request=json!({"tool":if index%2==0 {"chrome"} else {"edge"},"delivery_id":uuid::Uuid::new_v4(),
+                "caller":{"sid":"S-1-5-21-1000","user":format!("renamed-{index}")}});
+            // Each prior event has already been ACKed: no queued row is needed
+            // to preserve the receipt's quota identity across restart.
+            remember_delivery(&mut state,&request,&event,uuid::Uuid::new_v4()).unwrap();
+        }
+        assert_eq!(state.detection.event_receipts.len(),crate::browser_broker::PRINCIPAL_EVENTS+1);
+        assert!(state.shadow_queue.is_empty() && state.browser_queue_owners.is_empty());
+        let home=tempfile::tempdir().unwrap();
+        { let store=crate::Store::open(home.path()).unwrap();store.save(&state).unwrap(); }
+        let state=crate::Store::open(home.path()).unwrap().load().unwrap();
+        assert_eq!(delivery_receipt(&state,&victim,&event).unwrap(),Some(id));
+        assert_eq!(completed_delivery(&state,&victim).unwrap(),Some(id));
+    }
+
+    #[test]
+    fn unowned_legacy_display_digest_cannot_manufacture_kernel_ownership() {
+        let mut state=State::default();
+        let event=json!({"kind":"presence"});let id=uuid::Uuid::new_v4();
+        let request=json!({"tool":"chrome","delivery_id":uuid::Uuid::new_v4(),
+            "caller":{"sid":"S-1-5-21-1000","user":"legacy-name"}});
+        let (key,hash)=legacy_delivery_key(&state,&request,&event).unwrap().unwrap();
+        state.detection.event_receipts.push(json!([key,hash,id]));
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),None);
+        assert_eq!(completed_delivery(&state,&request).unwrap(),None);
+        assert!(state.browser_queue_owners.is_empty());
+        let next=uuid::Uuid::new_v4();remember_delivery(&mut state,&request,&event,next).unwrap();
+        assert_eq!(delivery_receipt(&state,&request,&event).unwrap(),Some(next));
     }
 }

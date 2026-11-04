@@ -1,1 +1,31 @@
-<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Milvago Browser</title><link rel="stylesheet" href="popup.css"><body><header><div class="brand"><img src="milvago-symbol-256.png" width="32" height="32" alt=""><b>Milvago</b></div><span>Browser</span></header><h1 id="title">Protection navigateur</h1><output id="status">Vérification de l’agent…</output><button id="refresh">Actualiser la politique</button><p class="scope" id="scope">Les neuf fournisseurs disposent d’adaptateurs. Leur qualification complète est en cours. Un contrôle indisponible bloque les transmissions concernées. Un événement observé ne prouve pas sa réception par le fournisseur.</p><p class="scope" id="usage">Le texte est contrôlé dans l’agent local. Sa conservation dépend de la politique de votre organisation. Un envoi autorisé reprend automatiquement après validation. Vous pouvez annuler la relecture du texte masqué.</p><script src="popup.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Milvago Browser</title>
+<script src="appearance.js"></script>
+<link rel="stylesheet" href="brand.css">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body class="popup-page">
+<header class="brand-row">
+  <div class="wordmark"><img class="logo-dark" src="milvago-logo-horizontal-inverse.svg" alt="Milvago" width="136" height="40"><img class="logo-light" src="milvago-logo-horizontal-mono-black.svg" alt="Milvago" width="136" height="40"></div>
+  <span class="section-label">Browser</span>
+</header>
+<main>
+  <h1 id="title">Browser protection</h1>
+  <section class="agent-panel" aria-labelledby="agent-label">
+    <span class="section-label" id="agent-label">Local agent</span>
+    <output id="status" aria-live="polite">Checking local control…</output>
+  </section>
+  <button id="refresh" class="primary">Refresh policy</button>
+  <details class="scope-panel">
+    <summary id="scope-label">Scope and privacy</summary>
+    <p id="scope"></p><p id="usage"></p>
+  </details>
+</main>
+<footer class="appearance-row"><label id="appearance-label" for="appearance">Appearance</label><select id="appearance"><option value="system">System</option><option value="dark">Dark</option><option value="light">Light</option></select></footer>
+<script src="popup.js"></script>
+</body>
+</html>

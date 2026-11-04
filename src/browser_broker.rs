@@ -16,6 +16,10 @@ pub fn capabilities() -> Value {
 }
 pub const MAX_EVENTS: usize = 1000;
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+// Only the actual serialized true markers receive this bounded format allowance.
+const TRANSFER_MARKER_BYTES:usize = br#","transfer_started":true"#.len();
+pub(crate) const MAX_TRANSFER_FORMAT_BYTES:usize=MAX_EVENTS*TRANSFER_MARKER_BYTES;
+fn transfer_not_started(value:&bool)->bool{!*value}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -44,6 +48,8 @@ pub struct Request {
     #[serde(default)]
     pub check_model: Option<bool>,
     #[serde(default)]
+    pub observation: Option<bool>,
+    #[serde(default)]
     pub platform_id: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
@@ -51,6 +57,8 @@ pub struct Request {
     pub event: Option<Value>,
     #[serde(default)]
     pub delivery_id: Option<String>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
     #[serde(default)]
     pub batch: Option<Value>,
     #[serde(default)]
@@ -95,6 +103,7 @@ pub fn parse(value: &Value) -> Result<Parsed> {
     let health = request.op == "browser_health";
     let receipt = request.op == "browser_receipt";
     let complete = request.op == "browser_complete";
+    let cancelled=matches!(request.op.as_str(),"browser_cancelled"|"browser_confirm");
     if !matches!(
         request.op.as_str(),
         "browser_policy"
@@ -105,21 +114,24 @@ pub fn parse(value: &Value) -> Result<Parsed> {
             | "browser_submit"
             | "browser_receipt"
             | "browser_complete"
+            | "browser_cancelled"
+            | "browser_confirm"
     ) || (complete != request.completion.is_some())
         || (!inspect
         && (request.provider.is_some()
             || request.text.is_some()
             || request.upload.is_some()
             || request.check_model.is_some()
+            || request.observation.is_some()
             || request.model.is_some()
             || request.platform_id.is_some()))
         || ((!event && request.event.is_some())
-            || (!event && !receipt && !complete && request.delivery_id.is_some()))
+            || (!event && !receipt && !complete && !cancelled && request.delivery_id.is_some()))
         || (health != request.batch.is_some())
     {
         return Err("browser operation fields refused".into());
     }
-    if receipt {
+    if receipt || cancelled {
         if fields
             .as_object()
             .ok_or("browser receipt fields refused")?
@@ -139,6 +151,9 @@ pub fn parse(value: &Value) -> Result<Parsed> {
                 .as_deref()
                 .ok_or("delivery identity missing")?,
         )?;
+    }
+    if let Some(id)=&request.approval_id {
+        if request.op!="browser_submit"||uuid::Uuid::parse_str(id).is_err(){return Err("confirmation identity refused".into());}
     }
     if complete {
         // A completion names the send it enriches, and says nothing else: it carries
@@ -229,7 +244,7 @@ impl Parsed {
 impl Request {
     pub fn inspection(&self) -> Value {
         json!({"op":"inspect","tool":self.tool,"provider":self.provider,"text":self.text,"upload":self.upload,
-        "check_model":self.check_model.unwrap_or(false),"platform_id":self.platform_id,"model":self.model})
+        "observation":self.observation.unwrap_or(false),"check_model":self.check_model.unwrap_or(false),"platform_id":self.platform_id,"model":self.model})
     }
 }
 pub fn signed(
@@ -258,6 +273,9 @@ pub struct Pending {
     pub sequence: u64,
     pub generation: u64,
     pub event: ShadowEvent,
+    /// Durable before the first transfer: a missing ACK does not prove local ownership.
+    #[serde(default, skip_serializing_if = "transfer_not_started")]
+    pub transfer_started: bool,
     /// The OS principal that admitted it, for its share of the machine-wide queue.
     #[serde(default)]
     pub principal: String,
@@ -356,6 +374,7 @@ impl Queue {
         let Some(index) = self.pending.iter().position(|p| p.event.id == completion.id) else {
             return false;
         };
+        if self.pending[index].principal.is_empty()||self.pending[index].transfer_started { return false; }
         // A completion that would take the queue past its bounds is not placed: kept in
         // memory, it would fail every later save and wedge the queue for all accounts.
         let before = self.pending[index].event.clone();
@@ -387,9 +406,13 @@ impl Queue {
         }
     }
     pub fn validate(&self) -> Result<()> {
+        if self.pending.len()>MAX_EVENTS||self.health.len()>MAX_EVENTS||self.pending.len().checked_add(self.health.len()).is_none_or(|count|count>MAX_EVENTS){
+            return Err("browser queue invalid".into());
+        }
+        let marker_bytes=self.pending.iter().filter(|pending|pending.transfer_started).count().saturating_mul(TRANSFER_MARKER_BYTES).min(MAX_TRANSFER_FORMAT_BYTES);
         if self.len() > MAX_EVENTS
             || self.receipts.len() > MAX_EVENTS
-            || crate::shadow::serialized_size(self)? > MAX_BYTES
+            || crate::shadow::serialized_size(self)? > MAX_BYTES.saturating_add(marker_bytes)
             || self
                 .pending
                 .iter()
@@ -488,6 +511,7 @@ impl Queue {
             sequence,
             generation: journal.generation,
             event,
+            transfer_started:false,
             principal: parsed.principal.clone(),
         });
         next.keep_receipt(Receipt { key, hash, id, principal: parsed.principal.clone() });
@@ -673,6 +697,7 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         });
         return Ok(json!({"ok":true,"durable":true,"id":id}));
     }
+    let owner = crate::browser_queue_quota::broker_owner(request)?;
     let mut event: ShadowEvent = serde_json::from_value(request["event"].clone())?;
     *changed |= crate::shadow::discard_unpermitted(state);
     if let Some(receipt) = &state.browser_broker_receipt {
@@ -692,9 +717,8 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
     let policy = crate::shadow::cached(state)?;
     // Retention is applied before accepting or retrying custody, including when
     // collection was turned off during the outage.
-    let collect = policy.config["collection"]["enabled"]
-        .as_bool()
-        .unwrap_or(false);
+    let collect = policy.config["collection"]["enabled"]==true ||
+        (event.dlp.as_ref().is_some_and(|t|t.valid()) && crate::shadow::dlp_transport::journal(&policy));
     if collect {
         let id = event.id;
         let occurred = event.occurred_at;
@@ -718,18 +742,28 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         }
         let mut input = serde_json::to_value(&event)?;
         let obj = input.as_object_mut().ok_or("invalid broker event")?;
-        for key in ["id", "occurred_at", "user"] {
+        for key in ["id", "occurred_at", "user", "dlp"] {
             obj.remove(key);
         }
         *changed = true;
         // An event the current policy refuses for good (its service was disabled since
         // SYSTEM admitted it) is acknowledged and dropped, as when collection is off:
         // refused forever, it would wedge the head of the machine-wide SYSTEM queue.
-        if crate::shadow::browser_event(&policy, state.detection.revision, input.clone()).is_err() {
+        let mut narrow=policy.clone();
+        if event.dlp.is_some() {narrow.config["collection"]["enabled"]=json!(true);}
+        if crate::shadow::browser_event(&narrow, state.detection.revision, input.clone()).is_err() {
             state.browser_broker_receipt = Some(AgentReceipt { installation: installation.into(), sequence, id });
             return Ok(json!({"ok":true,"durable":true,"id":id}));
         }
-        let generated = crate::shadow::enqueue_browser(state, input)?;
+        let mut prepared=crate::shadow::browser_event(&narrow,state.detection.revision,input)?;
+        prepared.dlp=event.dlp.clone();
+        let size=crate::shadow::fit_event(&mut prepared)?;
+        crate::config::current().queue.check(state,1,size)?;
+        if state.shadow_queue.iter().any(|queued| queued.id == id) {
+            return Err("browser queue identity collision".into());
+        }
+        let generated=prepared.id;
+        state.shadow_queue.push(prepared);
         let received = state
             .shadow_queue
             .iter_mut()
@@ -740,8 +774,8 @@ fn receive_into(state: &mut crate::State, request: &Value, changed: &mut bool) -
         received.user = user;
         received.policy_revision = revision;
         // OS attribution is added after parsing; include it in the admission budget.
-        if let Err(error) = crate::config::current().queue.check(state, 0, 0) {
-            state.shadow_queue.pop();
+        if let Err(error) = crate::browser_queue_quota::claim(state, id, owner) {
+            crate::browser_queue_quota::rollback(state, id);
             return Err(error);
         }
     }

@@ -13,35 +13,28 @@ const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const pages={
  chatgpt:['<textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button>','<div data-message-author-role="assistant">Answer</div>','/c/00000000-0000-4000-8000-000000000000'],
  claude:['<div role="textbox" contenteditable="true" data-testid="chat-input"></div><button type="button" aria-label="Envoyer le message" data-testid="chat-input-send">Envoyer</button>','<div data-testid="assistant-message">Answer</div>','/chat/00000000-0000-4000-8000-000000000000'],
- // Measured on 2026-09-14: TWO submit buttons coexist on the page, and only
- // the composer's carries `aria-busy`. The second one is reproduced here, otherwise the fixture
- // would validate a disambiguation it never actually exercised.
- lechat:['<textarea></textarea><button type="submit">Autre</button><button type="submit" aria-busy="false" aria-label="Envoyer">Envoyer</button>','<div data-message-role="assistant">Answer</div>','/chat/00000000-0000-4000-8000-000000000000'],
- copilot:['<textarea></textarea><button data-testid="submit-button">Send</button>','<div data-content="ai-message">Answer</div>','/chats/00000000-0000-4000-8000-000000000000'],
- // The real page nests the button inside a wrapper that carries the class, and its
- // label is in the interface language. A fixture that put the class on the button
- // itself made a dead selector look alive: the markup here mirrors what was measured.
- gemini:['<rich-textarea><div contenteditable="true"></div></rich-textarea><gem-icon-button class="send-button"><button aria-label="Envoyer un message">Envoyer</button></gem-icon-button>','<model-response>Answer</model-response>','/app/abcdefgh12345678'],
- // The Send/Envoyer labels matched TWO buttons on the real page — an
- // ambiguous selector, not just a language-dependent one. The neighbors are reproduced.
- notebooklm:['<textarea></textarea><button aria-label="Web">Web</button><button type="submit" aria-label="Envoyer">Envoyer</button>','<div class="to-user-message">Answer</div>','/notebook/00000000-0000-4000-8000-000000000000'],
- // DeepSeek exposes NO <button> around its composer at all: its send control is a
- // div[role=button] from its in-house library, with its variant class.
- deepseek:['<textarea></textarea><div role="button" class="ds-button ds-button--secondary">Autre</div><div role="button" class="ds-button ds-button--primary ds-button--filled ds-button--circle" tabindex="0">Envoyer</div>','<div data-message-role="assistant">Answer</div>','/a/chat/s/00000000-0000-4000-8000-000000000000'],
- // Perplexity has no structural handle at all and its three selectors are neutralized:
- // it has no DOM path left to exercise. The fixture stays here for URL resolution.
- perplexity:['<textarea></textarea><button aria-label="Envoyer">Send</button>','<div data-testid="answer">Answer</div>','/search/private-question-00000000-0000-4000-8000-000000000000'],
- grok:['<textarea></textarea><button type="submit" data-testid="chat-submit" aria-label="Envoyer">Envoyer</button>','<div data-message-role="assistant">Answer</div>','/c/00000000-0000-4000-8000-000000000000'],
+ // Synthetic page shapes for engine paths the two covered providers do not exercise: a send
+ // control that is not a <button>, and a send button nested in a wrapper that carries the class.
+ divsend:['<textarea></textarea><div role="button" class="action">Other</div><div role="button" class="action send" tabindex="0">Send</div>','<div data-message-role="assistant">Answer</div>','/c/00000000-0000-4000-8000-000000000000'],
+ wrapped:['<div class="composer"><div contenteditable="true"></div></div><span class="send-wrap"><button aria-label="Envoyer un message">Envoyer</button></span>','<div class="reply">Answer</div>','/c/00000000-0000-4000-8000-000000000000'],
 };
+// Installed only for the tests that need those shapes, then the factory adapters come back.
+const syntheticProvider=(id,dom)=>({id,label:id,domains:[`${id}.example.invalid`],aliases:[],conversation_path:'/c/*',conversation_segment:1,dom,network:[]});
+const synthetic={providers:[
+ syntheticProvider('divsend',{editor:'textarea',send:'div[role="button"].send',response:'[data-message-role="assistant"]'}),
+ syntheticProvider('wrapped',{editor:'.composer [contenteditable="true"],textarea',send:'.send-wrap button',response:'.reply'}),
+ syntheticProvider('blank',{editor:'',send:'',response:''}),
+]};
+async function withSynthetic(run){A.applyCatalog(synthetic);try{return await run();}finally{A.applyCatalog(null);}}
 function trusted(type,target,extra={}){return {type,target,isTrusted:true,prevented:false,preventDefault(){this.prevented=true;},stopImmediatePropagation(){},...extra};}
 async function fixture(id='chatgpt',answer,store=false,submitAnswer,eventAnswer){
  const adapter=A.adapters.find(a=>a.id===id),[html,old,path]=pages[id];const dom=new JSDOM(`<form>${html}</form>${old}`,{url:`https://${adapter.domain}${path}`});const doc=dom.window.document;Object.defineProperty(dom.window.crypto,'subtle',{value:webcrypto.subtle});
  const form=doc.querySelector('form');let submissions=0;const geste={parClic:false};
  // Count the resumed GESTURE, not the form submission. Measured on 2026-09-14:
  // claude.ai has no form and its send button is `type="button"`;
- // chat.deepseek.com has no <button> at all. Their resume therefore goes through
+ // a page may have no <button> at all. Their resume therefore goes through
  // `control.click()` and produces no `submit` event. Counting submits alone
- // would have required a page shape these two providers don't have.
+ // would have required a page shape these providers don't have.
  // The wrapping form remains a fixture simplification: `submissionTarget()`
  // keeps the control when it exists, so its presence doesn't change the path exercised.
  form.addEventListener('submit',event=>{event.preventDefault();if(!geste.parClic){submissions+=1;}});
@@ -52,11 +45,7 @@ async function fixture(id='chatgpt',answer,store=false,submitAnswer,eventAnswer)
  geste.parClic=!!button;if(button){button.addEventListener('click',()=>{submissions+=1;});}
  return {dom,doc,controller,messages,editor,button,config,adapter,submissionCount(){return submissions;},close(){controller.dispose();dom.window.close();},dialog(){return [...doc.querySelectorAll('div')].find(x=>x.testShadow)?.testShadow;}};
 }
-// Perplexity is deliberately without a DOM path: its three selectors are neutralized
-// for lack of any structural handle, and its interface language follows the browser across
-// dozens of languages. It is exercised by its own test below, which verifies
-// the opposite: that it intercepts NOTHING, so it cannot block a send.
-for(const adapter of A.adapters.filter(a=>a.id!=='perplexity')){test(`${adapter.id}: trusted submission, navigation, correlated response without retrospective capture`,async()=>{
+for(const adapter of A.adapters){test(`${adapter.id}: trusted submission, navigation, correlated response without retrospective capture`,async()=>{
  const f=await fixture(adapter.id);try{
   const first=trusted('click',f.button);await f.controller.handle(first);assert.equal(first.prevented,true);
   assert.equal(f.messages.filter(m=>m.type==='submit').length,1);
@@ -84,42 +73,42 @@ test('responses are classified and masked locally even when inspect says block',
 test('blocked upload does not read filenames or contents',async()=>{const f=await fixture('chatgpt',{ok:true,action:'block',text:'',reason:'Uploads blocked'});try{const {input,file}=selectedFile(f);Object.defineProperty(file,'name',{get(){throw Error('Filename read');}});file.text=()=>{throw Error('File contents read');};let delivered=0;input.addEventListener('change',()=>delivered++);const e=trusted('change',input);await f.controller.upload(e);assert.equal(e.prevented,true);assert.equal(delivered,0);const message=f.messages.find(m=>m.type==='inspect');assert.equal(message.upload,true);assert.equal(message.text,'');assert.equal(f.messages.filter(m=>m.type==='submit').length,0);}finally{f.close();}});
 test('URL normalization removes query/hash and descriptive search slug',()=>{for(const a of A.adapters){const c=A.context(`https://${a.domain}${pages[a.id][2]}?token=secret#fragment`);assert.ok(c.conversation_id);assert.ok(!/[?#]/.test(c.url));assert.ok(!c.url.includes('private-question'));}assert.equal(A.context('https://chatgpt.com/private-sensitive-title').url,'https://chatgpt.com');});
 test('worker whitelist derives sender, drops unknown fields and gates raw content',()=>{const input={kind:'prompt',action:'observed',characters:5,prompt:'hello',response:'secret',provider:'other.test',source:'native',organization_id:'fake',labels:['email','bad space']};const out=eventForPolicy(input,'https://chatgpt.com/c/abcdefgh?secret=x','edge',policy());assert.equal(out.provider,'chatgpt.com');assert.equal(out.source,'browser');assert.equal(out.prompt,undefined);assert.equal(out.organization_id,undefined);assert.deepEqual(out.labels,['email']);assert.equal(eventForPolicy(input,'https://chatgpt.com','edge',policy(true)).prompt,'hello');const off=policy(true);off.config.collection.enabled=false;assert.equal(eventForPolicy(input,'https://chatgpt.com','edge',off),null);});
-test('v2 network block stays scoped and malformed expiration is rejected',()=>{const p=policy();p.config.services[0].mode='block';assert.equal(networkRules(p).length,2);p.expires_at='invalid';assert.throws(()=>networkRules(p));});
+test('v2 network block stays scoped and malformed expiration is rejected',()=>{const p=policy();p.config.services[0].mode='block';assert.equal(networkRules(p).length,3);p.expires_at='invalid';assert.throws(()=>networkRules(p));});
 test('manifest grants exactly supported domains and retains stable extension identity',async()=>{const m=JSON.parse(await readFile(new URL('./manifest.json',import.meta.url)));assert.deepEqual(m.host_permissions,['<all_urls>']);assert.ok(m.permissions.includes('webRequestBlocking'));assert.ok(m.key);assert.deepEqual(m.content_scripts[0].js,['adapters.js','capture.js']);});
 
 // A provider with no structural handle must intercept NOTHING. The worst possible
 // state would be a live `editor` with a dead `send`: `submission()` would then swallow the
 // Enter key, `submissionTarget()` would fail for lack of a button or a form, and the
-// person's send would be blocked by an overlay. Measured on gemini, deepseek and perplexity on
-// 2026-09-14. The three selectors are therefore neutralized together, never separately.
-test('a provider with no structural handle intercepts nothing and cannot block a send',()=>{
- const perplexity=A.adapters.find(a=>a.id==='perplexity');
- assert.deepEqual([perplexity.editor,perplexity.send,perplexity.response],[':not(*)',':not(*)',':not(*)']);
- const dom=new JSDOM('<textarea>Synthetic</textarea><button aria-label="Envoyer">Send</button>',{url:'https://www.perplexity.ai/'});
+// person's send would be blocked by an overlay. The three selectors are therefore
+// neutralized together, never separately.
+test('a provider with no structural handle intercepts nothing and cannot block a send',()=>withSynthetic(()=>{
+ const blank=A.adapters.find(a=>a.id==='blank');
+ assert.deepEqual([blank.editor,blank.send,blank.response],[':not(*)',':not(*)',':not(*)']);
+ const dom=new JSDOM('<textarea>Synthetic</textarea><button aria-label="Envoyer">Send</button>',{url:'https://blank.example.invalid/'});
  try{
   const doc=dom.window.document,editor=doc.querySelector('textarea'),bouton=doc.querySelector('button');
   const adapter=A.resolve(dom.window.location.href);
-  assert.equal(adapter.id,'perplexity');
+  assert.equal(adapter.id,'blank');
   assert.equal(A.submission(adapter,trusted('keydown',editor,{key:'Enter'}),doc),null);
   assert.equal(A.submission(adapter,trusted('click',bouton),doc),null);
  }finally{dom.window.close();}
-});
+}));
 
-test('Enter without a form resumes the unique provider button in one gesture',async()=>{
- const f=await fixture('deepseek');try{
+test('Enter without a form resumes the unique provider button in one gesture',()=>withSynthetic(async()=>{
+ const f=await fixture('divsend');try{
   const form=f.doc.querySelector('form');form.replaceWith(...form.childNodes);let clicks=0;
   f.button.addEventListener('click',()=>clicks++);
   await f.controller.handle(trusted('keydown',f.editor,{key:'Enter'}));
   assert.equal(clicks,1);assert.equal(f.messages.filter(m=>m.type==='inspect').length,1);assert.equal(f.messages.filter(m=>m.type==='submit').length,1);assert.equal(f.dialog(),undefined);
  }finally{f.close();}
-});
-// Measured on the real pages on 2026-09-14: gemini, copilot, notebooklm and grok
+}));
+// Measured on real pages on 2026-09-14: several providers
 // expose TWO elements for their editor selector and have no form. The fallback
 // required a unique editor, so the Enter key was intercepted there — the send blocked —
 // then abandoned with "This control cannot resume sending automatically",
 // whether the send button was live or not. What must be unique is the button, not the editor.
-test('Enter resumes even when the editor selector matches several elements',async()=>{
- const f=await fixture('gemini');try{
+test('Enter resumes even when the editor selector matches several elements',()=>withSynthetic(async()=>{
+ const f=await fixture('wrapped');try{
   const form=f.doc.querySelector('form');form.replaceWith(...form.childNodes);
   // A second element matching the editor selector, as on the real page.
   const autre=f.doc.createElement('textarea');f.doc.body.append(autre);
@@ -130,22 +119,23 @@ test('Enter resumes even when the editor selector matches several elements',asyn
   assert.equal(clicks,1);assert.equal(f.messages.filter(m=>m.type==='submit').length,1);
   assert.equal(f.dialog(),undefined,'aucune incrustation ne doit s\'afficher pour un envoi autorisé');
  }finally{f.close();}
-});
-// The ambiguity that matters is still refused: two send buttons, no resume possible.
-test('Enter refuses to resume when the send control is ambiguous',async()=>{
- const f=await fixture('gemini');try{
+}));
+// Two send buttons: neither is guessed. The approved Enter is replayed on the editor instead.
+test('Enter never clicks a guessed button when the send control is ambiguous',()=>withSynthetic(async()=>{
+ const f=await fixture('wrapped');try{
   const form=f.doc.querySelector('form');form.replaceWith(...form.childNodes);
-  // Gemini's selector targets the button VIA ITS CONTAINER: cloning the button alone
+  // The selector targets the button VIA ITS CONTAINER: cloning the button alone
   // creates no ambiguity. It's the wrapper that must be duplicated.
-  const enveloppe=f.button.closest('.send-button');
+  const enveloppe=f.button.closest('.send-wrap');
   f.doc.body.append(enveloppe.cloneNode(true));
   assert.equal(f.doc.querySelectorAll(f.adapter.send).length,2);
   let clicks=0;for(const b of f.doc.querySelectorAll(f.adapter.send)){b.addEventListener('click',()=>clicks++);}
+  const replayed=[];f.editor.addEventListener('keydown',event=>{if(!event.isTrusted){replayed.push(event.key);}});
   await f.controller.handle(trusted('keydown',f.editor,{key:'Enter'}));
-  assert.equal(clicks,0);assert.equal(f.messages.filter(m=>m.type==='submit').length,0);
-  assert.ok(f.dialog(),'un envoi non reprenable doit être signalé, pas parti en silence');
+  assert.equal(clicks,0);assert.deepEqual(replayed,['Enter']);
+  await delay(1600);assert.ok(f.dialog(),'a draft left in place must be signalled, not dropped in silence');
  }finally{f.close();}
-});
+}));
 // Measured on chatgpt.com signed out, Chrome and Firefox, 2026-09-29: the mobile composer
 // page cancels the first submit, fetches its sentinel tokens, then calls
 // form.requestSubmit() itself 32 ms later. That second, trusted submit was taken for a
@@ -264,9 +254,14 @@ test('failed response inspection is retried without needing another DOM mutation
   assert.equal(responses,2);assert.equal(f.messages.filter(m=>m.event?.kind==='response').length,1);
  }finally{f.close();}
 });
-test('Le Chat roleless editor and Notebook current hostname resolve',()=>{
- const dom=new JSDOM('<div contenteditable="true">Synthetic</div><button type="submit" aria-busy="false" aria-label="Envoyer">Envoyer</button>',{url:'https://chat.mistral.ai/'});
- try{const adapter=A.resolve(dom.window.location.href);assert.equal(A.submission(adapter,trusted('click',dom.window.document.querySelector('button')),dom.window.document),dom.window.document.querySelector('[contenteditable]'));assert.equal(A.resolve('https://notebook.google.com/').id,'notebooklm');}finally{dom.window.close();}
+// Community captures conversations on ChatGPT and Claude only: any other assistant resolves to
+// no adapter, so the content script reads nothing there. Its visit is still reported, by
+// the worker's presence path (presence.test.js).
+test('only ChatGPT and Claude resolve to a capture adapter',()=>{
+ assert.deepEqual(A.adapters.map(a=>a.id),['chatgpt','claude']);
+ assert.deepEqual(Object.keys(A.aliases),['chat.openai.com']);
+ for(const url of ['https://gemini.google.com/app/abcdefgh12345678','https://www.perplexity.ai/search/00000000-0000-4000-8000-000000000000','https://notebook.google.com/']){assert.equal(A.resolve(url),null,url);assert.equal(A.context(url),null,url);}
+ assert.equal(A.resolve('https://chatgpt.com/c/abcdefgh').id,'chatgpt');assert.equal(A.resolve('https://claude.ai/chat/abcdefgh').id,'claude');
 });
 
 function selectedFile(f,name='synthetic.txt'){

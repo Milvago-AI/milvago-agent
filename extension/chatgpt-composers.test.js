@@ -67,8 +67,59 @@ test('a click on the mobile send control resolves the same submission', () => {
 
 test('the branches stay language independent', () => {
   // A branch that names a translated label only works for one language: that is the
-  // bug that left Gemini silent in French. Both send branches key off a test
+  // bug that left a provider silent in French. Both send branches key off a test
   // identifier and a structure instead.
   for (const branch of adapter.send.split(',')) {assert.ok(!/aria-label|title=/.test(branch), branch);}
   for (const branch of adapter.editor.split(',')) {assert.ok(!/aria-label|title=/.test(branch), branch);}
+});
+
+// Measured 2026-10-16 on the signed-in page: no `#prompt-textarea`, no `data-testid` anywhere
+// on the composer, a bare ProseMirror textbox and a language-dependent send label.
+const proseMirror = `<form><div data-composer-body="">
+  <div contenteditable="true" role="textbox" class="ProseMirror" data-composer-markdown=""></div>
+  <textarea hidden style="display:none">x</textarea>
+  <button type="button" aria-label="Ajouter des fichiers et plus encore"></button>
+  <button type="submit" aria-label="Envoyer" class="bg-composer-primary"></button>
+</div></form>`;
+
+test('the id-less ProseMirror composer and its send button are recognised', () => {
+  const document = page(proseMirror);
+  assert.equal(document.querySelectorAll(adapter.editor).length, 1);
+  assert.equal(document.querySelector(adapter.editor).getAttribute('role'), 'textbox');
+  assert.equal(document.querySelectorAll(adapter.send).length, 1);
+  const editor = document.querySelector(adapter.editor);
+  editor.textContent = 'Test 4';
+  const event = { type: 'keydown', key: 'Enter', isTrusted: true, isComposing: false, defaultPrevented: false, shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, target: editor };
+  assert.equal(A.submission(adapter, event, document), editor);
+  assert.equal(A.submissionTarget(adapter, event, editor, document).control.getAttribute('aria-label'), 'Envoyer');
+});
+
+// Desktop composer measured by CDP on 2026-10-16 (nothing sent, every non-GET request failed): the
+// send control is a `type="submit"` without test id nor id, inside the composer body, the last button
+// of the form, and exists only with a draft; dictation and voice are `type="button"`. A submit of the
+// form outside the composer body is not the send, whatever its label.
+const measured = `<form>
+  <button type="submit" aria-label="Synthetic other action"></button>
+  <div data-composer-body="">
+    <div class="ProseMirror" contenteditable="true" data-composer-markdown="">x</div>
+    <div data-composer-footer-responsive="">
+      <button type="button" aria-label="Ajouter des fichiers et plus encore"></button>
+      <button type="button" aria-label="Dicter"></button>
+      <div class="ms-2"><button type="submit" aria-label="Envoyer"></button></div>
+    </div>
+  </div>
+</form>`;
+test('the desktop send control is the composer submit, not any submit of its form', async () => {
+  const { factoryCatalog } = await import('./detection-factory.js');
+  for (const [label, catalog] of [['factory', null], ['catalog', factoryCatalog]]) {
+    A.applyCatalog(catalog);
+    try {
+      const chat = A.resolve('https://chatgpt.com/'), document = page(measured), editor = document.querySelector('.ProseMirror');
+      assert.deepEqual([...document.querySelectorAll(chat.send)].map(b => b.getAttribute('aria-label')), ['Envoyer'], label);
+      const enter = { type: 'keydown', key: 'Enter', isTrusted: true, isComposing: false, defaultPrevented: false, shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, target: editor };
+      assert.equal(A.submissionTarget(chat, enter, editor, document).control.getAttribute('aria-label'), 'Envoyer', label);
+      const other = { type: 'click', isTrusted: true, defaultPrevented: false, target: document.querySelector('[aria-label="Synthetic other action"]') };
+      assert.equal(A.submission(chat, other, document), null, label + ': another submit of the form is not a send');
+    } finally { A.applyCatalog(null); }
+  }
 });

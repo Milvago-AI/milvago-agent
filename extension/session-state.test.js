@@ -43,7 +43,7 @@ test('a further conversation path recognizes the signed-out page and keeps its s
     assert.equal(signedIn.conversation_id, id);
     assert.equal(signedIn.url, `https://chatgpt.com/c/${id}`);
     // Without the field, the page is not a conversation: exactly what was measured.
-    A.applyCatalog({ ...factory, providers: [chatgpt] });
+    A.applyCatalog({ ...factory, providers: [{ ...chatgpt, conversation_paths: undefined }] });
     assert.equal(A.context(`https://chatgpt.com/uc/${id}`).conversation_id, undefined);
   } finally {
     A.applyCatalog(null);

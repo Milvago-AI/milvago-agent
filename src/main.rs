@@ -90,6 +90,7 @@ fn run_service(home: &Path, stop: Arc<AtomicBool>) -> Result<()> {
         "agent service started, version {}",
         env!("CARGO_PKG_VERSION")
     ));
+    let discovery_worker = milvago_browser_agent::discovery::spawn(home.to_path_buf(), stop.clone())?;
     let _extension_server = milvago_browser_agent::extension_update::start_for_service(home, stop.clone());
     let ipc_home = home.to_path_buf();
     let ipc_channel = CHANNEL.to_string();
@@ -116,6 +117,7 @@ fn run_service(home: &Path, stop: Arc<AtomicBool>) -> Result<()> {
     });
     run_watch(home, &stop);
     milvago_browser_agent::log::info("agent service stopped");
+    discovery_worker.join().map_err(|_| "discovery worker failed")?;
     ipc_thread.join().map_err(|_| "IPC service thread failed")?
 }
 
@@ -237,6 +239,18 @@ fn run() -> Result<()> {
         println!("{}", milvago_browser_agent::health::wait(CHANNEL, ipc::Access::Browser, "community", env!("CARGO_PKG_VERSION"))?);
         return Ok(());
     }
+    if op == "discovery-wsl-probe" {
+        if args.len()!=1 {return Err("unexpected WSL probe argument".into());}
+        #[cfg(windows)]
+        return milvago_browser_agent::discovery_wsl::probe();
+        #[cfg(not(windows))]
+        return Err("WSL is unavailable on this platform".into());
+    }
+    #[cfg(windows)]
+    if op == "discovery-vmware-probe" {
+        if args.len()!=1 {return Err("unexpected VMware probe argument".into());}
+        return milvago_browser_agent::discovery_vmware::probe();
+    }
     if op == "help" {
         println!(
             "milvago-browser-agent service <state-dir>\nmilvago-browser-agent watch <state-dir>\nmilvago-browser-agent enroll <state-dir> <provision.json> <hostname>\nmilvago-browser-agent sync <state-dir>\nmilvago-browser-agent status <state-dir>"
@@ -260,6 +274,16 @@ fn run() -> Result<()> {
     // like the running service; the log stays quiet here, only the configuration is
     // registered.
     milvago_browser_agent::config::open(&home);
+
+    #[cfg(target_os = "linux")]
+    if op == "import-discovery-enrollment" {
+        return milvago_browser_agent::discovery_privileged::enrollment::import(&home, "community", &mut io::stdin());
+    }
+    #[cfg(target_os = "linux")]
+    if op == "bootstrap" && std::env::var("MILVAGO_DISCOVERY_MANAGED").as_deref() == Ok("1") {
+        return Ok(());
+    }
+
     if op == "installation-info" {
         println!(
             "{}",

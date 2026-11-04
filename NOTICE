@@ -10,3 +10,8 @@ The Milvago server and console are distributed separately under AGPL-3.0-only. T
 Enterprise modules are proprietary and are not part of this repository.
 
 Third-party dependencies retain their own licenses.
+
+Discovery includes reviewed Apache-2.0 HTTP fingerprints from Julius
+(Praetorian), reviewed probes at revision eb45b89 and Hermes contribution ed26a485.
+See discovery-engine/NOTICE and
+discovery-engine/LICENSE for attribution and license terms.

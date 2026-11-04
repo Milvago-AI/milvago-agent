@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
+
 use std::{cell::{Cell, RefCell}, fs, fs::OpenOptions, os::windows::fs::OpenOptionsExt};
 
 fn signed<T: Serialize>(key: &SigningKey, value: &T) -> Envelope {
@@ -36,7 +36,7 @@ fn live_catalog(key: &SigningKey) -> Envelope {
             id: "chatgpt".into(), label: "Synthetic provider".into(), domains: vec!["chatgpt.com".into()],
             aliases: vec![], conversation_path: String::new(), conversation_segment: 0, conversation_paths: vec![],
             dom: detection::Dom { editor:String::new(), send:String::new(), response:String::new() },
-            network: vec![], qualified_at: now.to_rfc3339(), asset_hosts: vec![],
+            network: vec![], qualified_at: "2000-01-01T00:00:00Z".into(), asset_hosts: vec![],
         }],
         native_tools: vec![],
         heuristics: detection::Heuristics { keys: vec![], mime_types: vec![] },
@@ -47,7 +47,7 @@ fn live_catalog(key: &SigningKey) -> Envelope {
         kind:"detection_catalog".into(), schema:1, revision:1, issued_at:now,
         expires_at:now+Duration::minutes(10),
         min_engine:detection::Engines { extension:detection::ENGINE_VERSION.into(), bridge:detection::ENGINE_VERSION.into() },
-        content_hash:format!("{:x}",Sha256::digest(&raw)), content:STANDARD.encode(raw),
+        content_hash:crate::sha256_hex(&raw), content:STANDARD.encode(raw),
     })
 }
 
@@ -75,7 +75,7 @@ fn memory_authority() -> (Authority, Value, shadow::ShadowPolicy, String) {
         "cache_catalog_revision":journal.catalog_revision,
     });
     let stored = Stored { journal, keys, queue:Default::default() };
-    (Authority { stored, storage:Storage::Memory, storage_failed:false }, response, policy, boot)
+    (Authority { stored, storage:Storage::Memory, storage_failed:false, masked:Vec::new(), replay:Default::default() }, response, policy, boot)
 }
 
 fn wrapped(request: Value) -> crate::browser_broker::Parsed {
@@ -264,7 +264,7 @@ fn reachable_offline_agent_keeps_every_browser_operation_connected_past_grace() 
         }
     };
     for op in ["browser_policy", "browser_catalog", "browser_inspect", "browser_submit"] {
-        let (mode, reply) = authority.answer_with(&request(op), &mut exchange, &boot, 400_101).unwrap();
+        let (mode, reply) = authority.answer_direct_with(&request(op), &mut exchange, &boot, 400_101).unwrap();
         assert_eq!(mode, "connected", "{op}");
         assert_ne!(reply["ok"], false, "{op}: {reply}");
         if op == "browser_policy" { assert_eq!(reply["online"], false); }
@@ -300,19 +300,19 @@ fn stale_system_copy_does_not_block_live_custody_or_duplicate_recovery() {
             other => Err(format!("unexpected operation {other}").into()),
         }
     };
-    let (mode, first) = authority.answer_with(&parsed, &mut exchange, &boot, 500).unwrap();
+    let (mode, first) = authority.answer_direct_with(&parsed, &mut exchange, &boot, 500).unwrap();
     assert_eq!(mode, "connected");
     assert_eq!(first["durable"], true);
     assert_eq!(authority.stored.queue.len(), 1);
     assert!(!authority.stored.journal.armed, "stale SYSTEM cache must not grant later grace");
 
     allow_delivery.set(true);
-    authority.answer_with(&request("browser_policy"), &mut exchange, &boot, 600).unwrap();
+    authority.answer_direct_with(&request("browser_policy"), &mut exchange, &boot, 600).unwrap();
     assert_eq!(authority.stored.queue.len(), 1, "interactive policy lookup never drains");
     assert!(authority.drain_one_with(&mut exchange).unwrap());
     assert_eq!(authority.stored.queue.len(), 0);
     assert_eq!(delivered.borrow().len(), 1);
-    let (_, replay) = authority.answer_with(&parsed, &mut exchange, &boot, 700).unwrap();
+    let (_, replay) = authority.answer_direct_with(&parsed, &mut exchange, &boot, 700).unwrap();
     assert_eq!(replay["id"], first["id"]);
     assert_eq!(delivered.borrow().len(), 1, "stable delivery receipt prevents a duplicate");
 }
@@ -333,7 +333,7 @@ fn connected_preparation_masks_before_system_custody_and_rejects_stale_provenanc
             other => Err(format!("unexpected operation {other}").into()),
         }
     };
-    let (_, reply) = authority.answer_with(&parsed, &mut exchange, &boot, 500).unwrap();
+    let (_, reply) = authority.answer_direct_with(&parsed, &mut exchange, &boot, 500).unwrap();
     assert_eq!(reply["durable"], true);
     let stored = authority.stored.queue.pending[0].event.prompt.as_deref().unwrap();
     for secret in ["a@example.invalid", "b@example.invalid", "192.0.2.1", "ID-42"] {
@@ -355,7 +355,7 @@ fn connected_preparation_masks_before_system_custody_and_rejects_stale_provenanc
             _ => Err("unexpected operation".into()),
         }
     };
-    assert!(forged.answer_with(&parsed, &mut tampered, &boot, 550).is_err());
+    assert!(forged.answer_direct_with(&parsed, &mut tampered, &boot, 550).is_err());
     assert_eq!(forged.stored.queue.len(), 0);
 
     let (mut stale, response, policy, boot) = memory_authority();
@@ -370,7 +370,7 @@ fn connected_preparation_masks_before_system_custody_and_rejects_stale_provenanc
             _ => Err("unexpected operation".into()),
         }
     };
-    assert!(stale.answer_with(&parsed, &mut changed, &boot, 600).is_err());
+    assert!(stale.answer_direct_with(&parsed, &mut changed, &boot, 600).is_err());
     assert_eq!(stale.stored.queue.len(), 0);
 }
 
@@ -379,16 +379,16 @@ fn unreachable_agent_gets_one_monotone_grace_and_never_renews_it() {
     let (mut authority, _response, _policy, boot) = memory_authority();
     let parsed = request("browser_policy");
     let mut unavailable = |_request: &Value| -> Result<Value> { Err("agent unavailable".into()) };
-    let (mode, _) = authority.answer_with(&parsed, &mut unavailable, &boot, 1_000).unwrap();
+    let (mode, _) = authority.answer_direct_with(&parsed, &mut unavailable, &boot, 1_000).unwrap();
     assert_eq!(mode, "grace");
     let deadline = authority.stored.journal.deadline;
-    let (mode, _) = authority.answer_with(&parsed, &mut unavailable, &boot, 300_999).unwrap();
+    let (mode, _) = authority.answer_direct_with(&parsed, &mut unavailable, &boot, 300_999).unwrap();
     assert_eq!(mode, "grace");
     assert_eq!(authority.stored.journal.deadline, deadline);
-    assert!(authority.answer_with(&parsed, &mut unavailable, &boot, 301_000).is_err());
+    assert!(authority.answer_direct_with(&parsed, &mut unavailable, &boot, 301_000).is_err());
     assert_eq!(authority.stored.journal.deadline, deadline);
     assert!(!authority.stored.journal.armed);
-    assert!(authority.answer_with(&parsed, &mut unavailable, &boot, 301_001).is_err());
+    assert!(authority.answer_direct_with(&parsed, &mut unavailable, &boot, 301_001).is_err());
     assert_eq!(authority.stored.journal.deadline, deadline);
 }
 
@@ -396,7 +396,7 @@ fn unreachable_agent_gets_one_monotone_grace_and_never_renews_it() {
 fn explicit_or_cryptographically_invalid_agent_state_still_blocks() {
     let (mut refused, _response, _policy, boot) = memory_authority();
     let mut deny = |_request: &Value| -> Result<Value> { Ok(json!({"ok":false,"error":"operation_refused"})) };
-    let (mode, reply) = refused.answer_with(&request("browser_policy"), &mut deny, &boot, 200).unwrap();
+    let (mode, reply) = refused.answer_direct_with(&request("browser_policy"), &mut deny, &boot, 200).unwrap();
     assert_eq!(mode, "blocked");
     assert_eq!(reply["error"], "agent_refused");
     assert!(refused.stored.journal.cache.is_none());
@@ -418,7 +418,7 @@ fn explicit_or_cryptographically_invalid_agent_state_still_blocks() {
             _ => Err("unexpected operation".into()),
         }
     };
-    let (mode, _) = invalid.answer_with(&request("browser_policy"), &mut forged, &boot, 300).unwrap();
+    let (mode, _) = invalid.answer_direct_with(&request("browser_policy"), &mut forged, &boot, 300).unwrap();
     assert_eq!(mode, "connected", "a stale SYSTEM copy cannot downgrade a live agent");
     assert!(!invalid.stored.journal.armed);
     assert!(matches!(invalid.sync_cache(&response, &mut forged, &boot, 301), CacheSync::Refused));
@@ -430,4 +430,589 @@ fn corrupt_snapshot_without_committed_copy_is_refused() {
     let dir=tempfile::tempdir().unwrap();let root=dir.path();let s=fixture();commit(root,&s).unwrap();
     fs::write(root.join("state.bin"),b"corrupt").unwrap();fs::write(root.join("pending.bin"),b"corrupt").unwrap();
     assert!(recover(root,&s.journal.pin).is_err());assert_eq!(fs::read(root.join("state.bin")).unwrap(),b"corrupt");
+}
+
+fn draft(op: &str, text: &str, sid: &str) -> crate::browser_broker::Parsed {
+    let mut request = json!({"protocol":broker::PROTOCOL,"op":op,"challenge":STANDARD.encode([13u8;32]),
+        "tool":"chrome","provider":"chatgpt.com","text":text,"upload":false});
+    if op == "browser_submit" {
+        request["delivery_id"]=json!(uuid::Uuid::new_v4().to_string());
+        request["event"]=json!({"tool":"chrome"});
+    }
+    broker::parse(&json!({"protocol":broker::PROTOCOL,"op":"browser_request",
+        "caller":{"user":"synthetic-user","sid":sid},
+        "body":STANDARD.encode(serde_json::to_vec(&request).unwrap())})).unwrap()
+}
+
+/// Inspects a draft carrying a custom-rule match, then submits `sent` from `sid`;
+/// returns the masked text and the queued event, serialized.
+fn masked_send(sent: Option<&str>, sid: &str) -> (String, String) {
+    let (mut authority, response, policy, boot) = memory_authority();
+    let mut exchange = |request: &Value| -> Result<Value> {
+        match request["op"].as_str().unwrap_or("") {
+            "policy_v3" => Ok(response.clone()),
+            "inspect" => crate::native::inspect_authorized_request(&policy, request),
+            "broker_inspect" => Ok(json!({"ok":true,"policy_content_hash":response["cache_policy_content_hash"],
+                "inspection":crate::native::inspect_authorized_request(&policy, request)?})),
+            "broker_prepare_event" => Ok(prepared_event(&policy, &response, request)),
+            other => Err(format!("unexpected operation {other}").into()),
+        }
+    };
+    let owner = "S-1-5-21-1-2-3-1001";
+    let (_, inspected) = authority.answer_direct_with(&draft("browser_inspect", "reference ID-4242 synthetic", owner), &mut exchange, &boot, 400).unwrap();
+    let masked = inspected["text"].as_str().unwrap().to_string();
+    assert_ne!(masked, "reference ID-4242 synthetic", "the draft is masked: {inspected}");
+    assert_eq!(inspected["labels"], json!(["custom"]));
+    let sent = sent.unwrap_or(&masked);
+    let (_, reply) = authority.answer_direct_with(&draft("browser_submit", sent, sid), &mut exchange, &boot, 401).unwrap();
+    assert_eq!(reply["recorded"], true, "{reply}");
+    assert_eq!(authority.stored.queue.pending.len(), 1);
+    (masked, serde_json::to_string(&authority.stored.queue.pending[0].event).unwrap())
+}
+
+#[test]
+fn masked_send_keeps_the_labels_of_the_unmasked_draft() {
+    let (masked, event) = masked_send(None, "S-1-5-21-1-2-3-1001");
+    let event: Value = serde_json::from_str(&event).unwrap();
+    assert_eq!(event["labels"], json!(["custom"]));
+    assert_eq!(event["prompt"], json!(masked));
+    assert!(!event.to_string().contains("ID-4242"), "unmasked text never reaches the event: {event}");
+}
+
+#[test]
+fn another_draft_or_account_cannot_borrow_masked_labels() {
+    let (_, other_draft) = masked_send(Some("unrelated synthetic body"), "S-1-5-21-1-2-3-1001");
+    assert!(other_draft.contains("\"labels\":[]"), "{other_draft}");
+    // Same masked text, other OS account: the inspection was not its own.
+    let (_, other_account) = masked_send(None, "S-1-5-21-1-2-3-1002");
+    assert!(other_account.contains("\"labels\":[]"), "{other_account}");
+}
+
+/// Inspects `pasted` (a paste reviewed apart), then submits whatever `send` builds from its
+/// masked text, from `sid`; returns the queued event's labels.
+fn paste_then_send(pasted: &str, send: impl Fn(&str) -> String, sid: &str) -> Value {
+    let (mut authority, response, policy, boot) = memory_authority();
+    let mut exchange = |request: &Value| -> Result<Value> {
+        match request["op"].as_str().unwrap_or("") {
+            "policy_v3" => Ok(response.clone()),
+            "inspect" => crate::native::inspect_authorized_request(&policy, request),
+            "broker_inspect" => Ok(json!({"ok":true,"policy_content_hash":response["cache_policy_content_hash"],
+                "inspection":crate::native::inspect_authorized_request(&policy, request)?})),
+            "broker_prepare_event" => Ok(prepared_event(&policy, &response, request)),
+            other => Err(format!("unexpected operation {other}").into()),
+        }
+    };
+    let (_, inspected) = authority.answer_direct_with(&draft("browser_inspect", pasted, "S-1-5-21-1-2-3-1001"), &mut exchange, &boot, 400).unwrap();
+    let masked = inspected["text"].as_str().unwrap().to_string();
+    assert!(!masked.contains("ID-4242"), "{inspected}");
+    let (_, reply) = authority.answer_direct_with(&draft("browser_submit", &send(&masked), sid), &mut exchange, &boot, 401).unwrap();
+    assert_eq!(reply["recorded"], true, "{reply}");
+    let event = serde_json::to_value(&authority.stored.queue.pending[0].event).unwrap();
+    assert!(!event.to_string().contains("ID-4242"), "{event}");
+    // Single-use: the same draft sent again borrows nothing.
+    let (_, again) = authority.answer_direct_with(&draft("browser_submit", &send(&masked), sid), &mut exchange, &boot, 402).unwrap();
+    assert_eq!(again["labels"], json!([]), "{again}");
+    event["labels"].clone()
+}
+
+// Real campaign 0.7.10: a masked paste of three lines, laid out by the editor with a doubled break
+// between paragraphs, was recorded with `labels=[]`.
+#[test]
+fn a_masked_paste_lends_its_labels_to_the_draft_that_carries_it() {
+    const PASTE: &str = "Ligne un ID-4242\nLigne deux synthetique\nReponds juste OK.";
+    let owner = "S-1-5-21-1-2-3-1001";
+    assert_eq!(paste_then_send(PASTE, |m| m.replace('\n', "\n\n"), owner), json!(["custom"]));
+    assert_eq!(paste_then_send(PASTE, |m| format!("Question avant\n{}\n  \nApres", m.replace('\n', "\n\n")), owner), json!(["custom"]));
+    assert_eq!(paste_then_send(PASTE, |m| m.replace(' ', "\u{a0}  "), owner), json!(["custom"]), "blanks collapsed");
+}
+
+#[test]
+fn a_partial_or_foreign_paste_lends_no_labels() {
+    const PASTE: &str = "Ligne un ID-4242\nLigne deux synthetique\nReponds juste OK.";
+    let owner = "S-1-5-21-1-2-3-1001";
+    assert_eq!(paste_then_send(PASTE, |m| m.lines().take(2).collect::<Vec<_>>().join("\n"), owner), json!([]), "a line missing");
+    assert_eq!(paste_then_send(PASTE, |m| m.replace("Ligne un", "Ligne une"), owner), json!([]), "a line changed");
+    assert_eq!(paste_then_send(PASTE, |m| m.replace('\n', " "), owner), json!([]), "lines merged into one");
+    assert_eq!(paste_then_send(PASTE, |m| m.to_string(), "S-1-5-21-1-2-3-1002"), json!([]), "another OS account");
+    assert_eq!(paste_then_send(PASTE, |_| "unrelated synthetic body".into(), owner), json!([]));
+}
+
+fn memory_dlp_authority() -> (Authority,Value,shadow::ShadowPolicy,String) {
+    let (mut authority,_,mut policy,boot)=memory_authority();
+    policy.version=4;
+    policy.config["collection"]=json!({"enabled":false,"store_content":false,"store_file_names":false});
+    policy.config["dlp_legacy_disabled"]=json!(true);
+    policy.config["dlp_fingerprint"]=json!("a".repeat(64));
+    policy.config["dlp_context"]=json!({"device_id":"dc93a18c-a541-40e4-a39b-46892967fc54","organization_id":"5ea5b3f3-17ad-4084-b092-28a019f9e1f3","group_id":"none"});
+    policy.config["dlp"]=json!({"schema_version":1,"domain":"endpoint","inspection":true,"native_inspection":false,"journal":true,"detectors":[],"rules":[{
+        "id":"replacement","revision":1,"name":"Frozen replacement","mode":"active","priority":1,"condition":{"op":"contains","field":"prompt","value":"Tomate","ignore_case":false,"whole_word":false},"scope":{"op":"true"},"consequence":{"action":"replace","value":"Tomate","replacement":"Carotte","ignore_case":false,"whole_word":false},"review":true,"message":""
+    }]});
+    // This is a different signed policy, not a renewal of the original bytes.
+    policy.revision+=1;
+    policy.issued_at+=Duration::milliseconds(1);
+    policy.expires_at+=Duration::milliseconds(1);
+    let key=SigningKey::from_bytes(&[73;32]);let envelope=signed(&key,&policy);
+    cache::prepare(&mut authority.stored.journal,&authority.stored.keys,&envelope,&live_catalog(&key)).unwrap();
+    let journal=&authority.stored.journal;
+    let response=json!({"ok":true,"online":true,"policy":crate::native::browser_policy(&policy),"cache_policy_hash":cache::envelope_hash(&envelope).unwrap(),"cache_authorization_generation":7,"cache_policy_content_hash":journal.policy_content_hash,"cache_catalog_content_hash":journal.catalog_content_hash,"cache_catalog_revision":journal.catalog_revision});
+    (authority,response,policy,boot)
+}
+fn dlp_exchange(response:&Value,policy:&shadow::ShadowPolicy,request:&Value)->Result<Value> {
+    match request["op"].as_str().unwrap_or("") {
+        "policy_v3"=>Ok(response.clone()),
+        "inspect"=>crate::native::inspect_authorized_request(policy,request),
+        "broker_inspect"=>Ok(json!({"ok":true,"policy_content_hash":response["cache_policy_content_hash"],"inspection":crate::native::inspect_authorized_request(policy,request)?})),
+        other=>Err(format!("unexpected fixture operation {other}").into()),
+    }
+}
+
+#[test]
+fn dlp_replacement_without_legacy_labels_keeps_single_use_custody_and_network_completion() {
+    let (mut authority,response,policy,boot)=memory_dlp_authority();
+    let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let owner="S-1-5-21-1-2-3-1001";
+    let (_,inspected)=authority.answer_direct_with(&draft("browser_inspect","Tomate",owner),&mut exchange,&boot,400).unwrap();
+    assert_eq!(inspected["text"],"Carotte");assert_eq!(inspected["labels"],json!([]));assert!(inspected["dlp_receipt"].is_string());
+    let submit=draft("browser_submit","Carotte",owner);
+    let (_,sent)=authority.answer_direct_with(&submit,&mut exchange,&boot,401).unwrap();
+    assert_eq!(sent["recording_required"],true);assert_eq!(sent["durable"],true);
+    let event=&authority.stored.queue.pending[0].event;
+    assert!(event.prompt.is_none());let trace=event.dlp.as_ref().unwrap();assert_eq!(trace.action,"transform");assert_eq!(trace.delivery,"prepared");assert_eq!(trace.decisions[0].rule_name,"Frozen replacement");
+    assert!(!serde_json::to_string(event).unwrap().contains("Tomate"));
+    let (_,again)=authority.answer_direct_with(&draft("browser_submit","Carotte",owner),&mut exchange,&boot,402).unwrap();
+    assert_eq!(again["recording_required"],false);assert_eq!(authority.stored.queue.pending.len(),1);
+    let complete=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_complete","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":submit.request.delivery_id,"completion":{"model":"fixture-model"}}));
+    let (_,done)=authority.answer_direct_with(&complete,&mut exchange,&boot,403).unwrap();assert_eq!(done["applied"],true);
+    assert_eq!(authority.stored.queue.pending[0].event.dlp.as_ref().unwrap().delivery,"observed");
+}
+
+#[test]
+fn dlp_cancel_receipt_is_bound_to_the_account_and_cannot_be_replayed() {
+    let (mut authority,response,policy,boot)=memory_dlp_authority();let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let (_,inspected)=authority.answer_direct_with(&draft("browser_inspect","Tomate","S-1-5-21-1-2-3-1001"),&mut exchange,&boot,400).unwrap();
+    let cancel=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_cancelled","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":inspected["dlp_receipt"]}));
+    let mut foreign=cancel.clone();foreign.principal="S-1-5-21-1-2-3-1002".into();
+    assert_eq!(authority.answer_direct_with(&foreign,&mut exchange,&boot,401).unwrap().1["applied"],false);
+    assert_eq!(authority.answer_direct_with(&cancel,&mut exchange,&boot,402).unwrap().1["applied"],true);
+    assert_eq!(authority.answer_direct_with(&cancel,&mut exchange,&boot,403).unwrap().1["applied"],false);
+    assert_eq!(authority.stored.queue.pending.len(),1);
+    let event=&authority.stored.queue.pending[0].event;assert!(event.prompt.is_none());assert_eq!(event.dlp.as_ref().unwrap().delivery,"cancelled");assert_eq!(event.dlp.as_ref().unwrap().decisions[0].outcome,"cancelled");
+}
+
+#[test]
+fn dlp_response_inspection_never_creates_a_prompt_receipt_or_attempt() {
+    let (mut authority,response,policy,boot)=memory_dlp_authority();let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let mut observation=draft("browser_inspect","Tomate","S-1-5-21-1-2-3-1001");observation.request.observation=Some(true);
+    let (_,reply)=authority.answer_direct_with(&observation,&mut exchange,&boot,400).unwrap();assert_eq!(reply["text"],"Carotte");
+    assert!(reply["dlp_receipt"].is_null());assert!(authority.masked.is_empty());assert!(authority.stored.queue.pending.is_empty());
+}
+
+#[test]
+fn generated_numbered_masks_are_reused_only_with_exact_privileged_custody() {
+ for journal in [false,true] {
+    let (mut authority,mut response,mut policy,boot)=memory_dlp_authority();
+    policy.config["dlp"]["journal"]=json!(journal);
+    policy.config["dlp"]["detectors"]=json!([{"id":"digits","name":"Digits","definition":{"kind":"regex","pattern":"[0-9]+","ignore_case":false}}]);
+    policy.config["dlp"]["rules"][0]["condition"]=json!({"op":"matches","field":"prompt","detector":"digits","minimum":1});
+    policy.config["dlp"]["rules"][0]["consequence"]=json!({"action":"mask","detector":"digits","label":"NUMBER"});
+    response["policy"]=crate::native::browser_policy(&policy);
+    let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+    let owner="S-1-5-21-1-2-3-1001";
+    let (_,checked)=authority.answer_direct_with(&draft("browser_inspect","12 34",owner),&mut exchange,&boot,400).unwrap();
+    assert_eq!(checked["text"],"[NUMBER1] [NUMBER2]");
+    let (_,sent)=authority.answer_direct_with(&draft("browser_submit","[NUMBER1] [NUMBER2]",owner),&mut exchange,&boot,401).unwrap();
+    assert_eq!(sent["action"],"observe");assert_eq!(sent["text"],"[NUMBER1] [NUMBER2]");
+    let (_,foreign)=authority.answer_direct_with(&draft("browser_submit","[NUMBER1] [NUMBER2]","S-1-5-21-1-2-3-1002"),&mut exchange,&boot,402).unwrap();
+    assert_ne!(foreign["text"],"[NUMBER1] [NUMBER2]");
+ }
+}
+
+#[test]
+fn dlp_confirmation_is_required_single_use_context_bound_and_independent_of_journaling(){
+ for journal in [false,true] {
+ let (mut authority,mut response,mut policy,boot)=memory_dlp_authority();
+ policy.config["dlp"]["journal"]=json!(journal);
+ policy.config["dlp"]["rules"][0]["consequence"]=json!({"action":"warn"});
+ policy.config["dlp"]["rules"][0]["review"]=json!(false);
+ policy.config["dlp"]["rules"][0]["message"]=json!("Confirm before sending.");
+ response["policy"]=crate::native::browser_policy(&policy);
+ let mut exchange=|request:&Value|dlp_exchange(&response,&policy,request);
+ let owner="S-1-5-21-1-2-3-1001";
+ let (_,checked)=authority.answer_direct_with(&draft("browser_inspect","Tomate",owner),&mut exchange,&boot,400).unwrap();
+ assert_eq!(checked["confirmation"],true);assert_eq!(checked["text"],"Tomate");
+ let receipt=checked["dlp_receipt"].as_str().unwrap();
+ let submit=draft("browser_submit","Tomate",owner);
+ assert_eq!(authority.answer_direct_with(&submit,&mut exchange,&boot,401).unwrap().1["action"],"review");
+ let confirm=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_confirm","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":receipt}));
+ let mut foreign=confirm.clone();foreign.principal="S-1-5-21-1-2-3-1002".into();
+ assert_eq!(authority.answer_direct_with(&foreign,&mut exchange,&boot,402).unwrap().1["applied"],false);
+ assert_eq!(authority.answer_direct_with(&confirm,&mut exchange,&boot,403).unwrap().1["applied"],true);
+ assert_eq!(authority.answer_direct_with(&confirm,&mut exchange,&boot,404).unwrap().1["applied"],false);
+ let mut approved=submit.clone();approved.request.approval_id=Some(receipt.into());
+ let (_,sent)=authority.answer_direct_with(&approved,&mut exchange,&boot,405).unwrap();assert_eq!(sent["action"],"observe");
+ assert_eq!(authority.answer_direct_with(&approved,&mut exchange,&boot,406).unwrap().1["action"],"review");
+ assert_eq!(authority.stored.queue.pending.len(),if journal{1}else{0});
+ if journal{let trace=authority.stored.queue.pending[0].event.dlp.as_ref().unwrap();assert_eq!(trace.action,"observe");assert_eq!(trace.decisions[0].consequence,"warn");}
+ }
+}
+
+#[test]
+fn dlp_confirmation_requires_the_current_projected_fingerprint_and_browser() {
+ let (mut authority,mut response,mut policy,boot)=memory_dlp_authority();
+ policy.config["dlp"]["rules"][0]["consequence"]=json!({"action":"warn"});
+ policy.config["dlp"]["rules"][0]["review"]=json!(false);
+ policy.config["dlp"]["rules"][0]["message"]=json!("Confirm before sending.");
+ response["policy"]=crate::native::browser_policy(&policy);
+ let owner="S-1-5-21-1-2-3-1001";
+ let (_,checked)=authority.answer_direct_with(&draft("browser_inspect","Tomate",owner),&mut |r|dlp_exchange(&response,&policy,r),&boot,400).unwrap();
+ let receipt=checked["dlp_receipt"].as_str().unwrap();
+ let confirm=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_confirm","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":receipt}));
+ let mut foreign=confirm.clone();foreign.request.tool="edge".into();
+ assert_eq!(authority.answer_direct_with(&foreign,&mut |r|dlp_exchange(&response,&policy,r),&boot,401).unwrap().1["applied"],false);
+ let original=response["policy"]["config"]["dlp_control"]["fingerprint"].clone();
+ for fingerprint in [Value::Null,json!("b".repeat(64))] {
+  response["policy"]["config"]["dlp_control"]["fingerprint"]=fingerprint;
+  assert_eq!(authority.answer_direct_with(&confirm,&mut |r|dlp_exchange(&response,&policy,r),&boot,402).unwrap().1["applied"],false);
+ }
+ response["policy"]["config"]["dlp_control"]["fingerprint"]=original;
+ assert_eq!(authority.answer_direct_with(&confirm,&mut |r|dlp_exchange(&response,&policy,r),&boot,403).unwrap().1["applied"],true);
+ assert_eq!(authority.answer_direct_with(&confirm,&mut |r|dlp_exchange(&response,&policy,r),&boot,404).unwrap().1["applied"],false);
+}
+#[test]
+fn cached_authorized_inspection_cannot_recover_a_later_observed_outage() {
+    use std::sync::{Arc, Mutex, mpsc}; use std::thread;
+    let (target, response, policy, boot) = memory_authority();
+    let slot = Arc::new(Mutex::new(Some(target))); let worker_slot = slot.clone();
+    let worker_boot = boot.clone(); let parsed = request("browser_inspect");
+    let (started, observed) = mpsc::channel(); let (release, wait) = mpsc::channel();
+    let worker = thread::spawn(move || crate::cache_replay::drive(&worker_slot,
+        &super::authority_replay::Operation::Browser { parsed, boot:worker_boot, deadline:Instant::now()+std::time::Duration::from_secs(5) },
+        Instant::now()+std::time::Duration::from_secs(5), || unreachable!(), |request, _| {
+            if request["op"] == "policy_v3" { return crate::cache_replay::Reply::Value(response.clone()); }
+            assert_eq!(request["op"], "inspect");
+            started.send(()).unwrap(); wait.recv().unwrap();
+            crate::cache_replay::Reply::Value(crate::native::inspect_authorized_request(&policy,request).unwrap())
+        }));
+    observed.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    crate::cache_replay::drive(&slot,
+        &super::authority_replay::Operation::Browser { parsed:request("browser_policy"), boot, deadline:Instant::now()+std::time::Duration::from_secs(5) },
+        Instant::now()+std::time::Duration::from_secs(5), || unreachable!(), |_, _| crate::cache_replay::Reply::Unreachable).unwrap();
+    let outage_deadline = slot.lock().unwrap().as_ref().unwrap().stored.journal.deadline;
+    assert!(outage_deadline.is_some());
+    release.send(()).unwrap(); assert!(worker.join().unwrap().is_err());
+    assert_eq!(slot.lock().unwrap().as_ref().unwrap().stored.journal.deadline, outage_deadline);
+}
+
+#[test]
+fn every_local_event_preparation_branch_suspends_outside_authority() {
+    use std::sync::{Arc, Mutex, mpsc}; use std::thread;
+    let owner = "S-1-5-21-1-2-3-1001";
+    // Offline event, offline submit, connected trace submit, blocked inspection,
+    // and cancelled receipt all reach the same real out-of-lock local work path.
+    for case in 0..5 {
+        let (mut target, mut response, mut policy, boot) = if case < 2 { memory_authority() } else { memory_dlp_authority() };
+        if case == 3 {
+            policy.config["dlp"]["rules"][0]["consequence"] = json!({"action":"block"});
+            // A block has no interactive transformation to review.
+            policy.config["dlp"]["rules"][0]["review"] = json!(false);
+            policy.revision += 1; policy.issued_at += Duration::milliseconds(1); policy.expires_at += Duration::milliseconds(1);
+            let key = SigningKey::from_bytes(&[73;32]); let envelope = signed(&key,&policy);
+            cache::prepare(&mut target.stored.journal,&target.stored.keys,&envelope,&live_catalog(&key)).unwrap();
+            response["policy"] = crate::native::browser_policy(&policy);
+            response["cache_policy_hash"] = json!(cache::envelope_hash(&envelope).unwrap());
+            response["cache_policy_content_hash"] = json!(target.stored.journal.policy_content_hash);
+        }
+        let mut receipt = None;
+        if matches!(case, 2 | 4) {
+            let mut exchange = |request:&Value| dlp_exchange(&response,&policy,request);
+            let (_, inspected) = target.answer_direct_with(&draft("browser_inspect","Tomate",owner), &mut exchange, &boot, 400).unwrap();
+            receipt = inspected["dlp_receipt"].as_str().map(str::to_owned);
+            assert!(receipt.is_some());
+        }
+        let parsed = match case {
+            0 => event_request(uuid::Uuid::new_v4()),
+            1 => draft("browser_submit","synthetic plain",owner),
+            2 => draft("browser_submit","Carotte",owner),
+            3 => draft("browser_inspect","Tomate",owner),
+            _ => wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_cancelled",
+                "challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":receipt.unwrap()})),
+        };
+        let slot = Arc::new(Mutex::new(Some(target))); let worker_slot = slot.clone();
+        let (started, observed) = mpsc::channel(); let (release, wait) = mpsc::channel();
+        let worker = thread::spawn(move || crate::cache_replay::drive(&worker_slot,
+            &super::authority_replay::Operation::Browser { parsed, boot, deadline:Instant::now()+std::time::Duration::from_secs(5) },
+            Instant::now()+std::time::Duration::from_secs(5), || unreachable!(), |request, _| {
+                if request["op"] == "cache_local_event" {
+                    started.send(()).unwrap(); wait.recv().unwrap();
+                }
+                if let Some(result) = crate::cache_replay_authority::local_work(request) {
+                    return crate::cache_replay::Reply::Value(result.unwrap());
+                }
+                if request["op"] == "policy_v3" && case < 2 { return crate::cache_replay::Reply::Unreachable; }
+                crate::cache_replay::Reply::Value(dlp_exchange(&response,&policy,request).unwrap())
+            }));
+        observed.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        { let locked = slot.try_lock().expect("local event preparation held the Authority mutex");
+          assert!(locked.as_ref().unwrap().stored.queue.pending.is_empty()); }
+        release.send(()).unwrap(); worker.join().unwrap().unwrap();
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().stored.queue.pending.len(), 1, "branch {case} lost custody");
+    }
+}
+
+fn replay_signed_body(reply:&Value)->Value{
+    serde_json::from_slice(&STANDARD.decode(reply["signed"]["payload"].as_str().unwrap()).unwrap()).unwrap()
+}
+
+#[test]
+fn unattributed_legacy_completion_is_refused_before_any_remote_forwarding(){
+    use std::sync::{Arc,Mutex};
+    let(mut target,response,policy,boot)=memory_authority();let delivery=uuid::Uuid::new_v4();
+    let id=target.stored.queue.admit(&target.stored.journal,&policy,&event_request(delivery)).unwrap();
+    target.stored.queue.pending[0].principal.clear();
+    let slot=Mutex::new(Some(target));let ownership=Arc::new(crate::cache_replay::Ownership::default());
+    let parsed=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_complete","challenge":STANDARD.encode([11u8;32]),
+        "tool":"chrome","delivery_id":delivery,"completion":{"model":"synthetic-legacy-model"}}));
+    let deadline=Instant::now()+std::time::Duration::from_secs(5);
+    let reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed,boot,deadline},deadline,
+        ||unreachable!(),|request,_|{assert_eq!(request["op"],"policy_v3");crate::cache_replay::Reply::Value(response.clone())}).unwrap();
+    assert_eq!(replay_signed_body(&reply)["reply"]["applied"],false);
+    let locked=slot.lock().unwrap();let row=&locked.as_ref().unwrap().stored.queue.pending[0];
+    assert_eq!(row.event.id,id);assert!(row.event.model.is_none());
+}
+
+#[test]
+fn owned_handoff_reconciles_ack_without_rearming_and_exposes_real_receiver_refusal(){
+    use std::sync::{Arc,Mutex,mpsc};use std::thread;
+    for refuse in [false,true]{
+        let(mut target,_,policy,boot)=memory_authority();let delivery=uuid::Uuid::new_v4();
+        let a=event_request(delivery);let id=target.stored.queue.admit(&target.stored.journal,&policy,&a).unwrap();
+        let mut b=event_request(uuid::Uuid::new_v4());b.principal="S-1-5-21-1-2-3-1002".into();
+        target.stored.queue.admit(&target.stored.journal,&policy,&b).unwrap();
+        let home=tempfile::tempdir().unwrap();let remote=home.path().to_path_buf();
+        let signing=SigningKey::from_bytes(&[73;32]);
+        let state=crate::State{public_key:STANDARD.encode(signing.verifying_key().as_bytes()),shadow_revision:1,
+            shadow_policy:Some(live_policy(&signing,1)),detection:crate::detection::Cache{
+                revision:target.stored.journal.catalog_revision,content_hash:target.stored.journal.catalog_content_hash.clone(),..Default::default()},..Default::default()};
+        {let store=crate::Store::open(&remote).unwrap();store.save(&state).unwrap();}
+        let slot=Arc::new(Mutex::new(Some(target)));let ownership=Arc::new(crate::cache_replay::Ownership::default());
+        let worker_slot=slot.clone();let worker_ownership=ownership.clone();let worker_remote=remote.clone();let worker_boot=boot.clone();
+        let(ack_ready,ack_seen)=mpsc::channel();let(release_ack,wait_ack)=mpsc::channel();
+        let maintenance=thread::spawn(move||{
+            let deadline=Instant::now()+std::time::Duration::from_secs(15);
+            super::authority_replay::run_gated(&worker_slot,&worker_ownership,
+                super::authority_replay::Operation::Maintenance{boot:worker_boot,owner:None},deadline,||unreachable!(),|request,_|{
+                    let mut packet=request.clone();packet["caller"]=json!({"system":true});
+                    let reply=crate::native::native_message(&worker_remote,packet).unwrap();
+                    if request["op"]=="broker_event"{assert_eq!(reply["durable"],true);ack_ready.send(()).unwrap();wait_ack.recv().unwrap();}
+                    crate::cache_replay::Reply::Value(reply)
+                })
+        });
+        ack_seen.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        let completion_slot=slot.clone();let completion_ownership=ownership.clone();let completion_remote=remote.clone();let completion_boot=boot.clone();
+        let(probe_ready,probe_seen)=mpsc::channel();let(release_probe,wait_probe)=mpsc::channel();let(completed,completion_result)=mpsc::channel();
+        let completion=thread::spawn(move||{
+            let parsed=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_complete","challenge":STANDARD.encode([11u8;32]),
+                "tool":"chrome","delivery_id":delivery,"completion":{"decision_reason":"control_unavailable","platform_id":"chatgpt"}}));
+            let deadline=Instant::now()+std::time::Duration::from_secs(15);
+            let result=super::authority_replay::run_gated(&completion_slot,&completion_ownership,
+                super::authority_replay::Operation::Browser{parsed,boot:completion_boot,deadline},deadline,||unreachable!(),|request,_|{
+                    if request["op"]=="policy_v3"{probe_ready.send(()).unwrap();wait_probe.recv().unwrap();}
+                    let mut packet=request.clone();packet["caller"]=json!({"system":true});
+                    crate::cache_replay::Reply::Value(crate::native::native_message(&completion_remote,packet).unwrap())
+                });completed.send(result).unwrap();
+        });
+        assert!(ownership.wait_for_waiter(&a.principal,Instant::now()+std::time::Duration::from_secs(3)));
+        assert!(completion_result.try_recv().is_err());
+        {let locked=slot.try_lock().unwrap();assert_eq!(locked.as_ref().unwrap().stored.queue.pending[0].event.action,"observed");}
+        let mut other=request("browser_policy");other.principal=b.principal.clone();let deadline=Instant::now()+std::time::Duration::from_secs(5);
+        let b_reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed:other,boot,deadline},deadline,
+            ||unreachable!(),|_,_|if refuse{crate::cache_replay::Reply::Value(json!({"ok":false}))}else{crate::cache_replay::Reply::Unreachable}).unwrap();
+        assert_eq!(replay_signed_body(&b_reply)["mode"],if refuse{"blocked"}else{"grace"});
+        let before={let locked=slot.lock().unwrap();let journal=&locked.as_ref().unwrap().stored.journal;(journal.generation,journal.deadline,journal.armed,journal.cache.is_some())};
+        // Model an accepted server flush using the fixture's actual durable store,
+        // without any network. The real broker_complete receiver must say false.
+        {let store=crate::Store::open(&remote).unwrap();let mut state=store.load().unwrap();assert!(state.shadow_queue.iter().any(|event|event.id==id));state.shadow_queue.clear();store.save(&state).unwrap();}
+        release_ack.send(()).unwrap();maintenance.join().unwrap().unwrap();
+        probe_seen.recv_timeout(std::time::Duration::from_secs(3)).unwrap();
+        {let locked=slot.lock().unwrap();let target=locked.as_ref().unwrap();let journal=&target.stored.journal;
+            assert_eq!((journal.generation,journal.deadline,journal.armed,journal.cache.is_some()),before);
+            assert_eq!(target.stored.queue.pending.len(),1);assert_eq!(target.stored.queue.pending[0].principal,b.principal);
+            if refuse{assert!(target.stored.queue.pending[0].event.prompt.is_none());}}
+        release_probe.send(()).unwrap();let reply=completion_result.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();completion.join().unwrap();
+        assert_eq!(replay_signed_body(&reply)["reply"]["applied"],false);
+        {let store=crate::Store::open(&remote).unwrap();let state=store.load().unwrap();assert!(state.shadow_completions.is_empty());}
+    }
+}
+
+#[test]
+fn maintenance_with_empty_snapshot_never_transfers_a_new_unowned_row(){
+    use std::sync::{Arc,Mutex,mpsc};use std::thread;
+    let(target,response,policy,boot)=memory_authority();let slot=Arc::new(Mutex::new(Some(target)));
+    let ownership=Arc::new(crate::cache_replay::Ownership::default());let worker_slot=slot.clone();let worker_ownership=ownership.clone();
+    let(started,seen)=mpsc::channel();let(release,wait)=mpsc::channel();
+    let worker=thread::spawn(move||super::authority_replay::run_gated(&worker_slot,&worker_ownership,
+        super::authority_replay::Operation::Maintenance{boot,owner:None},Instant::now()+std::time::Duration::from_secs(5),||unreachable!(),|request,_|{
+            assert_eq!(request["op"],"policy_v3");started.send(()).unwrap();wait.recv().unwrap();crate::cache_replay::Reply::Value(response.clone())
+        }));
+    seen.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    let id={let mut locked=slot.lock().unwrap();let target=locked.as_mut().unwrap();
+        let id=target.stored.queue.admit(&target.stored.journal,&policy,&event_request(uuid::Uuid::new_v4())).unwrap();target.save().unwrap();id};
+    release.send(()).unwrap();worker.join().unwrap().unwrap();
+    let locked=slot.lock().unwrap();let target=locked.as_ref().unwrap();assert_eq!(target.stored.queue.pending.len(),1);assert_eq!(target.stored.queue.pending[0].event.id,id);
+}
+
+#[test]
+fn failed_marker_persistence_prevents_every_handoff_call(){
+    use std::sync::{Arc,Mutex};use std::cell::Cell;
+    let(mut target,response,policy,boot)=memory_authority();
+    target.stored.queue.admit(&target.stored.journal,&policy,&event_request(uuid::Uuid::new_v4())).unwrap();
+    target.storage=Storage::FaultedMemory;
+    let slot=Mutex::new(Some(target));let ownership=Arc::new(crate::cache_replay::Ownership::default());let handoffs=Cell::new(0);
+    let result=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Maintenance{boot,owner:None},
+        Instant::now()+std::time::Duration::from_secs(5),||unreachable!(),|request,_|{
+            if request["op"]=="broker_event"{handoffs.set(handoffs.get()+1);}
+            assert_eq!(request["op"],"policy_v3");crate::cache_replay::Reply::Value(response.clone())
+        });
+    assert!(result.is_err());assert_eq!(handoffs.get(),0);
+    let locked=slot.lock().unwrap();let target=locked.as_ref().unwrap();assert!(target.stored.queue.pending[0].transfer_started);assert!(target.storage_failed);
+}
+
+#[test]
+fn lost_ack_restart_never_promises_local_or_premature_remote_completion(){
+    use std::sync::{Arc,Mutex};
+    for accepted in [false,true]{
+        let(mut target,_,policy,boot)=memory_authority();let delivery=uuid::Uuid::new_v4();
+        let id=target.stored.queue.admit(&target.stored.journal,&policy,&event_request(delivery)).unwrap();
+        let home=tempfile::tempdir().unwrap();let remote=home.path().to_path_buf();let key=SigningKey::from_bytes(&[73;32]);
+        let state=crate::State{public_key:STANDARD.encode(key.verifying_key().as_bytes()),shadow_revision:1,shadow_policy:Some(live_policy(&key,1)),
+            detection:crate::detection::Cache{revision:target.stored.journal.catalog_revision,content_hash:target.stored.journal.catalog_content_hash.clone(),..Default::default()},..Default::default()};
+        {let store=crate::Store::open(&remote).unwrap();store.save(&state).unwrap();}
+        let before_offer=encrypted(&target.stored);
+        let slot=Mutex::new(Some(target));let ownership=Arc::new(crate::cache_replay::Ownership::default());
+        let result=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Maintenance{boot:boot.clone(),owner:None},
+            Instant::now()+std::time::Duration::from_secs(5),||unreachable!(),|request,_|{
+                if request["op"]=="broker_event"{
+                    assert!(slot.try_lock().unwrap().as_ref().unwrap().stored.queue.pending[0].transfer_started);
+                    if accepted{let mut packet=request.clone();packet["caller"]=json!({"system":true});let reply=crate::native::native_message(&remote,packet).unwrap();assert_eq!(reply["durable"],true);}
+                    return crate::cache_replay::Reply::Unreachable;
+                }
+                assert_eq!(request["op"],"policy_v3");let mut packet=request.clone();packet["caller"]=json!({"system":true});
+                crate::cache_replay::Reply::Value(crate::native::native_message(&remote,packet).unwrap())
+            });
+        assert!(result.is_err());
+        {let mut locked=slot.lock().unwrap();let previous=locked.take().unwrap();assert!(previous.stored.queue.pending[0].transfer_started);
+            let committed=epoch(&previous.stored);let pin=previous.stored.journal.pin.clone();let bytes=encrypted(&previous.stored);
+            assert!(decode_snapshot(&before_offer,&pin,&committed).is_err(),"an older snapshot lost the durable marker");
+            let restored=decode_snapshot(&bytes,&pin,&committed).unwrap();assert!(restored.queue.pending[0].transfer_started);
+            *locked=Some(Authority{stored:restored,storage:Storage::Memory,storage_failed:false,masked:Vec::new(),replay:Default::default()});}
+        if accepted{let store=crate::Store::open(&remote).unwrap();let mut state=store.load().unwrap();assert!(state.shadow_queue.iter().any(|event|event.id==id));state.shadow_queue.clear();store.save(&state).unwrap();}
+        for fields in [json!({"decision_reason":"control_unavailable","platform_id":"chatgpt"}),json!({"model":"synthetic-completion"})]{
+            let parsed=wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_complete","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":delivery,"completion":fields}));
+            let deadline=Instant::now()+std::time::Duration::from_secs(5);
+            let reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed,boot:boot.clone(),deadline},deadline,
+                ||unreachable!(),|request,_|{assert_eq!(request["op"],"policy_v3","a marked completion was forwarded prematurely");
+                    let mut packet=request.clone();packet["caller"]=json!({"system":true});crate::cache_replay::Reply::Value(crate::native::native_message(&remote,packet).unwrap())}).unwrap();
+            assert_eq!(replay_signed_body(&reply)["reply"]["applied"],false);
+        }
+        {let locked=slot.lock().unwrap();let row=&locked.as_ref().unwrap().stored.queue.pending[0];assert!(row.transfer_started);assert!(row.event.model.is_none());assert_eq!(row.event.action,"observed");}
+        {let store=crate::Store::open(&remote).unwrap();assert!(store.load().unwrap().shadow_completions.is_empty());}
+        super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Maintenance{boot,owner:None},
+            Instant::now()+std::time::Duration::from_secs(5),||unreachable!(),|request,_|{
+                let mut packet=request.clone();packet["caller"]=json!({"system":true});crate::cache_replay::Reply::Value(crate::native::native_message(&remote,packet).unwrap())}).unwrap();
+        assert!(slot.lock().unwrap().as_ref().unwrap().stored.queue.pending.is_empty());
+    }
+}
+
+#[test]
+fn inherited_false_rows_are_sealed_before_exposing_completion_and_failure_blocks_open(){
+    let(mut target,_,policy,_)=memory_authority();target.stored.queue.admit(&target.stored.journal,&policy,&event_request(uuid::Uuid::new_v4())).unwrap();
+    assert!(!target.stored.queue.pending[0].transfer_started);target.seal_inherited_transfers().unwrap();assert!(target.stored.queue.pending[0].transfer_started);
+    target.storage=Storage::FaultedMemory;target.seal_inherited_transfers().unwrap();assert!(!target.storage_failed,"already sealed reload attempted another save");
+    let(mut failed,_,policy,_)=memory_authority();failed.stored.queue.admit(&failed.stored.journal,&policy,&event_request(uuid::Uuid::new_v4())).unwrap();
+    failed.storage=Storage::FaultedMemory;assert!(failed.seal_inherited_transfers().is_err());assert!(failed.stored.queue.pending[0].transfer_started);assert!(failed.storage_failed);
+}
+
+#[test]
+fn full_valid_data_budget_can_persist_marker_and_drain_without_metadata_headroom(){
+    use std::sync::{Arc,Mutex};
+    let(mut target,response,policy,boot)=memory_authority();
+    for index in 0..128{
+        let mut parsed=event_request(uuid::Uuid::new_v4());parsed.principal=format!("S-1-5-21-{}",1001+index/32);
+        target.stored.queue.admit(&target.stored.journal,&policy,&parsed).unwrap();
+    }
+    for row in &mut target.stored.queue.pending{row.event.prompt=Some(String::new());row.event.characters=65536;}
+    let spare=broker::MAX_BYTES-shadow::serialized_size(&target.stored.queue).unwrap();let part=spare/128;let rest=spare%128;
+    assert!(part+1<=65536);
+    for(index,row)in target.stored.queue.pending.iter_mut().enumerate(){let length=part+usize::from(index<rest);row.event.prompt=Some("x".repeat(length));row.event.characters=length.try_into().unwrap();}
+    assert_eq!(shadow::serialized_size(&target.stored.queue).unwrap(),broker::MAX_BYTES);target.stored.queue.validate().unwrap();
+    let id=target.stored.queue.pending[0].event.id;let slot=Mutex::new(Some(target));let ownership=Arc::new(crate::cache_replay::Ownership::default());
+    super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Maintenance{boot,owner:None},
+        Instant::now()+std::time::Duration::from_secs(10),||unreachable!(),|request,_|{
+            if request["op"]=="broker_event"{let locked=slot.try_lock().unwrap();let target=locked.as_ref().unwrap();
+                assert!(target.stored.queue.pending[0].transfer_started);assert_eq!(shadow::serialized_size(&target.stored.queue).unwrap(),broker::MAX_BYTES+24);
+                return crate::cache_replay::Reply::Value(json!({"ok":true,"durable":true,"id":id}));}
+            assert_eq!(request["op"],"policy_v3");crate::cache_replay::Reply::Value(response.clone())
+        }).unwrap();
+    assert_eq!(slot.lock().unwrap().as_ref().unwrap().stored.queue.pending.len(),127);
+}
+
+#[test]
+fn local_pending_quota_refusal_never_forwards_before_handoff_and_absent_row_still_forwards(){
+    use std::sync::{Arc,Mutex};use std::cell::Cell;
+    let(mut target,_,policy,boot)=memory_authority();let delivery=uuid::Uuid::new_v4();
+    // Keep each prompt within the receiver limit while saturating total custody.
+    for index in 0..256{
+        let mut parsed=event_request(if index==0{delivery}else{uuid::Uuid::new_v4()});
+        parsed.principal=format!("S-1-5-21-1-2-3-{}",1001+index/64);
+        target.stored.queue.admit(&target.stored.journal,&policy,&parsed).unwrap();
+    }
+    for row in &mut target.stored.queue.pending{row.event.prompt=Some(String::new());row.event.characters=32768;}
+    let spare=broker::MAX_BYTES-shadow::serialized_size(&target.stored.queue).unwrap();let part=spare/256;let rest=spare%256;assert!(part+1<=32768);
+    for(index,row)in target.stored.queue.pending.iter_mut().enumerate(){let length=part+usize::from(index<rest);row.event.prompt=Some("x".repeat(length));row.event.characters=length.try_into().unwrap();}
+    assert_eq!(shadow::serialized_size(&target.stored.queue).unwrap(),broker::MAX_BYTES);target.stored.queue.validate().unwrap();
+    let id=target.stored.queue.pending[0].event.id;assert!(!target.stored.queue.pending[0].transfer_started);
+    let fields=json!({"model":"synthetic-quota-growth"});
+    let mut refused=target.stored.queue.clone();assert!(!refused.complete(&shadow::ShadowCompletion::parse_for(id,&fields).unwrap()));
+    let before=cache::hash(&serde_json::to_vec(&target.stored.queue).unwrap());
+    assert_eq!(cache::hash(&serde_json::to_vec(&refused).unwrap()),before);
+    let home=tempfile::tempdir().unwrap();let key=SigningKey::from_bytes(&[73;32]);
+    let state=crate::State{public_key:STANDARD.encode(key.verifying_key().as_bytes()),shadow_revision:1,shadow_policy:Some(live_policy(&key,1)),
+        detection:crate::detection::Cache{revision:target.stored.journal.catalog_revision,content_hash:target.stored.journal.catalog_content_hash.clone(),..Default::default()},..Default::default()};
+    {let store=crate::Store::open(home.path()).unwrap();store.save(&state).unwrap();}
+    let slot=Mutex::new(Some(target));let ownership=Arc::new(crate::cache_replay::Ownership::default());
+    let complete=|fields:Value|wrapped(json!({"protocol":broker::PROTOCOL,"op":"browser_complete","challenge":STANDARD.encode([11u8;32]),"tool":"chrome","delivery_id":delivery,"completion":fields}));
+    let forwardings=Cell::new(0);
+    let no_forward=|request:&Value,_:Instant|{
+        if request["op"]=="broker_complete"{forwardings.set(forwardings.get()+1);}
+        assert_eq!(request["op"],"policy_v3","a completion was forwarded before its event left local custody");
+        let mut packet=request.clone();packet["caller"]=json!({"system":true});
+        crate::cache_replay::Reply::Value(crate::native::native_message(home.path(),packet).unwrap())
+    };
+    let parsed=complete(fields.clone());let deadline=Instant::now()+std::time::Duration::from_secs(10);
+    let reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed:parsed.clone(),boot:boot.clone(),deadline},deadline,
+        ||unreachable!(),&no_forward).unwrap();
+    assert_eq!(replay_signed_body(&reply)["reply"]["applied"],false);assert_eq!(forwardings.get(),0);
+    {let locked=slot.lock().unwrap();let target=locked.as_ref().unwrap();assert_eq!(cache::hash(&serde_json::to_vec(&target.stored.queue).unwrap()),before);
+        assert_eq!(target.stored.queue.completed(&target.stored.journal,&parsed).unwrap(),Some(id));assert!(!target.stored.queue.pending[0].transfer_started);}
+    {let store=crate::Store::open(home.path()).unwrap();let state=store.load().unwrap();assert!(state.shadow_queue.is_empty());assert!(state.shadow_completions.is_empty());}
+    // Capacity recovery permits a truthful local retry, still without forwarding.
+    {let mut locked=slot.lock().unwrap();let target=locked.as_mut().unwrap();target.stored.queue.pending.retain(|pending|pending.event.id==id);target.save().unwrap();}
+    let deadline=Instant::now()+std::time::Duration::from_secs(10);
+    let reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed,boot:boot.clone(),deadline},deadline,
+        ||unreachable!(),&no_forward).unwrap();
+    assert_eq!(replay_signed_body(&reply)["reply"]["applied"],true);assert_eq!(forwardings.get(),0);
+    // Model completed custody transfer using the real native receiver, then remove
+    // the local pending row while preserving its receipt. Remote fallback is valid.
+    {let mut locked=slot.lock().unwrap();let target=locked.as_mut().unwrap();let pending=&target.stored.queue.pending[0];
+        let packet=json!({"op":"broker_event","caller":{"system":true},"installation":target.stored.journal.pin.installation,
+            "sequence":pending.sequence,"event":pending.event,"quota_principal":pending.principal});
+        let ack=crate::native::native_message(home.path(),packet).unwrap();assert_eq!(ack["durable"],true);assert_eq!(ack["id"],json!(id));
+        {let store=crate::Store::open(home.path()).unwrap();let state=store.load().unwrap();assert!(state.shadow_queue.iter().any(|event|event.id==id),"handoff must retain the valid event before remote completion");}
+        target.stored.queue.pending.clear();target.save().unwrap();}
+    let parsed=complete(json!({"body_bytes":42}));let deadline=Instant::now()+std::time::Duration::from_secs(10);
+    let reply=super::authority_replay::run_gated(&slot,&ownership,super::authority_replay::Operation::Browser{parsed,boot,deadline},deadline,
+        ||unreachable!(),|request,_|{if request["op"]=="broker_complete"{forwardings.set(forwardings.get()+1);}
+            let mut packet=request.clone();packet["caller"]=json!({"system":true});crate::cache_replay::Reply::Value(crate::native::native_message(home.path(),packet).unwrap())}).unwrap();
+    assert_eq!(replay_signed_body(&reply)["reply"]["applied"],true);assert_eq!(forwardings.get(),1);
+    {let store=crate::Store::open(home.path()).unwrap();let state=store.load().unwrap();assert_eq!(state.shadow_queue.iter().find(|event|event.id==id).unwrap().body_bytes,Some(42));}
 }

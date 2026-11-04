@@ -1,0 +1,46 @@
+[Unit]
+Description=Milvago AI endpoint discovery collector
+After=network-online.target milvago-discovery-enroll.service
+ConditionPathExists=/etc/milvago-discovery/anchor.json
+StartLimitIntervalSec=60
+StartLimitBurst=3
+[Service]
+Type=simple
+User=root
+Group=milvago-agent
+ExecStart=/opt/milvago-discovery/milvago-discovery-system run
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=35
+RuntimeDirectory=milvago-discovery
+RuntimeDirectoryMode=0755
+StateDirectory=milvago-discovery
+StateDirectoryMode=0700
+ConfigurationDirectory=milvago-discovery
+ConfigurationDirectoryMode=0700
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_NET_RAW CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ReadWritePaths=/var/lib/milvago-discovery
+UMask=0077
+MemoryMax=128M
+CPUQuota=100%
+TasksMax=32
+LimitNOFILE=1024
+LimitCORE=0
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,48 @@ pub struct Authority {
     stored: Stored,
     storage: Storage,
     storage_failed: bool,
+    /// Labels of drafts the inspection rewrote, keyed by the rewritten text's digest
+    /// (never the original): the submit only sees the masked text, which no longer
+    /// carries what made it sensitive. In memory, short-lived, single-use.
+    masked: Vec<Masked>,
+    replay: authority_replay::ReplayState,
+}
+#[derive(Clone)]
+struct Masked {
+    key: String,
+    /// Digests of its lines, so that a masked paste still lends its labels once laid out
+    /// in a larger draft by the page's editor (real campaign 0.7.10: `labels=[]`).
+    lines: Vec<String>,
+    labels: Vec<Value>,
+    dlp: Option<crate::shadow::dlp_transport::Trace>,
+    verified_policy: Option<String>,
+    receipt: String,
+    requires_confirmation: bool,
+    transformed: bool,
+    confirmed: bool,
+    owner: String,
+    provider: String,
+    at: Instant,
+}
+#[path = "authority_replay.rs"]
+mod authority_replay;
+pub(crate) use authority_replay::{Operation, run as run_replayed};
+
+const MASKED_ENTRIES: usize = 32;
+const MASKED_LINES: usize = 256;
+const MASKED_TTL: Duration = Duration::from_secs(600);
+// Bound to the OS account, browser, service and policy revision: another account,
+// browser or draft cannot lend its labels to a send.
+fn masked_key(parsed: &crate::browser_broker::Parsed, revision: u64, text: &Value) -> String {
+    cache::hash(json!([parsed.principal, parsed.request.tool, parsed.request.provider, parsed.request.upload, parsed.request.check_model.unwrap_or(false), parsed.request.model, parsed.request.observation.unwrap_or(false), revision, text]).to_string().as_bytes())
+}
+// Each non-blank line, its blanks collapsed (an editor splits paragraphs and may double the
+// break between them), bound like the whole text. Digests only, never the line.
+fn masked_lines(parsed: &crate::browser_broker::Parsed, revision: u64, text: &str) -> impl Iterator<Item = String> {
+    text.lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .map(move |line| masked_key(parsed, revision, &json!(["line", line])))
 }
 enum Storage {
     Protected {
@@ -30,15 +72,11 @@ enum Storage {
     },
     #[cfg(test)]
     Memory,
+    #[cfg(test)]
+    FaultedMemory,
 }
-enum AgentState {
-    Authorized {
-        response: Value,
-        policy: crate::shadow::ShadowPolicy,
-    },
-    Unreachable,
-    Refused,
-}
+use crate::cache_replay_authority::{Input as AgentState, matches as cache_matches};
+
 enum CacheSync {
     Current,
     Deferred,
@@ -62,37 +100,8 @@ fn exchange_agent(edition: &str, request: &Value, timeout: Duration) -> Result<V
         timeout,
     )
 }
-fn projected_policy(response: &Value) -> Result<crate::shadow::ShadowPolicy> {
-    if response["ok"] != true
-        || response["cache_policy_hash"].as_str().is_none()
-        || response["cache_authorization_generation"].as_u64().is_none()
-        || response["cache_policy_content_hash"].as_str().is_none()
-        || response["cache_catalog_content_hash"].as_str().is_none()
-        || response["cache_catalog_revision"].as_u64().is_none()
-    {
-        return Err("agent policy response invalid".into());
-    }
-    let mut policy = response["policy"]
-        .as_object()
-        .cloned()
-        .ok_or("agent policy absent")?;
-    policy.remove("signed_expires_at");
-    Ok(serde_json::from_value(Value::Object(policy))?)
-}
 fn agent_state(response: Result<Value>) -> AgentState {
-    match response {
-        Err(_) => AgentState::Unreachable,
-        Ok(response) if response["ok"] != true => AgentState::Refused,
-        Ok(response) => match projected_policy(&response) {
-            Ok(policy) => AgentState::Authorized { response, policy },
-            Err(_) => AgentState::Refused,
-        },
-    }
-}
-fn cache_matches(response: &Value, journal: &Journal) -> bool {
-    response["cache_policy_content_hash"] == journal.policy_content_hash
-        && response["cache_catalog_content_hash"] == journal.catalog_content_hash
-        && response["cache_catalog_revision"] == journal.catalog_revision
+    crate::cache_replay_authority::classify(response.ok())
 }
 pub fn public_pin(edition: &str) -> Result<Pin> {
     let root = Directory::open(&windows::root(edition)?, false)?;
@@ -287,12 +296,12 @@ impl Authority {
         let lock = directory.lock()?;
         let epoch = windows::read_epoch(edition)?;
         let (stored, recovered) = committed_snapshot(&pin, &epoch,
-            |name| directory.read(name, 12 * 1024 * 1024),
+            |name| directory.read(name, 12 * 1024 * 1024 + crate::browser_broker::MAX_TRANSFER_FORMAT_BYTES as u64),
             || directory.legacy_snapshots())?;
         if let Some(encrypted) = recovered {
             directory.write("state.bin", &encrypted)?;
         }
-        Ok(Self {
+        let mut authority=Self {
             stored,
             storage: Storage::Protected {
                 directory,
@@ -300,49 +309,52 @@ impl Authority {
                 _lock: lock,
             },
             storage_failed: false,
-        })
+            masked: Vec::new(),
+            replay: Default::default(),
+        };
+        authority.seal_inherited_transfers()?;
+        Ok(authority)
     }
     fn save(&mut self) -> Result<()> {
+        self.replay.dirty = true;
+        if self.replay.staging {
+            self.storage_failed = false;
+            return self.stored.queue.validate();
+        }
         // Retain the exact intended state on failure, including any learned
         // revocation or delivered receipt. A retry must never restore older state.
         let result = match &self.storage {
             Storage::Protected { directory, .. } => persist(directory, &self.stored),
             #[cfg(test)]
             Storage::Memory => self.stored.queue.validate(),
+            #[cfg(test)]
+            Storage::FaultedMemory => Err("synthetic cache persistence failure".into()),
         };
         self.storage_failed = result.is_err();
+        if result.is_ok() { self.replay.dirty = false; }
         result
-    }
-    fn probe(&self) -> Result<Value> {
-        crate::ipc::exchange_agent(
-            edition_channel(&self.stored.journal.pin.edition),
-            &self.stored.journal.pin.edition,
-            &json!({"op":"policy_v3"}),
-            Duration::from_secs(2),
-        )
     }
     pub fn active(&self) -> bool {
         let j = &self.stored.journal;
         j.armed && j.deadline.is_some_and(|end| windows::tick() < end)
     }
-    pub fn prepare(&mut self, request: &Value) -> Result<Value> {
+    fn prepare_with(&mut self, request: &Value, exchange: &mut impl FnMut(&Value) -> Result<Value>, boot: &str) -> Result<Value> {
         if self.storage_failed { self.save()?; }
         if request["protocol"] != cache::PROTOCOL
             || request["op"] != "cache_prepare"
             || request["origin"] != self.stored.journal.pin.origin
-            || request["organization_anchor"] != self.stored.journal.pin.organization_anchor
-        {
+            || request["organization_anchor"] != self.stored.journal.pin.organization_anchor {
             return Err("cache source identity refused".into());
         }
-        let response = self.probe()?;
+        let response = exchange(&json!({"op":"policy_v3"}))?;
         if response["ok"] != true {
-            self.stored.journal.invalidate()?;
-            self.save()?;
+            self.stored.journal.invalidate()?; self.save()?;
             return Err("agent refused cache".into());
         }
-        let boot = windows::boot(&self.stored.journal.pin.edition, true)?;
-        self.prepare_response(request, &response, &boot, windows::tick())
+        self.prepare_response(request, &response, boot, windows::tick())
     }
+
+
     fn prepare_response(&mut self, request: &Value, response: &Value, boot: &str, tick: u64) -> Result<Value> {
         if request["protocol"] != cache::PROTOCOL
             || request["op"] != "cache_prepare"
@@ -380,101 +392,53 @@ impl Authority {
             json!({"ok":true,"protocol":cache::PROTOCOL,"generation":self.stored.journal.generation}),
         )
     }
-    pub fn browser(&mut self, request: &Value, deadline: Instant) -> Result<Value> {
-        use crate::browser_broker as broker;
-        let parsed = broker::parse(request)?;
-        if self.storage_failed {
-            self.save()?;
-        }
-        let outcome = self.answer(&parsed, deadline);
+    fn browser_with(&mut self, parsed: &crate::browser_broker::Parsed,
+        exchange: &mut impl FnMut(&Value) -> Result<Value>, boot: &str, deadline: Instant) -> Result<Value> {
+        if self.storage_failed { self.save()?; }
+        let outcome = self.answer_with(parsed, exchange, boot, windows::tick());
         let (mode, reply) = match outcome {
             Ok(answer) => answer,
             Err(_) => ("blocked", json!({"ok":false,"error":"control_unavailable"})),
         };
         let (mode, reply) = if Instant::now() >= deadline {
             ("blocked", json!({"ok":false,"error":"control_timeout"}))
-        } else {
-            (mode, reply)
-        };
-        let remaining = if mode == "grace" {
-            self.stored
-                .journal
-                .deadline
-                .unwrap_or(0)
-                .saturating_sub(windows::tick())
-        } else {
-            0
-        };
-        if mode == "grace" && (remaining == 0 || self.storage_failed) {
-            return broker::signed(
-                &self.stored.journal,
-                &self.stored.keys,
-                &parsed,
-                "blocked",
-                0,
-                json!({"ok":false,"error":"cache_expired"}),
-            );
-        }
-        broker::signed(
-            &self.stored.journal,
-            &self.stored.keys,
-            &parsed,
-            mode,
-            remaining,
-            reply,
-        )
+        } else { (mode, reply) };
+        // Signing and the final deadline check occur only after durable flush.
+        Ok(json!({"mode":mode,"reply":reply}))
     }
-    /// Background-only maintenance. The Update service calls this through
-    /// try_lock, so browser requests have priority and each invocation releases
-    /// the authority after at most one durable delivery.
-    pub fn maintenance(&mut self) -> Result<()> {
-        if self.storage_failed {
-            self.save()?;
-        }
-        let edition = self.stored.journal.pin.edition.clone();
-        let mut exchange = |request: &Value| exchange_agent(&edition, request, Duration::from_secs(2));
+
+
+    fn maintenance_with(&mut self, exchange: &mut impl FnMut(&Value) -> Result<Value>, boot: &str,
+        expected:Option<&authority_replay::RowIdentity>) -> Result<()> {
+        if self.storage_failed { self.save()?; }
         let state = agent_state(exchange(&json!({"op":"policy_v3"})));
         let AgentState::Authorized { response, policy } = state else {
-            if matches!(state, AgentState::Refused) {
-                let _ = self.refuse_agent()?;
-            }
+            if matches!(state, AgentState::Refused) { let _ = self.refuse_agent()?; }
             return Ok(());
         };
-        self.stored
-            .queue
-            .restrict(Some(&policy), self.stored.journal.generation);
+        self.stored.queue.restrict(Some(&policy), self.stored.journal.generation);
         self.save()?;
+        // A new row arriving after an empty snapshot has no owner gate. Likewise
+        // a changed head needs a fresh ownership admission, never this old plan.
+        if self.selected_row()?.as_ref()!=expected{return Ok(());}
         if self.stored.queue.len() != 0 {
-            let _ = self.drain_one_with(&mut exchange)?;
+            let _ = self.drain_one_with(exchange)?;
             return Ok(());
         }
-        let boot = windows::boot(&edition, true)?;
-        match self.sync_cache(&response, &mut exchange, &boot, windows::tick()) {
-            CacheSync::Current => self.stored.journal.recovered(&boot, windows::tick())?,
-            CacheSync::Deferred => {
-                self.stored.journal.armed = false;
-                self.stored.journal.deadline = None;
-            }
-            CacheSync::Refused => {
-                let _ = self.refuse_agent()?;
-                return Ok(());
-            }
+        match self.sync_cache(&response, exchange, boot, windows::tick()) {
+            CacheSync::Current => self.stored.journal.recovered(boot, windows::tick())?,
+            CacheSync::Deferred => { self.stored.journal.armed = false; self.stored.journal.deadline = None; }
+            CacheSync::Refused => { let _ = self.refuse_agent()?; return Ok(()); }
         }
         self.save()
     }
+
     pub fn maintenance_pending(&self) -> bool {
         self.storage_failed || self.stored.queue.len() != 0
     }
     fn drain_one_with(&mut self, exchange: &mut impl FnMut(&Value) -> Result<Value>) -> Result<bool> {
         // Maintenance transfers one row per lock acquisition. Every row remains
         // until the main agent's durable receipt has been observed.
-            let _custody = match &self.storage {
-                Storage::Protected { directory, .. } => Some(
-                    directory.delivery_guard(&self.stored.journal.pin.edition)?,
-                ),
-                #[cfg(test)]
-                Storage::Memory => None,
-            };
             let event_sequence = self
                 .stored
                 .queue
@@ -503,7 +467,7 @@ impl Authority {
             } else {
                 let pending = &self.stored.queue.pending[0];
                 (
-                    json!({"op":"broker_event","installation":self.stored.journal.pin.installation,"sequence":pending.sequence,"event":pending.event}),
+                    json!({"op":"broker_event","installation":self.stored.journal.pin.installation,"sequence":pending.sequence,"event":pending.event,"quota_principal":pending.principal}),
                     json!(pending.event.id),
                 )
             };
@@ -518,6 +482,13 @@ impl Authority {
             }
             self.save()?;
             Ok(true)
+    }
+    fn prepare_local_event(policy: &crate::shadow::ShadowPolicy, catalog_revision: u64,
+        input: Value, trace: Option<crate::shadow::dlp_transport::Trace>,
+        exchange: &mut impl FnMut(&Value) -> Result<Value>) -> Result<crate::shadow::ShadowEvent> {
+        let answer=exchange(&json!({"op":"cache_local_event","policy":policy,
+            "catalog_revision":catalog_revision,"input":input,"trace":trace}))?;
+        Ok(serde_json::from_value(answer)?)
     }
     fn prepare_connected_event(
         &self,
@@ -578,16 +549,15 @@ impl Authority {
             Err(_) => CacheSync::Refused,
         }
     }
-    fn answer(&mut self, parsed: &crate::browser_broker::Parsed, deadline: Instant) -> Result<(&'static str, Value)> {
-        let edition = self.stored.journal.pin.edition.clone();
-        let mut exchange = |request: &Value| {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or("browser operation deadline exceeded")?;
-            exchange_agent(&edition, request, remaining.min(Duration::from_secs(2)))
-        };
-        let boot = windows::boot(&edition, true)?;
-        self.answer_with(parsed, &mut exchange, &boot, windows::tick())
+    #[cfg(test)]
+    fn answer_direct_with(&mut self, parsed: &crate::browser_broker::Parsed,
+        exchange: &mut impl FnMut(&Value) -> Result<Value>, boot: &str, tick: u64) -> Result<(&'static str, Value)> {
+        // Existing branch fixtures model agent IO only. Local inspection remains
+        // real in them; coordinator tests exercise its out-of-lock suspension.
+        self.answer_with(parsed, &mut |request: &Value| {
+            if let Some(result) = authority_replay::local_work(request) { result }
+            else { exchange(request) }
+        }, boot, tick)
     }
     fn answer_with(
         &mut self,
@@ -689,21 +659,41 @@ impl Authority {
                     return Ok((mode, json!({"ok":true,"applied":false})));
                 };
                 completion.id = id;
+                // An attempted handoff may already be durable remotely even when
+                // its ACK was lost. Never promise enrichment or forward it early.
+                if self.stored.queue.pending.iter().any(|pending|pending.event.id==id&&(pending.principal.is_empty()||pending.transfer_started)) {
+                    return Ok((mode,json!({"ok":true,"applied":false})));
+                }
                 if self.stored.queue.complete(&completion) {
                     self.save()?;
                     return Ok((mode, json!({"ok":true,"applied":true})));
+                }
+                // A local capacity refusal does not transfer ownership. The
+                // receiver may otherwise accept enrichment before seeing the event.
+                if self.stored.queue.pending.iter().any(|pending|pending.event.id==id) {
+                    return Ok((mode,json!({"ok":true,"applied":false})));
                 }
                 // The agent already holds the event. Failing to reach it costs the
                 // enrichment, never the event: the completion is simply not placed.
                 let answer = exchange(&json!({"op":"broker_complete","completion":completion}));
                 Ok((
                     mode,
-                    json!({"ok":true,"applied":answer.is_ok_and(|a| a["ok"] == true)}),
+                    json!({"ok":true,"applied":answer.is_ok_and(|a| a["ok"] == true && a["applied"] == true)}),
                 ))
             }
             "browser_submit" => {
                 let mut request = parsed.request.inspection();
-                let mut reply = if connected {
+                self.masked.retain(|m|m.at.elapsed()<MASKED_TTL);
+                let key=masked_key(parsed,policy.revision,&request["text"]);
+                let fingerprint=policy.config["dlp_fingerprint"].as_str().or_else(||policy.config["dlp_control"]["fingerprint"].as_str());
+                // Exact bytes already passed final verification in this policy and
+                // context. Reuse only privileged custody, never a page-supplied marker.
+                let sealed=self.masked.iter().find(|m|m.key==key&&m.confirmed&&(!m.requires_confirmation||Some(m.receipt.as_str())==parsed.request.approval_id.as_deref())&&m.verified_policy.as_deref().is_some()&&m.verified_policy.as_deref()==fingerprint);
+                let mut reply = if let Some(sealed)=sealed {
+                    let mut answer=json!({"ok":true,"action":"observe","text":request["text"],"labels":sealed.labels});
+                    if let Some(trace)=&sealed.dlp {answer["dlp"]=serde_json::to_value(&trace.decisions)?;answer["dlp_fingerprint"]=json!(trace.fingerprint);}
+                    answer
+                } else if connected {
                     request["op"] = json!("broker_inspect");
                     let answer = exchange(&request)?;
                     if answer["ok"] != true
@@ -714,7 +704,7 @@ impl Authority {
                     }
                     answer["inspection"].clone()
                 } else {
-                    crate::native::inspect_authorized_request(&policy, &request)?
+                    exchange(&json!({"op":"cache_local_inspect","policy":policy,"request":request}))?
                 };
                 // A transformed/reviewed text requires the person to decide again and
                 // send a new request. It can never inherit authorization for the old body.
@@ -724,9 +714,37 @@ impl Authority {
                 {
                     return Ok((mode, reply));
                 }
-                let required = policy.config["collection"]["enabled"]
-                    .as_bool()
-                    .unwrap_or(false);
+                let key = masked_key(parsed, policy.revision, &request["text"]);
+                self.masked.retain(|m| m.at.elapsed() < MASKED_TTL);
+                let mut lent = Vec::new();
+                if let Some(found) = self.masked.iter().position(|m| m.key == key && m.confirmed && (!m.requires_confirmation || Some(m.receipt.as_str())==parsed.request.approval_id.as_deref())) {
+                    lent.push(self.masked.remove(found));
+                }
+                // Then every masked text whose lines all appear in this draft: a paste reviewed
+                // apart, sent with or without words around it.
+                let sent: std::collections::HashSet<String> =
+                    masked_lines(parsed, policy.revision, request["text"].as_str().unwrap_or("")).collect();
+                while let Some(found) = self.masked.iter().position(|m| m.confirmed && !m.requires_confirmation && !m.lines.is_empty() && m.lines.iter().all(|line| sent.contains(line))) {
+                    lent.push(self.masked.remove(found));
+                }
+                let mut dlp=crate::shadow::dlp_transport::Trace::inspection(&reply,&request["text"]);
+                let transformed=lent.iter().any(|m|m.transformed);
+                if !lent.is_empty() {
+                    for masked in &lent {
+                        if let Some(trace)=masked.dlp.clone() {
+                            if let Some(current)=&mut dlp {current.merge(trace);} else {dlp=Some(trace);}
+                        }
+                    }
+                    let mut merged = reply["labels"].as_array().cloned().unwrap_or_default();
+                    for label in lent.into_iter().flat_map(|m| m.labels) {
+                        if !merged.contains(&label) {
+                            merged.push(label);
+                        }
+                    }
+                    reply["labels"] = json!(merged);
+                }
+                if let Some(trace)=&mut dlp {if trace.action=="review" {trace.action=if transformed {"transform"}else{"observe"}.into();}}
+                let required = policy.config["collection"]["enabled"] == true || dlp.is_some();
                 reply["recording_required"] = json!(required);
                 reply["recorded"] = json!(false);
                 if required {
@@ -758,11 +776,18 @@ impl Authority {
                     self.stored
                         .queue
                         .restrict(Some(&policy), self.stored.journal.generation);
-                    let id = if let Some(response) = &response {
+                    let id = if let Some(trace) = dlp {
+                        let prepared=Self::prepare_local_event(&policy,self.stored.journal.catalog_revision,event.clone(),Some(trace),exchange)?;
+                        self.stored.queue.admit_prepared(&admission_journal,&custody,prepared)?
+                    } else if let Some(response) = &response {
                         let prepared = self.prepare_connected_event(&custody, response, exchange)?;
                         self.stored.queue.admit_prepared(&admission_journal, &custody, prepared)?
                     } else {
-                        self.stored.queue.admit(&admission_journal, &policy, &custody)?
+                        {
+                            let input=custody.request.event.clone().ok_or("submission event absent")?;
+                            let prepared=Self::prepare_local_event(&policy,admission_journal.catalog_revision,input,None,exchange)?;
+                            self.stored.queue.admit_prepared(&admission_journal,&custody,prepared)?
+                        }
                     };
                     self.save()?;
                     reply["id"] = json!(id);
@@ -781,12 +806,66 @@ impl Authority {
                     return Err("browser queue full".into());
                 }
                 let request = parsed.request.inspection();
-                let reply = if connected {
+                let mut reply = if connected {
                     exchange(&request)?
                 } else {
-                    crate::native::inspect_authorized_request(&policy, &request)?
+                    exchange(&json!({"op":"cache_local_inspect","policy":policy,"request":request}))?
                 };
+                if let Some(labels) = reply["labels"].as_array().filter(|labels| {
+                    reply["ok"] == true && request["observation"]!=true && (!labels.is_empty() || reply["dlp"].as_array().is_some_and(|d|!d.is_empty()) || policy.version>=4) && reply["text"].is_string() && (reply["text"] != request["text"] || reply["confirmation"]==true)
+                }) {
+                    self.masked.retain(|m| m.at.elapsed() < MASKED_TTL);
+                    if self.masked.len() >= MASKED_ENTRIES {
+                        self.masked.remove(0);
+                    }
+                    let labels = labels.iter().take(16).cloned().collect();
+                    let text = reply["text"].as_str().unwrap_or("");
+                    let lines = if reply["confirmation"]==true {vec![]}else{masked_lines(parsed, policy.revision, text).take(MASKED_LINES).collect()};
+                    let receipt=uuid::Uuid::new_v4().to_string();
+                    reply["dlp_receipt"]=json!(receipt);
+                    let verified_policy=if policy.version>=4 {policy.config["dlp_fingerprint"].as_str().or_else(||policy.config["dlp_control"]["fingerprint"].as_str()).map(str::to_owned)}else{None};
+                    self.masked.push(Masked { transformed:reply["text"]!=request["text"],requires_confirmation:reply["confirmation"]==true,confirmed:reply["confirmation"]!=true,verified_policy,receipt,owner:cache::hash(json!([parsed.principal,parsed.request.tool]).to_string().as_bytes()),provider:request["provider"].as_str().unwrap_or("").into(),key: masked_key(parsed, policy.revision, &reply["text"]), lines, labels, dlp:crate::shadow::dlp_transport::Trace::inspection(&reply,&request["text"]), at: Instant::now() });
+                }
+                if reply["action"]=="block" && request["observation"]!=true {
+                    if let Some(trace)=crate::shadow::dlp_transport::Trace::inspection(&reply,&request["text"]) {
+                        let input=json!({"source":"browser","tool":parsed.request.tool,"provider":request["provider"],"kind":"prompt","action":"blocked","characters":request["text"].as_str().unwrap_or("").chars().count(),"labels":reply["labels"],"prompt":request["text"]});
+                        let mut custody=parsed.clone();
+                        custody.request.op="browser_event".into();
+                        custody.request.delivery_id=Some(uuid::Uuid::new_v4().to_string());
+                        custody.request.event=Some(input.clone());
+                        let event=Self::prepare_local_event(&policy,self.stored.journal.catalog_revision,input,Some(trace),exchange)?;
+                        let id=self.stored.queue.admit_prepared(&admission_journal,&custody,event)?;
+                        self.save()?;
+                        reply["dlp_recorded"]=json!(true);
+                        reply["id"]=json!(id);
+                    }
+                }
                 Ok((mode, reply))
+            }
+            "browser_confirm" => {
+                let owner=cache::hash(json!([parsed.principal,parsed.request.tool]).to_string().as_bytes());
+                self.masked.retain(|m|m.at.elapsed()<MASKED_TTL);
+                // Connected responses carry the redacted browser projection; grace
+                // uses the complete signed policy. Bind both to the same fingerprint.
+                let Some(fingerprint)=policy.config["dlp_fingerprint"].as_str().or_else(||policy.config["dlp_control"]["fingerprint"].as_str()) else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                let Some(pending)=self.masked.iter_mut().find(|m|m.owner==owner&&Some(m.receipt.as_str())==parsed.request.delivery_id.as_deref()&&m.verified_policy.as_deref()==Some(fingerprint)) else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                if !pending.requires_confirmation||pending.confirmed{return Ok((mode,json!({"ok":true,"applied":false})));}
+                pending.confirmed=true;
+                Ok((mode,json!({"ok":true,"applied":true})))
+            }
+            "browser_cancelled" => {
+                let owner=cache::hash(json!([parsed.principal,parsed.request.tool]).to_string().as_bytes());
+                self.masked.retain(|m|m.at.elapsed()<MASKED_TTL);
+                let Some(index)=self.masked.iter().position(|m|m.owner==owner&&Some(m.receipt.as_str())==parsed.request.delivery_id.as_deref()) else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                let pending=self.masked.remove(index);
+                let Some(mut trace)=pending.dlp else {return Ok((mode,json!({"ok":true,"applied":false})));};
+                trace.delivery="cancelled".into();
+                for decision in &mut trace.decisions {if decision.outcome=="prepared" {decision.outcome="cancelled".into();}}
+                let input=json!({"source":"browser","tool":parsed.request.tool,"provider":pending.provider,"kind":"prompt","action":"observed","characters":0,"characters_known":false,"labels":pending.labels});
+                let mut custody=parsed.clone();custody.request.op="browser_event".into();custody.request.event=Some(input.clone());
+                let event=Self::prepare_local_event(&policy,self.stored.journal.catalog_revision,input,Some(trace),exchange)?;
+                let id=self.stored.queue.admit_prepared(&admission_journal,&custody,event)?;self.save()?;
+                Ok((mode,json!({"ok":true,"applied":true,"id":id})))
             }
             "browser_catalog" => {
                 let mut reply = if connected {
@@ -825,7 +904,11 @@ impl Authority {
                     let prepared = self.prepare_connected_event(parsed, response, exchange)?;
                     self.stored.queue.admit_prepared(&admission_journal, parsed, prepared)?
                 } else {
-                    self.stored.queue.admit(&admission_journal, &policy, parsed)?
+                    {
+                        let input=parsed.request.event.clone().ok_or("browser event absent")?;
+                        let prepared=Self::prepare_local_event(&policy,admission_journal.catalog_revision,input,None,exchange)?;
+                        self.stored.queue.admit_prepared(&admission_journal,parsed,prepared)?
+                    }
                 };
                 self.save()?;
                 if self.storage_failed {

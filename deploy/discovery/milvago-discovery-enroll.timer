@@ -1,0 +1,8 @@
+[Unit]
+Description=Retry protected Milvago discovery enrollment
+[Timer]
+OnBootSec=15
+OnUnitInactiveSec=60
+Unit=milvago-discovery-enroll.service
+[Install]
+WantedBy=timers.target

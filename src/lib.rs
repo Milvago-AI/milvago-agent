@@ -6,7 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use fs2::FileExt;
-use rand::{RngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -18,9 +18,39 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+// Never continue with unfilled key or nonce bytes if OS randomness is unavailable.
+pub(crate) fn fill_random(bytes: &mut [u8]) {
+    SysRng.try_fill_bytes(bytes).expect("OS randomness unavailable");
+}
+
+pub fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 15) as usize] as char);
+    }
+    output
+}
+
 pub mod bootstrap;
 pub mod config;
  pub mod detection;
+pub mod discovery;
+pub mod discovery_vmware;
+pub mod discovery_wsl;
+mod discovery_reservation;
+pub mod discovery_system_protocol;
+#[cfg(any(windows, test))]
+pub mod discovery_windows_system;
+#[cfg(target_os = "linux")]
+pub mod discovery_privileged;
+mod discovery_system;
+mod discovery_guests;
+mod discovery_network;
+mod discovery_runtime_channels;
 pub mod eventlog;
 pub mod ipc;
 pub mod health;
@@ -35,8 +65,13 @@ pub mod shadow;
 mod shadow_tests;
 pub mod update;
 pub mod update_host;
+#[cfg(any(windows, test))]
+pub(crate) mod cache_replay;
+#[cfg(any(windows, test))]
+pub(crate) mod cache_replay_authority;
 pub mod browser_cache;
 pub mod browser_broker;
+mod browser_queue_quota;
 #[cfg(windows)]
 pub mod cache_windows;
 #[cfg(windows)]
@@ -101,6 +136,8 @@ pub struct Provision {
 #[derive(Serialize, Deserialize, Default)]
 pub struct State {
     #[serde(default)]
+    pub discovery: discovery::Cache,
+    #[serde(default)]
     pub browser_broker_receipt: Option<browser_broker::AgentReceipt>,
     #[serde(default)]
     pub detection: detection::Cache,
@@ -150,6 +187,9 @@ pub struct State {
     pub browsers: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>>,
     #[serde(default)]
     pub shadow_queue: Vec<shadow::ShadowEvent>,
+    /// Internal kernel-principal quota ownership, never a telemetry identity.
+    #[serde(default)]
+    pub browser_queue_owners: std::collections::BTreeMap<Uuid, String>,
     /// Completions waiting for the server: what an outgoing request said about an
     /// exchange the server has already accepted. An event still in `shadow_queue` is
     /// completed there instead, so nothing here can outrun the event it names.
@@ -497,7 +537,7 @@ impl Store {
                 return Err("state key missing; refusing data loss".into());
             }
             let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
+            fill_random(&mut key);
             let encrypted = os_wrap(&key, true)?;
             let mut file = private_file(&keypath, true)?;
             file.write_all(&encrypted)?;
@@ -529,9 +569,11 @@ impl Store {
                 },
             )
             .map_err(|_| "state integrity check failed")?;
-        let parsed = serde_json::from_slice(&plain);
+        let parsed: std::result::Result<State, _> = serde_json::from_slice(&plain);
         plain.zeroize();
-        Ok(parsed?)
+        let mut state = parsed?;
+        browser_queue_quota::prune(&mut state);
+        Ok(state)
     }
     pub fn save(&self, state: &State) -> Result<()> {
         let mut plain = serde_json::to_vec(state)?;
@@ -539,7 +581,7 @@ impl Store {
             return Err("state is full".into());
         }
         let mut nonce = [0u8; 12];
-        OsRng.fill_bytes(&mut nonce);
+        fill_random(&mut nonce);
         let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| "invalid encryption key")?;
         let encrypted = cipher
             .encrypt(
@@ -738,6 +780,16 @@ pub fn write_frame<W: Write>(out: &mut W, value: &serde_json::Value) -> Result<(
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+    #[test]
+    fn sha256_hex_preserves_wire_format() {
+        for (bytes, expected) in [
+            (b"".as_slice(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+            (b"abc".as_slice(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+            (b"s".as_slice(), "043a718774c572bd8a25adbeb1bfcd5c0256ae11cecf9f9c3f925d0e52beaf89"),
+        ] {
+            assert_eq!(sha256_hex(bytes), expected);
+        }
+    }
     // The root applier reads the agent's state: a FIFO or a link to /dev/zero planted
     // there must be refused at once, never block it nor exhaust its memory.
     #[cfg(unix)]

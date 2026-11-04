@@ -1,3 +1,4 @@
+pub use milvago_dlp_engine as dlp;
 use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,26 +27,92 @@ pub struct Inspection {
     pub text: String,
     pub labels: Vec<String>,
     pub reason: String,
+    #[serde(default,skip_serializing_if="std::ops::Not::not")]
+    pub confirmation: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decision_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dlp: Vec<dlp::Decision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlp_fingerprint: Option<String>,
 }
 
 pub fn inspect(input: &InspectionInput) -> Result<Inspection> {
+    inspect_with_context(input, std::collections::BTreeMap::new())
+}
+
+pub fn inspect_with_context(input: &InspectionInput, mut facts: std::collections::BTreeMap<String,String>) -> Result<Inspection> {
+    let Some(raw) = input.config.get("dlp") else { return inspect_legacy(input); };
+    let policy: dlp::Policy = serde_json::from_value(raw.clone()).map_err(|_| "invalid DLP policy")?;
+    dlp::validate(&policy)?;
+    let native=facts.get("channel").is_some_and(|value|value=="native")||input.scope=="coding";
+    let mut legacy = input.clone();
+    if input.config["dlp_legacy_disabled"] == true {
+        legacy.config["protection"]["keywords"] = serde_json::json!([]);
+        legacy.config["protection"]["block_uploads"] = serde_json::json!(false);
+        legacy.config["privacy"]["enabled"] = serde_json::json!(false);
+    }
+    if native&&(!policy.inspection||!policy.native_inspection) {
+        if input.text.len()>TEXT_LIMIT{return Err("text exceeds local inspection limit".into());}
+        legacy.text.clear();legacy.config["protection"]["keywords"]=serde_json::json!([]);
+        legacy.config["protection"]["block_uploads"]=serde_json::json!(false);
+        legacy.config["privacy"]=serde_json::json!({"enabled":false,"custom_rules":[]});
+        legacy.config["classification"]=serde_json::json!({"coding":[],"browser":[],"medical_terms":[]});
+        let mut result=inspect_legacy(&legacy)?;result.text=input.text.clone();return Ok(result);
+    }
+    let mut result = inspect_legacy(&legacy)?;
+    if let Some(signed) = input.config["dlp_context"].as_object() {
+        for (key,value) in signed { if let Some(value) = value.as_str() { facts.insert(key.clone(),value.into()); } }
+    }
+    facts.insert("channel".into(), if native { "native" } else { "browser" }.into());
+    facts.insert("provider".into(), input.service["id"].as_str().unwrap_or(&input.provider).into());
+    let output = dlp::evaluate(&dlp::Input {
+        policy:policy.clone(), texts:std::collections::BTreeMap::from([("prompt".into(),vec![input.text.clone()])]),
+        facts, upload:Some(input.upload),
+    })?;
+    if output.action == "block" {
+        result.action="block".into();
+        result.reason=if output.reason.is_empty(){"This submission is restricted by a DLP rule.".into()}else{output.reason};
+        result.decision_reason=Some(if result.reason=="control_unavailable"{"control_unavailable"}else{"dlp"}.into());
+        result.text=input.text.clone();
+    } else if result.action != "block" && result.action != "redirect" {
+        if let Some(text)=output.texts.get("prompt").and_then(|values|values.first()) {
+            result.text=text.clone();
+            if output.action=="review" { result.action="review".into(); result.confirmation=output.confirmation;result.reason=if output.confirmation{output.reason.clone()}else{"Review the transformed text before sending.".into()}; }
+        }
+    }
+    for decision in &output.decisions {
+        if decision.condition != dlp::Truth::True { continue; }
+        if decision.rule_id.starts_with("legacy-keyword") { result.labels.push("keyword".into()); }
+        if decision.rule_id.starts_with("legacy-custom") { result.labels.push("custom".into()); }
+        if let Some(category)=decision.rule_id.strip_prefix("legacy-mask-") { result.labels.push(category.into()); }
+    }
+    result.labels.sort();result.labels.dedup();
+    if policy.journal {
+        result.dlp=output.decisions;
+        result.dlp_fingerprint=input.config["dlp_fingerprint"].as_str().map(str::to_owned);
+    }
+    Ok(result)
+}
+
+fn inspect_legacy(input: &InspectionInput) -> Result<Inspection> {
     if input.text.len() > TEXT_LIMIT { return Err("text exceeds local inspection limit".into()); }
     if input.provider.len() > 100 || input.scope.len() > 32 { return Err("invalid inspection input".into()); }
     let protection = &input.config["protection"];
     let message = protection["message"].as_str().unwrap_or("La politique de votre organisation empêche cet envoi.");
-    let mut out = Inspection { ok: true, action: "observe".into(), text: input.text.clone(), labels: vec![], reason: String::new(), redirect_url: None, decision_reason: None, evidence: None };
+    let mut out = Inspection { ok: true, action: "observe".into(), text: input.text.clone(), labels: vec![], reason: String::new(), confirmation:false, redirect_url: None, decision_reason: None, evidence: None, dlp: vec![], dlp_fingerprint: None };
     if input.service["mode"] == "block" || (input.upload && protection["block_uploads"].as_bool().unwrap_or(false)) { out.action = "block".into(); out.reason = message.into(); }
     if input.service["mode"] == "redirect" {
         let target = input.service["redirect_url"].as_str().ok_or("missing redirect destination")?;
         let url = url::Url::parse(target).map_err(|_| "redirect destination rejected")?;
-        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() { return Err("redirect destination rejected".into()); }
-        out.action = "redirect".into(); out.redirect_url = Some(target.into());
+        if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() || explicit_port(target) { return Err("redirect destination rejected".into()); }
+        // A destination the same policy holds back would only bounce the person again.
+        if held(&input.config, url.host_str().unwrap_or_default()) { out.action = "block".into(); out.reason = message.into(); }
+        else { out.action = "redirect".into(); out.redirect_url = Some(target.into()); }
     }
     let lower = input.text.to_lowercase();
     let mut labels = BTreeSet::new();
@@ -80,6 +147,20 @@ pub fn inspect(input: &InspectionInput) -> Result<Inspection> {
     Ok(out)
 }
 
+// `Url` drops a default port (`:443`) and an empty one: read the authority as written, so
+// the engine refuses every port the server refuses.
+fn explicit_port(target: &str) -> bool {
+    let rest = target.split_once("://").map_or("", |(_, rest)| rest);
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    host.rsplit_once(']').map_or(host, |(_, after)| after).contains(':')
+}
+fn held(config: &Value, host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    config["services"].as_array().into_iter().flatten().filter(|s| s["enabled"].as_bool().unwrap_or(false) && matches!(s["mode"].as_str(), Some("block" | "redirect")))
+        .flat_map(|s| strings(&s["domains"])).map(|d| d.trim_end_matches('.').to_ascii_lowercase())
+        .any(|d| !d.is_empty() && (host == d || host.ends_with(&format!(".{d}"))))
+}
 fn strings(v: &Value) -> Vec<&str> { v.as_array().map(|items| items.iter().filter_map(Value::as_str).collect()).unwrap_or_default() }
 // Format characters (Unicode Cf), variation selectors and fillers: rendered as nothing,
 // kept by NFKC, so they could split a term or a value without changing what is read.
@@ -94,11 +175,11 @@ impl Skeleton {
     fn push(&mut self, c: char, from: usize, to: usize) { self.spans.push((self.text.len(),from,to)); self.text.push(c); }
     fn source(&self, start: usize, end: usize) -> Option<(usize,usize)> { let first=self.spans.partition_point(|s|s.0<start); let last=self.spans.partition_point(|s|s.0<end); (first<last).then(|| (self.spans[first].1, self.spans[last-1].2)) }
 }
-/// NFKC per character, invisibles dropped, case kept: what the sensitive patterns read, so
+/// NFKC per character, invisibles, combining marks and the blank Braille cell dropped, case kept: what the sensitive patterns read, so
 /// full-width digits or a zero-width space inside a value cannot hide it from them.
 fn normalized(text:&str)->Skeleton {
     let mut view=Skeleton::default();
-    for (at,source) in text.char_indices() { let end=at+source.len_utf8(); let mut buffer=[0u8;4]; for c in source.encode_utf8(&mut buffer).nfkc().filter(|c|!invisible(*c)) { view.push(c,at,end); } }
+    for (at,source) in text.char_indices() { let end=at+source.len_utf8(); let mut buffer=[0u8;4]; for c in source.encode_utf8(&mut buffer).nfkc().filter(|c|!invisible(*c)&&!unicode_normalization::char::is_combining_mark(*c)&&*c!='\u{2800}') { view.push(c,at,end); } }
     view
 }
 fn skeletons(text:&str)->(Skeleton,Skeleton) {
@@ -112,24 +193,55 @@ fn excerpt(text:&str,from:usize,to:usize)->Option<String>{let(from,to)=(from.min
 fn safe_regex(pattern:&str,ci:bool)->Result<regex::Regex>{if pattern.len()>200{return Err("custom pattern too long".into());}let re=RegexBuilder::new(pattern).case_insensitive(ci).size_limit(256*1024).dfa_size_limit(512*1024).build().map_err(|e|e.to_string())?;if re.is_match(""){return Err("pattern must not match empty input".into());}Ok(re)}
 const FIXED_PATTERNS: [(&str, &str); 7] = [
     ("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
-    ("iban", r"\b[A-Z]{2}[0-9]{2}(?:[ ]?[A-Z0-9]){11,30}\b"),
-    ("card", r"\b(?:[0-9]{13,19}|[0-9]{4}(?:[ -][0-9]{4}){3}|[0-9]{4}[ -][0-9]{6}[ -][0-9]{5})\b"),
+    // No `\b`: a Unicode word boundary hid a value glued to `é` or `_`. `bounded` holds
+    // these two to no ASCII letter or digit on either side instead.
+    ("iban", r"[A-Z]{2}[0-9]{2}(?:(?:[ ]{1,2}|\t|\r?\n|[.-])?[A-Z0-9]){11,30}"),
+    ("card", r"(?:[0-9]{13,19}|[0-9]{4}(?:[ .-][0-9]{4}){3}|[0-9]{4}[ .-][0-9]{6}[ .-][0-9]{5})"),
     ("phone", r"(?:\+[0-9]{1,3}[ .-]?)?(?:[0-9][ .-]?){8,14}[0-9]"),
     ("social_id", r"\b[12][0-9]{12,14}\b"),
     ("ssn_us", r"\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b"),
     ("ip", r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"),
 ];
 
-fn fixed_regexes() -> &'static [(&'static str, regex::Regex)] {
-    static REGEXES: OnceLock<Vec<(&str, regex::Regex)>> = OnceLock::new();
+/// Each fixed pattern, and the same pattern anchored on a whole candidate.
+fn fixed_regexes() -> &'static [(&'static str, regex::Regex, regex::Regex)] {
+    static REGEXES: OnceLock<Vec<(&str, regex::Regex, regex::Regex)>> = OnceLock::new();
     REGEXES.get_or_init(|| {
         FIXED_PATTERNS
             .iter()
             .map(|(kind, pattern)| {
-                (*kind, safe_regex(pattern, true).expect("fixed sensitive pattern must compile"))
+                let compile = |p: &str| safe_regex(p, true).expect("fixed sensitive pattern must compile");
+                (*kind, compile(pattern), compile(&format!("^(?:{pattern})$")))
             })
             .collect()
     })
+}
+
+/// The values of one fixed pattern that pass its check. The patterns are greedy and
+/// case-insensitive: an IBAN's pattern also takes the word after it ("… 189 annule"), and a
+/// failed check then hid the value itself (real campaign 0.7.3). A failed match is retried
+/// shortened at each word end inside it, longest first, then from its next character, so a
+/// valid value is never lost to the text around it.
+fn checked_matches(kind: &str, pattern: &regex::Regex, whole: &regex::Regex, text: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at <= text.len() {
+        let Some(m) = pattern.find_at(text, at) else { break };
+        let start = m.start();
+        let word_ends = text[start..m.end()].char_indices().filter(|(i, c)| *i > 0 && !c.is_alphanumeric()).map(|(i, _)| start + i).filter(|end| text[..*end].chars().next_back().is_some_and(char::is_alphanumeric));
+        let mut ends: Vec<usize> = std::iter::once(m.end()).chain(word_ends).collect();
+        ends[1..].reverse();
+        match ends.into_iter().find(|end| *end > start && bounded(kind, text, start, *end) && whole.is_match(&text[start..*end]) && plausible(kind, &text[start..*end])) {
+            Some(end) => { found.push((start, end)); at = end; }
+            None => at = start + text[start..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    found
+}
+
+fn bounded(kind: &str, text: &str, start: usize, end: usize) -> bool {
+    let alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    !matches!(kind, "iban" | "card") || (!alnum(text[..start].chars().next_back()) && !alnum(text[end..].chars().next()))
 }
 
 struct CachedRegex {
@@ -161,7 +273,7 @@ fn custom_regex(pattern: &str, case_insensitive: bool) -> Result<regex::Regex> {
     });
     Ok(regex)
 }
-fn plausible(kind:&str,value:&str)->bool{let compact:String=value.chars().filter(|c|!matches!(c,' '|'-')).collect();match kind{"ip"=>value.parse::<std::net::Ipv4Addr>().is_ok(),"ssn_us"=>{let p:Vec<_>=value.split('-').collect();p.len()==3&&p[0]!="000"&&p[0]!="666"&&!p[0].starts_with('9')&&p[1]!="00"&&p[2]!="0000"},"card"=>{let d:Vec<_>=compact.chars().filter_map(|c|c.to_digit(10)).collect();if !(13..=19).contains(&d.len())||d.iter().all(|n|*n==d[0]){return false;}d.iter().rev().enumerate().map(|(i,n)|{let n=if i%2==1{n*2}else{*n};if n>9{n-9}else{n}}).sum::<u32>()%10==0},"iban"=>{let value=compact.to_ascii_uppercase();if !(15..=34).contains(&value.len())||!value.is_ascii(){return false;}let mut r=0;for b in value.bytes().skip(4).chain(value.bytes().take(4)){if b.is_ascii_digit(){r=(r*10+u32::from(b-b'0'))%97}else if b.is_ascii_uppercase(){r=(r*100+u32::from(b-b'A'+10))%97}else{return false}}r==1},_=>true}}
+fn plausible(kind:&str,value:&str)->bool{let compact:String=value.chars().filter(|c|!matches!(c,' '|'-'|'.'|'\t'|'\n'|'\r')).collect();match kind{"ip"=>value.parse::<std::net::Ipv4Addr>().is_ok(),"ssn_us"=>{let p:Vec<_>=value.split('-').collect();p.len()==3&&p[0]!="000"&&p[0]!="666"&&!p[0].starts_with('9')&&p[1]!="00"&&p[2]!="0000"},"card"=>{let d:Vec<_>=compact.chars().filter_map(|c|c.to_digit(10)).collect();if !(13..=19).contains(&d.len())||d.iter().all(|n|*n==d[0]){return false;}d.iter().rev().enumerate().map(|(i,n)|{let n=if i%2==1{n*2}else{*n};if n>9{n-9}else{n}}).sum::<u32>()%10==0},"iban"=>{let value=compact.to_ascii_uppercase();if !(15..=34).contains(&value.len())||!value.is_ascii(){return false;}let mut r=0;for b in value.bytes().skip(4).chain(value.bytes().take(4)){if b.is_ascii_digit(){r=(r*10+u32::from(b-b'0'))%97}else if b.is_ascii_uppercase(){r=(r*100+u32::from(b-b'A'+10))%97}else{return false}}r==1},_=>true}}
 fn looks_like_source(text:&str)->bool{const I:[&str;14]=["function ","import ","fn ","def ","class ","return ","const ","public ","#include","=>","->","()","{}","};"];let hits=I.iter().filter(|i|text.contains(**i)).take(3).count();let nested=text.chars().scan(0i32,|d,c|{*d+=match c{'{'|'('| '['=>1,'}'|')'|']'=>-1,_=>0};Some(*d)}).any(|d|d>=2);hits>=3||(hits>=2&&nested)}
 fn medical_terms(config:&Value)->Vec<String>{let defined=&config["classification"]["medical_terms"];if defined.is_array(){return strings(defined).into_iter().take(100).map(|s|s.trim().to_lowercase()).filter(|s|!s.is_empty()).collect();}["diagnostic","ordonnance","prescription","medical record","dossier médical"].into_iter().map(str::to_string).collect()}
 type SensitiveSpan = (usize, usize, String);
@@ -216,7 +328,7 @@ fn inspect_sensitive(config:&Value,text:&str,scope:&str,lower:&str,out:&mut Insp
  // labels (`labels`), on the other hand, remain the category identifiers.
  // Patterns read the normalized view; masking covers the original bytes it came from.
  let view=normalized(text);
- for(kind,pattern)in fixed_regexes(){if !wanted(kind){continue}for m in pattern.find_iter(&view.text).filter(|m|!m.is_empty()){if plausible(kind,m.as_str()){labels.insert((*kind).into());if redact&&types.contains(kind)&&let Some((from,to))=view.source(m.start(),m.end()){spans.push((from,to,kind.to_uppercase()));}}}}
+ for(kind,pattern,whole)in fixed_regexes(){if !wanted(kind){continue}for(start,end)in checked_matches(kind,pattern,whole,&view.text){labels.insert((*kind).into());if redact&&types.contains(kind)&&let Some((from,to))=view.source(start,end){spans.push((from,to,kind.to_uppercase()));}}}
  for custom in config["privacy"]["custom_rules"].as_array().into_iter().flatten().take(50){if !custom["enabled"].as_bool().unwrap_or(false){continue}let placeholder=custom["label"].as_str().map(str::trim).filter(|s|!s.is_empty()).unwrap_or("custom").to_string();for m in custom_regex(custom["pattern"].as_str().ok_or("custom pattern missing")?,custom["case_insensitive"].as_bool().unwrap_or(false))?.find_iter(&view.text).filter(|m|!m.is_empty()){labels.insert("custom".into());if redact&&let Some((from,to))=view.source(m.start(),m.end()){spans.push((from,to,placeholder.clone()));}}}
  if wanted("source_code")&&looks_like_source(text){labels.insert("source_code".into());}if wanted("medical")&&medical_terms(config).iter().filter(|term|lower.contains(term.as_str())).take(2).count()>=2{labels.insert("medical".into());}
  if !spans.is_empty() {
@@ -226,7 +338,9 @@ fn inspect_sensitive(config:&Value,text:&str,scope:&str,lower:&str,out:&mut Insp
          out.reason = "Vérifiez le texte masqué avant l’envoi.".into();
      }
  }
- if let Some(selected)=config["classification"][scope].as_array(){labels.retain(|label|label=="custom"||selected.iter().any(|v|v.as_str()==Some(label)));}Ok(())
+ // A value masked by privacy keeps its label although the usage classification does not list it: the
+ // event otherwise said nothing of an e-mail it masked (real campaign 0.7.7: `[EMAIL]` sent, `labels` card and iban).
+ if let Some(selected)=config["classification"][scope].as_array(){labels.retain(|label|label=="custom"||label=="keyword"||(redact&&types.contains(&label.as_str()))||selected.iter().any(|v|v.as_str()==Some(label)));}Ok(())
 }
 #[cfg(target_arch = "wasm32")]
 mod wasm {
@@ -377,6 +491,182 @@ mod tests {
         let actual = inspect(&request).unwrap();
         assert_eq!(actual.action, "block");
         assert!(actual.evidence.as_deref().is_none_or(|excerpt| excerpt == "secret"));
+    }
+
+    fn masking(types: &[&str], text: &str) -> Inspection {
+        let mut request = input();
+        request.config = serde_json::json!({
+            "protection": {},
+            "privacy": {"enabled": true, "types": types, "review": true},
+            "classification": {"browser": types}
+        });
+        request.text = text.into();
+        inspect(&request).unwrap()
+    }
+
+    // Real campaign 0.7.3: the case-insensitive IBAN pattern swallowed the word after the
+    // value, the check digits then failed and the IBAN left in clear.
+    #[test]
+    fn an_iban_followed_by_a_word_is_masked() {
+        for (text, expected) in [
+            ("IBAN FR76 3000 6000 0112 3456 7890 189 annule", "IBAN [IBAN] annule"),
+            ("IBAN FR76 3000 6000 0112 3456 7890 189 ABCD", "IBAN [IBAN] ABCD"),
+            ("(FR76 3000 6000 0112 3456 7890 189).", "([IBAN])."),
+            ("iban:fr76 3000 6000 0112 3456 7890 189, merci", "iban:[IBAN], merci"),
+            ("FR7630006000 01123456 7890189 ok", "[IBAN] ok"),
+            ("FR76\u{a0}3000\u{a0}6000\u{a0}0112\u{a0}3456\u{a0}7890\u{a0}189 ok", "[IBAN] ok"),
+            ("FR76 3000 6000 0112 3456 7890 189 DE89 3704 0044 0532 0130 00 fin", "[IBAN1] [IBAN2] fin"),
+            ("XX12 FR76 3000 6000 0112 3456 7890 189 fin", "XX12 [IBAN] fin"),
+        ] {
+            let actual = masking(&["iban"], text);
+            assert_eq!(actual.text, expected, "{text}");
+            assert_eq!(actual.labels, ["iban"], "{text}");
+            assert_eq!(actual.action, "review", "{text}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_iban_is_not_masked_even_when_shortened() {
+        for text in ["FR76 3000 6000 0112 3456 7890 188 annule", "FR76 3000 6000 0112 3456 7890 188", "AB12 CDEF GHIJ KLMN OPQR mot"] {
+            let actual = masking(&["iban"], text);
+            assert_eq!(actual.text, text);
+            assert!(actual.labels.is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_card_beside_words_is_masked_and_a_wrong_one_is_not() {
+        for (text, expected) in [
+            ("carte 4111 1111 1111 1111 annule", "carte [CARD] annule"),
+            ("carte 4111111111111111.", "carte [CARD]."),
+            ("4111-1111-1111-1111 et 5555 5555 5555 4444 fin", "[CARD1] et [CARD2] fin"),
+            ("carte 4111 1111 1111 1112 annule", "carte 4111 1111 1111 1112 annule"),
+        ] {
+            assert_eq!(masking(&["card"], text).text, expected, "{text}");
+        }
+    }
+
+    // Real campaign 0.7.7: an e-mail masked under privacy lost its label, the classification listing only
+    // card and iban. Detection without masking still follows the classification.
+    #[test]
+    fn a_masked_value_keeps_its_label_outside_the_classification() {
+        let mut request = input();
+        request.config = serde_json::json!({
+            "protection": {},
+            "privacy": {"enabled": true, "types": ["email", "card"], "review": true},
+            "classification": {"browser": ["iban", "card", "social_id"]}
+        });
+        request.text = "mail jean.exemple@example.com carte 4111 1111 1111 1111 ip 192.0.2.1".into();
+        let actual = inspect(&request).unwrap();
+        assert_eq!(actual.text, "mail [EMAIL] carte [CARD] ip 192.0.2.1");
+        assert_eq!(actual.labels, ["card", "email"]);
+        request.config["privacy"]["enabled"] = serde_json::json!(false);
+        assert_eq!(inspect(&request).unwrap().labels, ["card"], "not masked: classification only");
+    }
+
+    // Observation mode: a protected word found must leave its label even when the usage
+    // classification does not list it, or observing protected words records nothing.
+    #[test]
+    fn an_observed_keyword_keeps_its_label() {
+        let mut request = input();
+        request.config = serde_json::json!({
+            "protection": {"keywords": ["PRJ-1234"], "exact": "observe", "unicode": "observe", "fuzzy": "off"},
+            "privacy": {"enabled": false},
+            "classification": {"browser": ["iban"]}
+        });
+        request.text = "voir PRJ-1234 demain".into();
+        let actual = inspect(&request).unwrap();
+        assert_eq!(actual.action, "observe");
+        assert_eq!(actual.labels, ["keyword"]);
+    }
+
+    // Fourth review, M1: a combining mark or a blank Braille cell inside a value split it
+    // for the patterns while the reader saw the value whole.
+    #[test]
+    fn combining_marks_and_braille_blanks_do_not_hide_a_value() {
+        for text in ["carte 4\u{301}111 1111 1111 1111 fin", "carte 4111\u{2800}1111\u{2800}1111\u{2800}1111 fin", "carte 4111 1\u{20dd}111 1111 1111 fin"] {
+            assert_eq!(masking(&["card"], text).text, "carte [CARD] fin", "{text:?}");
+        }
+    }
+
+    // Fourth review, M2: other separators a person or a document puts in an IBAN or a card,
+    // and a value glued to an accented letter or an underscore.
+    #[test]
+    fn wider_separators_and_glued_values_are_masked() {
+        for (kind, text, expected) in [
+            ("iban", "FR76  3000  6000  0112  3456  7890  189 ok", "[IBAN] ok"),
+            ("iban", "FR76\t3000\t6000\t0112\t3456\t7890\t189 ok", "[IBAN] ok"),
+            ("iban", "FR76\n3000\n6000\n0112\n3456\n7890\n189\nok", "[IBAN]\nok"),
+            ("iban", "FR76-3000-6000-0112-3456-7890-189 ok", "[IBAN] ok"),
+            ("iban", "FR76.3000.6000.0112.3456.7890.189 ok", "[IBAN] ok"),
+            ("iban", "réf_FR7630006000011234567890189 ok", "réf_[IBAN] ok"),
+            ("iban", "éFR7630006000011234567890189 ok", "é[IBAN] ok"),
+            ("card", "carte 4111.1111.1111.1111 fin", "carte [CARD] fin"),
+            ("card", "carte_4111111111111111 fin", "carte_[CARD] fin"),
+            ("card", "numéro é4111 1111 1111 1111 fin", "numéro é[CARD] fin"),
+        ] {
+            assert_eq!(masking(&[kind], text).text, expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn wider_separators_bring_no_false_positive() {
+        for (kind, text) in [
+            ("iban", "FR76.3000.6000.0112.3456.7890.188 ok"),
+            ("iban", "FR76\t3000\t6000\t0112\t3456\t7890\t188"),
+            ("iban", "version AB12.CDEF.GHIJ.KLMN fin"),
+            ("card", "version 2024.1015.0001.0003 fin"),
+            ("card", "carte 4111.1111.1111.1112 fin"),
+            // A valid card inside a longer run of digits or letters is not a card.
+            ("card", "ref 99994111111111111111 fin"),
+            ("card", "ref a4111111111111111 fin"),
+            ("card", "ref 4111111111111111a fin"),
+            ("iban", "codeXFR7630006000011234567890189 fin"),
+        ] {
+            let actual = masking(&[kind], text);
+            assert_eq!(actual.text, text, "{text:?}");
+            assert!(actual.labels.is_empty(), "{text:?}");
+        }
+    }
+
+    fn redirect(config: serde_json::Value, target: &str) -> Result<Inspection> {
+        let mut request = input();
+        request.config = config;
+        request.text = "bonjour".into();
+        request.service = serde_json::json!({"mode": "redirect", "redirect_url": target});
+        inspect(&request)
+    }
+
+    // Fourth review, M5: the server refuses a port in a redirect destination; the engine
+    // refuses it too, explicit default port included, and never sends a person to a
+    // destination the same policy holds back.
+    #[test]
+    fn a_redirect_destination_with_a_port_is_refused() {
+        let config = serde_json::json!({"protection": {}, "privacy": {"enabled": false}});
+        for target in ["https://ai.example.test:8443/", "https://ai.example.test:443/", "https://[2001:db8::1]:443/", "https://ai.example.test:/"] {
+            assert!(redirect(config.clone(), target).is_err(), "{target}");
+        }
+        let fine = redirect(config.clone(), "https://ai.example.test/approved").unwrap();
+        assert_eq!(fine.action, "redirect");
+        assert_eq!(fine.redirect_url.as_deref(), Some("https://ai.example.test/approved"));
+        assert_eq!(redirect(config, "https://[2001:db8::1]/").unwrap().action, "redirect");
+    }
+
+    #[test]
+    fn a_redirect_to_a_held_destination_blocks_instead() {
+        let config = serde_json::json!({"protection": {}, "privacy": {"enabled": false}, "services": [
+            {"id": "other", "domains": ["held.example.test"], "enabled": true, "mode": "block"},
+            {"id": "off", "domains": ["off.example.test"], "enabled": false, "mode": "block"},
+            {"id": "seen", "domains": ["seen.example.test"], "enabled": true, "mode": "observe"}
+        ]});
+        for target in ["https://held.example.test/", "https://HELD.example.test./x", "https://www.held.example.test/"] {
+            let actual = redirect(config.clone(), target).unwrap();
+            assert_eq!(actual.action, "block", "{target}");
+            assert!(actual.redirect_url.is_none(), "{target}");
+        }
+        for target in ["https://off.example.test/", "https://seen.example.test/", "https://notheld.example.test/"] {
+            assert_eq!(redirect(config.clone(), target).unwrap().action, "redirect", "{target}");
+        }
     }
 
     #[test]

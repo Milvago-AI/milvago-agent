@@ -104,11 +104,13 @@ pub enum Access {
     CacheBrowser,
     #[cfg(windows)]
     UpdateAgent,
+    #[cfg(windows)]
+    DiscoveryAgent,
 }
 
 fn frame_budget(access:Access)->usize {
     #[cfg(windows)]
-    match access {Access::UpdateAgent=>return 2*1024*1024,Access::CacheBrowser=>return 1024*1024,_=>{}}
+    match access {Access::DiscoveryAgent=>return 8*1024*1024,Access::UpdateAgent=>return 2*1024*1024,Access::CacheBrowser=>return 1024*1024,_=>{}}
     let _=access;128*1024
 }
 /// Handler invoked for each request frame received from a relayed client.
@@ -160,7 +162,7 @@ pub fn exchange(channel: &str, access: Access, request: &Value) -> Result<Value>
 pub fn exchange_timeout(channel: &str, access: Access, request: &Value, timeout: std::time::Duration) -> Result<Value> {
     let deadline = std::time::Instant::now() + timeout;
     #[cfg(windows)]
-    let mut conn = windows::connect(channel, access)?;
+    let mut conn = windows::connect_until(channel, access, deadline)?;
     #[cfg(unix)]
     let mut conn = unix::connect(channel, access)?;
     conn.deadline = conn.deadline.min(deadline);
@@ -215,6 +217,8 @@ struct DeadlineStream<S> {
 impl<S> DeadlineStream<S> {
     fn new(inner: S, access: Access, stop: Arc<AtomicBool>) -> Self {
         let seconds = if matches!(access, Access::Service) { 120 } else { 10 };
+        #[cfg(windows)]
+        let seconds=if access==Access::DiscoveryAgent {120} else {seconds};
         Self { inner, deadline: std::time::Instant::now() + std::time::Duration::from_secs(seconds), stop }
     }
     fn check(&self) -> io::Result<()> {
@@ -290,7 +294,7 @@ mod windows {
     const PIPE_REJECT_REMOTE_CLIENTS: u32 = 0x0000_0008;
     const PIPE_UNLIMITED_INSTANCES: u32 = 255;
     const GENERIC_READ: u32 = 0x8000_0000;
-    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const CLIENT_ACCESS: u32 = 0x0012019b;
     const OPEN_EXISTING: u32 = 3;
     const SECURITY_SQOS_PRESENT: u32 = 0x0010_0000;
     const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
@@ -302,6 +306,10 @@ mod windows {
     const ERROR_PIPE_LISTENING: u32 = 536;
     const NMPWAIT_TIMEOUT_MS: u32 = 2000;
     const BUFFER: u32 = 64 * 1024;
+    // Keep each nonblocking write below the kernel quota. Windows can report
+    // success with zero bytes for an oversized write, leaving both polling peers
+    // waiting forever. The frame limit and absolute connection deadline still apply.
+    const PIPE_WRITE_CHUNK: usize = 16 * 1024;
 
     #[repr(C)]
     struct SecurityAttributes {
@@ -627,7 +635,7 @@ mod windows {
                 "S-1-5-18" | "S-1-5-20" | "S-1-5-32-544"
             ),
             // Only LocalSystem serves a service channel.
-            Access::Service | Access::CacheBrowser | Access::UpdateAgent => owner == "S-1-5-18",
+            Access::Service | Access::CacheBrowser | Access::UpdateAgent | Access::DiscoveryAgent => owner == "S-1-5-18",
         };
         if !owned_by_a_service {
             return Ok(false);
@@ -642,7 +650,7 @@ mod windows {
             None => true,
             Some(text) => match access {
                 Access::Browser => matches!(text.as_str(), "S-1-5-18" | "S-1-5-20"),
-                Access::Service | Access::CacheBrowser | Access::UpdateAgent => text == "S-1-5-18",
+                Access::Service | Access::CacheBrowser | Access::UpdateAgent | Access::DiscoveryAgent => text == "S-1-5-18",
             },
         })
     }
@@ -720,7 +728,7 @@ mod windows {
                 WriteFile(
                     self.0,
                     buf.as_ptr(),
-                    buf.len() as u32,
+                    buf.len().min(PIPE_WRITE_CHUNK) as u32,
                     &mut written,
                     std::ptr::null_mut(),
                 )
@@ -784,7 +792,7 @@ mod windows {
                 WriteFile(
                     self.0,
                     buf.as_ptr(),
-                    buf.len() as u32,
+                    buf.len().min(PIPE_WRITE_CHUNK) as u32,
                     &mut written,
                     std::ptr::null_mut(),
                 )
@@ -832,6 +840,7 @@ mod windows {
             Access::Service => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{})", crate::cache_peer::service_sid(edition)?),
             Access::CacheBrowser => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;AU)"),
             Access::UpdateAgent => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{})", crate::cache_peer::service_sid(edition)?),
+            Access::DiscoveryAgent => format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{})", crate::cache_peer::service_sid(edition)?),
         })
     }
     /// Who may create instances of a Browser channel: the one service that serves it,
@@ -999,7 +1008,7 @@ mod windows {
                 continue;
             }
             let authenticated = match access {
-                Access::CacheBrowser | Access::UpdateAgent => {
+                Access::CacheBrowser | Access::UpdateAgent | Access::DiscoveryAgent => {
                     let mut pid = 0;
                     if unsafe { GetNamedPipeClientProcessId(handle, &mut pid) } == 0 { false }
                     else if access == Access::CacheBrowser { crate::cache_peer::relay(pid, edition).is_ok() }
@@ -1012,7 +1021,8 @@ mod windows {
                 continue;
             }
             let caller = caller_identity(handle);
-            if active.load(Ordering::Acquire) >= MAX_CONNECTIONS || !callers.admit(&caller) {
+            let connection_limit=if access==Access::DiscoveryAgent {1} else {MAX_CONNECTIONS};
+            if active.load(Ordering::Acquire) >= connection_limit || !callers.admit(&caller) {
                 unsafe {
                     DisconnectNamedPipe(handle);
                     CloseHandle(handle);
@@ -1034,6 +1044,9 @@ mod windows {
                 let object=request.as_object_mut().ok_or("IPC object required")?;
                 let caller=object.get_mut("caller").and_then(Value::as_object_mut).ok_or("IPC caller absent")?;
                 caller.insert("system".into(),json!(principal == "S-1-5-18"));
+                if access==Access::DiscoveryAgent {
+                    caller.insert("service_sid".into(),json!(crate::cache_peer::service_sid(edition)?));
+                }
                 // The account comes from the same kernel token as the SID, never from a
                 // process id the client could have recycled.
                 caller.insert("user".into(),json!(sid_account(&principal).unwrap_or_default()));
@@ -1059,14 +1072,29 @@ mod windows {
     mod pipe_tests {
         use super::*;
         #[test]
+        fn an_expired_connect_budget_is_refused_before_opening_a_pipe() {
+            let result = connect_until("synthetic-expired-budget", Access::Browser, std::time::Instant::now());
+            assert!(result.is_err());
+            assert!(result.err().unwrap().to_string().contains("connection deadline"));
+        }
+        #[test]
+        fn agent_connection_wait_consumes_the_exchange_budget() {
+            let channel = format!("synthetic-deadline-{}", uuid::Uuid::new_v4());
+            let start = std::time::Instant::now();
+            let error = exchange_agent(&channel, "community", &json!({"op":"policy_v3"}), std::time::Duration::from_millis(50)).unwrap_err();
+            assert!(error.to_string().contains("connection deadline"));
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        }
+
+        #[test]
         fn privileged_pipe_descriptors_explicitly_own_system() {
             unsafe extern "system" {
                 fn GetSecurityDescriptorOwner(descriptor: *mut c_void, owner: *mut *mut c_void, defaulted: *mut i32) -> i32;
             }
             let mut checked=0;
-            for access in [Access::Service, Access::CacheBrowser, Access::UpdateAgent] {
+            for access in [Access::Service, Access::CacheBrowser, Access::UpdateAgent, Access::DiscoveryAgent] {
                 // The agent's service SID resolves only where the service is installed.
-                if matches!(access, Access::UpdateAgent | Access::Service) && crate::cache_peer::service_sid("community").is_err() { continue; }
+                if matches!(access, Access::UpdateAgent | Access::Service | Access::DiscoveryAgent) && crate::cache_peer::service_sid("community").is_err() { continue; }
                 let text=pipe_sddl(access,"community","").unwrap();
                 let mut raw=std::ptr::null_mut();
                 assert_ne!(unsafe { ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(&text).as_ptr(),
@@ -1087,8 +1115,8 @@ mod windows {
             assert_eq!(pipe_sddl(Access::Browser,"community","OW").unwrap(),
                 "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)(A;;0x0012019b;;;AU)");
             // No client ACE may carry FILE_CREATE_PIPE_INSTANCE (0x4) or GENERIC_WRITE.
-            for access in [Access::Browser, Access::Service, Access::CacheBrowser] {
-                if access == Access::Service && crate::cache_peer::service_sid("community").is_err() { continue; }
+            for access in [Access::Browser, Access::Service, Access::CacheBrowser, Access::DiscoveryAgent] {
+                if matches!(access, Access::Service | Access::DiscoveryAgent) && crate::cache_peer::service_sid("community").is_err() { continue; }
                 let text=pipe_sddl(access,"community","OW").unwrap();
                 assert!(!text.contains("GW"), "generic write granted: {text}");
                 assert_eq!(u32::from_str_radix(CLIENT.trim_start_matches("0x"),16).unwrap()&0x4,0);
@@ -1098,6 +1126,18 @@ mod windows {
 
         // The kernel decides: a principal granted only the client ACE cannot serve its
         // own instance of the name, where the former GENERIC_WRITE grant let it.
+        #[test]
+        fn discovery_channel_grants_only_the_installed_service_identity() {
+            if let Ok(sid) = crate::cache_peer::service_sid("community") {
+                let descriptor = pipe_sddl(Access::DiscoveryAgent, "community", "S-1-5-21-1-2-3-1000").unwrap();
+                assert_eq!(descriptor, format!("O:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;{CLIENT};;;{sid})"));
+                assert!(!descriptor.contains(";;;AU)"));
+                assert!(!descriptor.contains(";;;NS)"));
+                assert!(!descriptor.contains("S-1-5-21-1-2-3-1000"));
+            }
+            assert_eq!(frame_budget(Access::DiscoveryAgent), 8*1024*1024);
+        }
+
         #[test]
         fn a_client_principal_cannot_add_a_pipe_instance() {
             let join = |sddl: &str| -> u32 {
@@ -1121,6 +1161,33 @@ mod windows {
             let former = "D:P(A;;FA;;;SY)(A;;GRGW;;;AU)";
             assert_eq!(join(former), 0, "the former descriptor no longer reproduces the defect");
             assert_eq!(join(&hardened), 5, "a client principal joined the served pipe");
+        }
+
+        #[test]
+        fn a_client_with_no_instance_creation_right_can_still_read_and_write() {
+            let connect=|access| {
+                let name=wide(&pipe_name(&format!("test-{}",uuid::Uuid::new_v4())));
+                let text=wide(&format!("D:P(A;;FA;;;SY)(A;;{CLIENT};;;AU)"));
+                let mut raw=std::ptr::null_mut();
+                assert_ne!(unsafe {ConvertStringSecurityDescriptorToSecurityDescriptorW(text.as_ptr(),SDDL_REVISION_1,&mut raw,std::ptr::null_mut())},0);
+                let descriptor=Descriptor(raw);
+                let sa=SecurityAttributes{n_length:std::mem::size_of::<SecurityAttributes>() as u32,security_descriptor:descriptor.0,inherit_handle:0};
+                let server=unsafe{CreateNamedPipeW(name.as_ptr(),PIPE_ACCESS_DUPLEX|FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_NOWAIT|PIPE_REJECT_REMOTE_CLIENTS,1,BUFFER,BUFFER,0,&sa)};
+                assert_ne!(server,INVALID_HANDLE_VALUE);
+                unsafe {ConnectNamedPipe(server,std::ptr::null_mut());}
+                let client=unsafe {CreateFileW(name.as_ptr(),access,0,std::ptr::null(),OPEN_EXISTING,SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,0)};
+                let error=if client==INVALID_HANDLE_VALUE {unsafe {GetLastError()}} else {
+                    assert_ne!(unsafe {SetNamedPipeHandleState(client,&PIPE_NOWAIT,std::ptr::null(),std::ptr::null())},0);
+                    let mut client=ClientStream(client);let mut serving=PipeStream(server);
+                    client.write_all(b"synthetic").unwrap();let mut bytes=[0;9];serving.read_exact(&mut bytes).unwrap();assert_eq!(&bytes,b"synthetic");
+                    serving.write_all(b"confirmed").unwrap();client.read_exact(&mut bytes).unwrap();assert_eq!(&bytes,b"confirmed");
+                    return 0;
+                };
+                unsafe {CloseHandle(server);}error
+            };
+            assert_eq!(u32::from_str_radix(CLIENT.trim_start_matches("0x"),16).unwrap(),CLIENT_ACCESS);
+            assert_eq!(connect(CLIENT_ACCESS),0,"the client cannot connect with its granted rights");
         }
 
         // The squatting defence rests on the kernel refusing the protected namespace to a
@@ -1155,7 +1222,7 @@ mod windows {
             let name = wide(&pipe_name(channel));
             let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let handle = loop {
-                let handle = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE,
+                let handle = unsafe { CreateFileW(name.as_ptr(), CLIENT_ACCESS,
                     0, std::ptr::null(), OPEN_EXISTING, SECURITY_SQOS_PRESENT | level, 0) };
                 if handle != INVALID_HANDLE_VALUE { break handle; }
                 let error = unsafe { GetLastError() };
@@ -1169,6 +1236,36 @@ mod windows {
             assert_ne!(unsafe { SetNamedPipeHandleState(handle, &PIPE_NOWAIT, std::ptr::null(), std::ptr::null()) }, 0);
             DeadlineStream::new(ClientStream(handle), Access::Browser,
                 Arc::new(AtomicBool::new(false)))
+        }
+
+        #[test]
+        fn nonblocking_byte_frames_larger_than_pipe_buffer_complete_both_directions() {
+            let channel = format!("test-{}", uuid::Uuid::new_v4());
+            let served = channel.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().to_owned();
+            let (completed, done) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                completed.send(serve(&path, &served, Access::Browser, stopping,
+                    Arc::new(|_, request| Ok(json!({"ok":true,"data":request["data"]}))))).unwrap();
+            });
+            let mut client = raw_client(&channel, &done);
+            let result = (|| -> Result<()> {
+                for size in [0, 16383, 16384, 16385, 65535, 65536, 65537, 96000, 131000] {
+                    let expected = "s".repeat(size);
+                    write_frame(&mut client, &json!({"data":expected}))?;
+                    let answer = frame(&mut client)?.ok_or("missing frame")?;
+                    assert_eq!(answer["data"], expected, "frame size {size}");
+                }
+                Ok(())
+            })();
+            drop(client);
+            stop.store(true, Ordering::Release);
+            worker.join().unwrap();
+            done.recv().unwrap().unwrap();
+            result.unwrap();
         }
 
         #[test]
@@ -1322,20 +1419,25 @@ mod windows {
     }
 
     pub fn exchange_agent(channel: &str, edition: &str, request: &Value, timeout: std::time::Duration) -> Result<Value> {
-        let mut stream = connect(channel, Access::Browser)?;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stream = connect_until(channel, Access::Browser, deadline)?;
         let mut pid = 0;
         if unsafe { GetNamedPipeServerProcessId(stream.inner.0, &mut pid) } == 0 { return Err("agent process unavailable".into()); }
         crate::cache_peer::agent(pid, edition)?;
-        stream.deadline = std::time::Instant::now() + timeout;
+        stream.deadline = stream.deadline.min(deadline);
         write_frame(&mut stream, request)?;
         (crate::frame_limit(&mut stream,if request["op"]=="broker_cache_source"{2*1024*1024}else{1024*1024})?).ok_or_else(|| "agent response absent".into())
     }
     pub fn connect(channel: &str, access: Access) -> Result<DeadlineStream<ClientStream>> {
+        connect_until(channel, access, std::time::Instant::now() + std::time::Duration::from_secs(3))
+    }
+    pub(super) fn connect_until(channel: &str, access: Access, deadline: std::time::Instant) -> Result<DeadlineStream<ClientStream>> {
+        let deadline = deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(3));
         let names = pipe_names(channel, access).map(|name| wide(&name));
         let open = |name: &[u16]| unsafe {
             CreateFileW(
                 name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                CLIENT_ACCESS,
                 0,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -1348,8 +1450,10 @@ mod windows {
         // Every instance taken by another client (a local process may connect and close in
         // a loop) or the name between two instances is not an absent agent: retried until
         // a bounded deadline, waiting for a free instance, before reporting unavailable.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let handle = loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("agent pipe connection deadline exceeded".into());
+            }
             let mut name = &names[0];
             let mut handle = open(name);
             let mut err = if handle == INVALID_HANDLE_VALUE { unsafe { GetLastError() } } else { 0 };
@@ -1367,9 +1471,9 @@ mod windows {
             // ERROR_FILE_NOT_FOUND: no instance at this instant; ERROR_PIPE_BUSY: all taken.
             if left.is_zero() || !(err == ERROR_PIPE_BUSY || err == 2) {
                 if err == ERROR_PIPE_BUSY {
-                    return Err("CreateFileW agent pipe busy: win32=231, access=0xc0000000".into());
+                    return Err("CreateFileW agent pipe busy: win32=231, access=0x0012019b".into());
                 }
-                return Err(format!("CreateFileW agent pipe failed: win32={err}, access=0xc0000000").into());
+                return Err(format!("CreateFileW agent pipe failed: win32={err}, access=0x0012019b").into());
             }
             if err == ERROR_PIPE_BUSY {
                 unsafe { WaitNamedPipeW(name.as_ptr(), (left.as_millis() as u32).clamp(1, NMPWAIT_TIMEOUT_MS)) };
@@ -1519,10 +1623,14 @@ mod unix {
                     let original_handler = handler.clone();
                     let rate_callers = callers.clone();
                     let rate_caller = caller.clone();
-                    let handler: Arc<Handler> = Arc::new(move |home, request| {
+                    let handler: Arc<Handler> = Arc::new(move |home, mut request| {
                         if !rate_callers.allow(&rate_caller) {
                             return Err("IPC request rate exceeded".into());
                         }
+                        // Numeric SO_PEERCRED identity, independent from display names.
+                        let caller = request.get_mut("caller").and_then(Value::as_object_mut)
+                            .ok_or("IPC caller absent")?;
+                        if let Some(uid) = uid { caller.insert("uid".into(), json!(uid)); }
                         original_handler(home, request)
                     });
                     let active_clone = active.clone();

@@ -1,11 +1,13 @@
 [package]
 name = "milvago-browser-agent"
-version = "0.6.4"
+version = "0.7.44"
 edition = "2024"
 publish = false
 license = "Apache-2.0"
 
 [features]
+systemd-qualification = []
+windows-qualification = ["windows-sys/Win32_NetworkManagement_Dns", "windows-sys/Win32_Storage_FileSystem"]
 # Enterprise builds only: per-model control. Its implementation is not part of this
 # repository, so the feature cannot be enabled from here.
 model-control = []
@@ -13,37 +15,39 @@ model-control = []
 enterprise-extension = []
 
 [dependencies]
+milvago-discovery-engine = { path = "discovery-engine" }
+milvago-discovery-collector = { path = "discovery-collector" }
 aes-gcm = "=0.11.1"
 milvago-browser-engine = { path = "browser-engine", default-features = false }
 base64 = "=0.23.1"
 chrono = { version = "=0.4.45", features = ["serde"] }
 ed25519-dalek = "=3.0.0"
 fs2 = "=0.4.3"
-rand = "=0.8.8"
+rand = "=0.10.2"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls", "rustls-tls-native-roots"] }
 serde = { version = "=1.0.229", features = ["derive"] }
-serde_json = "=1.0.151"
-toml = "=1.1.6"
-uuid = { version = "=1.26.1", features = ["v4", "serde"] }
-zeroize = "=1.9.0"
+serde_json = "=1.0.154"
+toml = "=1.1.8"
+uuid = { version = "=1.28.0", features = ["v4", "serde"] }
+zeroize = "=1.9.1"
 regex = "=1.13.1"
-unicode-normalization = "=0.1.25"
-sha2 = "=0.10.9"
+unicode-normalization = "=0.1.26"
+sha2 = "=0.11.0"
 unicode-security = "=0.1.2"
-rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring"] }
 time = "=0.3.55"
 
 # The Unix socket peer credential, because UnixStream::peer_cred is unstable.
 [target.'cfg(unix)'.dependencies]
-libc = "=0.2.189"
+libc = "=0.2.191"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_RemoteDesktop"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_RemoteDesktop", "Win32_System_Diagnostics_Etw", "Win32_System_Time", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security"] }
 windows-service = "=0.8.1"
 
 [build-dependencies]
-serde_json = "=1.0.151"
+serde_json = "=1.0.154"
 
 [dev-dependencies]
 tempfile = "=3.27.0"
@@ -51,3 +55,8 @@ tempfile = "=3.27.0"
 [profile.release]
 strip = true
 lto = "thin"
+
+[[example]]
+name = "qualify_wsl_system"
+path = "examples/qualify_wsl_system.rs"
+required-features = ["windows-qualification"]

@@ -5,14 +5,14 @@ use crate::{Envelope, State, browser_broker as broker, browser_cache as cache, d
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{Duration, Utc};
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use rand::{RngCore, rngs::OsRng};
+
 use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+
 
 fn authority() -> SigningKey {
     let mut seed = [0u8; 32];
-    OsRng.fill_bytes(&mut seed);
+    crate::fill_random(&mut seed);
     SigningKey::from_bytes(&seed)
 }
 
@@ -79,7 +79,7 @@ fn catalog(key: &SigningKey) -> Envelope {
             extension: detection::ENGINE_VERSION.into(),
             bridge: detection::ENGINE_VERSION.into(),
         },
-        content_hash: format!("{:x}", Sha256::digest(&raw)),
+        content_hash: crate::sha256_hex(&raw),
         content: STANDARD.encode(raw),
     };
     signed(key, &header)
@@ -1048,4 +1048,385 @@ fn a_completion_that_would_overflow_the_queue_is_not_placed() {
     assert!(!queue.complete(&completion));
     assert!(queue.pending[0].event.model.is_none());
     queue.validate().unwrap();
+}
+
+/// A send the network guard sealed after its DOM record is one blocked event: the seal
+/// completes that record where it still waits. Placed nowhere else, it says so, and the
+/// browser records the refusal on its own.
+#[test]
+fn a_sealed_send_turns_its_waiting_record_blocked_and_nothing_else() {
+    let (journal, _, policy_envelope, authority) = prepared();
+    let policy = shadow::verify(&policy_envelope, &STANDARD.encode(authority.verifying_key().as_bytes()), 1, Utc::now()).unwrap();
+    let mut queue = broker::Queue::default();
+    let delivery = uuid::Uuid::new_v4();
+    let id = queue.admit(&journal, &policy, &broker::parse(&event_for_principal("S-1-5-21-601", delivery, 4)).unwrap()).unwrap();
+    let seal = json!({"decision_reason":"control_unavailable","platform_id":"chatgpt"});
+    // Another account cannot name this send.
+    assert!(queue.completed(&journal, &broker::parse(&completion_request(delivery, seal.clone(), "S-1-5-21-602")).unwrap()).unwrap().is_none());
+    let completion = shadow::ShadowCompletion::parse_for(id, &seal).unwrap();
+    let before = (queue.pending[0].event.prompt.clone(), queue.pending[0].event.characters);
+    assert!(queue.complete(&completion));
+    let event = &queue.pending[0].event;
+    assert_eq!((event.action.as_str(), event.decision_reason.as_deref(), event.platform_id.as_deref()), ("blocked", Some("control_unavailable"), Some("chatgpt")));
+    assert_eq!((event.prompt.clone(), event.characters), before, "no text and no count change");
+    // A record of another platform keeps its action.
+    let mut other = queue.pending[0].event.clone();
+    (other.action, other.decision_reason, other.platform_id, other.provider) = ("observed".into(), None, None, "claude.ai".into());
+    completion.apply(&mut other);
+    assert_eq!(other.action, "observed");
+    // Already at the server: not placed, and said so.
+    let mut state = State::default();
+    let mut gone = completion;
+    gone.id = uuid::Uuid::new_v4();
+    assert!(!shadow::complete(&mut state, gone).unwrap());
+    assert!(state.shadow_completions.is_empty());
+    for bad in [
+        json!({"decision_reason":"model_denied","platform_id":"chatgpt"}),
+        json!({"decision_reason":"control_unavailable"}),
+        json!({"decision_reason":"control_unavailable","platform_id":"unknown-platform"}),
+        json!({"platform_id":"chatgpt","model":"model-alpha"}),
+    ] {
+        assert!(shadow::ShadowCompletion::parse_for(uuid::Uuid::nil(), &bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn repeated_custody_transfers_keep_the_downstream_account_share() {
+    let (journal, _, policy_envelope, authority) = prepared();
+    let policy_key = STANDARD.encode(authority.verifying_key().as_bytes());
+    let policy = shadow::verify(&policy_envelope,&policy_key,1,Utc::now()).unwrap();
+    let mut queue=broker::Queue::default();
+    let parsed=broker::parse(&event_request(uuid::Uuid::new_v4(),3)).unwrap();
+    queue.admit(&journal,&policy,&parsed).unwrap();
+    let event=queue.pending[0].event.clone();
+    let installation=uuid::Uuid::new_v4().to_string();
+    let mut state=State {public_key:policy_key,shadow_policy:Some(policy_envelope),shadow_revision:1,
+        detection:detection::Cache {revision:journal.catalog_revision,..Default::default()},..State::default()};
+    let share=250.min((crate::config::current().queue.max_events/2).max(1));
+    for sequence in 1..=share {
+        let mut event=event.clone();event.id=uuid::Uuid::new_v4();
+        let request=json!({"caller":{"system":true},"installation":installation,"sequence":sequence,
+            "quota_principal":"S-1-5-21-1000","event":event});
+        assert_eq!(broker::receive(&mut state,&request).0.unwrap()["durable"],true);
+    }
+    let mut refused=event.clone();refused.id=uuid::Uuid::new_v4();
+    let mut request=json!({"caller":{"system":true},"installation":installation,"sequence":share+1,
+        "quota_principal":"S-1-5-21-1000","event":refused});
+    assert!(broker::receive(&mut state,&request).0.is_err());
+    assert_eq!(state.browser_broker_receipt.as_ref().unwrap().sequence,share as u64);
+    assert_eq!(state.shadow_queue.len(),share);
+    request["quota_principal"]=json!("S-1-5-21-1001");
+    assert_eq!(broker::receive(&mut state,&request).0.unwrap()["durable"],true);
+    assert_eq!(state.shadow_queue.len(),share+1);
+    assert_eq!(state.browser_queue_owners.len(),share+1);
+}
+fn replay_live_response(journal: &cache::Journal, envelope: &Envelope, policy: &shadow::ShadowPolicy) -> Value {
+    json!({"ok":true,"policy":crate::native::browser_policy(policy),
+        "cache_policy_hash":cache::envelope_hash(envelope).unwrap(),"cache_authorization_generation":7,
+        "cache_policy_content_hash":journal.policy_content_hash,
+        "cache_catalog_content_hash":journal.catalog_content_hash,"cache_catalog_revision":journal.catalog_revision})
+}
+
+#[test]
+fn production_observation_orders_probe_results_and_does_not_extend_an_outage() {
+    use crate::cache_replay_authority::{Observation, classify};
+    let (mut journal, keys, envelope, authority) = prepared();
+    let policy = shadow::verify(&envelope, &STANDARD.encode(authority.verifying_key().as_bytes()), 1, Utc::now()).unwrap();
+    let response = replay_live_response(&journal, &envelope, &policy);
+    let boot = uuid::Uuid::new_v4().to_string(); journal.recovered(&boot, 100).unwrap();
+    let mut queue = broker::Queue::default(); let mut observation = Observation::default();
+    let authorized = observation.ticket().unwrap();
+    observation.observe(&mut journal, &keys, &mut queue, classify(Some(response.clone())), authorized, Some(&boot), 200).unwrap();
+    let captured_authorized_epoch = observation.epoch();
+    let outage = observation.ticket().unwrap();
+    assert!(observation.observe(&mut journal, &keys, &mut queue, classify(None), outage, Some(&boot), 300).unwrap().save);
+    assert_ne!(observation.epoch(), captured_authorized_epoch, "cached authorized work could otherwise recover a later outage");
+    let deadline = journal.deadline;
+    let outage_epoch = observation.epoch();
+    let next_outage = observation.ticket().unwrap();
+    observation.observe(&mut journal, &keys, &mut queue, classify(None), next_outage, Some(&boot), 400).unwrap();
+    assert_eq!(journal.deadline, deadline); assert_eq!(observation.epoch(), outage_epoch);
+    let recovery = observation.ticket().unwrap();
+    observation.observe(&mut journal, &keys, &mut queue, classify(Some(response)), recovery, Some(&boot), 500).unwrap();
+    assert_ne!(observation.epoch(), outage_epoch, "an older unreachable transcript must not start a second outage");
+}
+
+#[test]
+fn production_observation_rejects_delayed_probe_after_newer_success_or_failure() {
+    use crate::cache_replay_authority::{Observation, classify};
+    for newer_reachable in [true, false] {
+        let (mut journal, keys, envelope, authority) = prepared();
+        let policy = shadow::verify(&envelope, &STANDARD.encode(authority.verifying_key().as_bytes()), 1, Utc::now()).unwrap();
+        let response = replay_live_response(&journal, &envelope, &policy);
+        let boot = uuid::Uuid::new_v4().to_string(); journal.recovered(&boot, 100).unwrap();
+        let mut queue = broker::Queue::default(); let mut observation = Observation::default();
+        let old = observation.ticket().unwrap(); let new = observation.ticket().unwrap();
+        let newest = if newer_reachable { Some(response.clone()) } else { None };
+        observation.observe(&mut journal, &keys, &mut queue, classify(newest), new, Some(&boot), 200).unwrap();
+        let epoch = observation.epoch(); let deadline = journal.deadline;
+        let delayed = if newer_reachable { None } else { Some(response) };
+        assert!(observation.observe(&mut journal, &keys, &mut queue, classify(delayed), old, Some(&boot), 300).is_err());
+        assert_eq!(observation.epoch(), epoch); assert_eq!(journal.deadline, deadline);
+    }
+}
+
+#[test]
+fn production_local_event_preparation_is_identity_free_and_preserves_dlp_custody() {
+    let (journal, _, envelope, authority) = prepared();
+    let mut policy = shadow::verify(&envelope, &STANDARD.encode(authority.verifying_key().as_bytes()), 1, Utc::now()).unwrap();
+    let input = json!({"kind":"prompt","provider":"chatgpt.com","source":"browser","tool":"chrome",
+        "action":"observed","characters":20,"labels":[],"prompt":"synthetic local text"});
+    let normal = crate::cache_replay_authority::local_work(&json!({"op":"cache_local_event","policy":policy,
+        "catalog_revision":journal.catalog_revision,"input":input,"trace":null})).unwrap().unwrap();
+    let normal:shadow::ShadowEvent=serde_json::from_value(normal).unwrap();
+    assert!(normal.id.is_nil()); assert!(normal.user.is_none()); assert!(normal.prompt.is_some());
+    policy.version = 4;
+    policy.config["collection"] = json!({"enabled":false,"store_content":false,"store_file_names":false});
+    policy.config["dlp"] = json!({"schema_version":1,"domain":"endpoint","inspection":true,"native_inspection":false,"journal":true,"detectors":[],"rules":[]});
+    policy.config["dlp_fingerprint"] = json!("a".repeat(64)); policy.config["dlp_legacy_disabled"] = json!(true);
+    use shadow::dlp_transport::{Trace, Decision, Mode, Truth};
+    for delivery in ["not_sent","cancelled"] {
+        let trace = Trace { fingerprint:"a".repeat(64),action:"block".into(),delivery:delivery.into(),
+            decisions:vec![Decision {rule_id:"synthetic.rule".into(),rule_revision:1,rule_name:"Synthetic rule".into(),
+                mode:Mode::Active,consequence:"block".into(),condition:Truth::True,scope:Truth::True,
+                outcome:if delivery=="cancelled" {"cancelled"}else{"blocked"}.into(),occurrences:1}] };
+        let prepared = crate::cache_replay_authority::local_work(&json!({"op":"cache_local_event","policy":policy,
+            "catalog_revision":journal.catalog_revision,"input":input,"trace":trace})).unwrap().unwrap();
+        let event:shadow::ShadowEvent=serde_json::from_value(prepared).unwrap();
+        assert!(event.id.is_nil()); assert!(event.user.is_none()); assert!(event.prompt.is_none());
+        assert_eq!(event.dlp.as_ref().unwrap().delivery, delivery);
+    }
+}
+
+#[test]
+fn legacy_unattributed_row_cannot_gain_in_place_completion_during_handoff(){
+    let(journal,_,envelope,authority)=prepared();let policy=shadow::verify(&envelope,&STANDARD.encode(authority.verifying_key().as_bytes()),1,Utc::now()).unwrap();
+    let mut queue=broker::Queue::default();let parsed=broker::parse(&event_request(uuid::Uuid::new_v4(),1)).unwrap();
+    let id=queue.admit(&journal,&policy,&parsed).unwrap();let mut value=serde_json::to_value(&queue).unwrap();
+    value["pending"][0].as_object_mut().unwrap().remove("principal");
+    let mut legacy:broker::Queue=serde_json::from_value(value).unwrap();legacy.validate().unwrap();
+    assert!(!legacy.complete(&shadow::ShadowCompletion::parse_for(id,&json!({"model":"synthetic-model"})).unwrap()));
+    assert!(legacy.pending[0].event.model.is_none());
+}
+
+#[test]
+fn real_native_completion_receiver_reports_recoverable_quota_refusal(){
+    let(journal,_,envelope,authority)=prepared();let policy=shadow::verify(&envelope,&STANDARD.encode(authority.verifying_key().as_bytes()),1,Utc::now()).unwrap();
+    let base=shadow::browser_event(&policy,journal.catalog_revision,json!({"kind":"prompt","provider":"chatgpt.com","source":"browser","tool":"chrome",
+        "action":"observed","characters":1,"labels":[],"prompt":"synthetic"})).unwrap();
+    let mut state=State::default();let owner="sid:S-1-5-21-1000";
+    for _ in 0..250{
+        let mut row=base.clone();row.id=uuid::Uuid::new_v4();row.prompt=Some("x".repeat(32*1024));let id=row.id;state.shadow_queue.push(row);
+        if crate::browser_queue_quota::claim(&mut state,id,owner.into()).is_err(){crate::browser_queue_quota::rollback(&mut state,id);break;}
+    }
+    let mut row=base;row.id=uuid::Uuid::new_v4();row.prompt=Some(String::new());let id=row.id;state.shadow_queue.push(row);
+    crate::browser_queue_quota::claim(&mut state,id,owner.into()).unwrap();
+    let cap=(2*1024*1024).min((crate::config::current().queue.max_bytes/2).max(1));
+    let used=shadow::queue_bytes(&state).unwrap();let padding=cap.checked_sub(used+32).unwrap();assert!(padding<32*1024);
+    state.shadow_queue.last_mut().unwrap().prompt=Some("x".repeat(padding));crate::browser_queue_quota::check_growth(&state,id).unwrap();
+    let home=tempfile::tempdir().unwrap();{let store=crate::Store::open(home.path()).unwrap();store.save(&state).unwrap();}
+    let too_large=shadow::ShadowCompletion::parse_for(id,&json!({"model":"m".repeat(200),"effort":"e".repeat(200),"conversation_id":"c".repeat(200)})).unwrap();
+    let reply=crate::native::native_message(home.path(),json!({"op":"broker_complete","caller":{"system":true},"completion":too_large})).unwrap();
+    assert_eq!(reply["ok"],true);assert_eq!(reply["applied"],false);
+    {let store=crate::Store::open(home.path()).unwrap();let current=store.load().unwrap();assert!(current.shadow_queue.iter().any(|event|event.id==id&&event.model.is_none()));}
+    let small=shadow::ShadowCompletion::parse_for(id,&json!({"body_bytes":1})).unwrap();
+    let reply=crate::native::native_message(home.path(),json!({"op":"broker_complete","caller":{"system":true},"completion":small})).unwrap();
+    assert_eq!(reply["applied"],true);
+}
+
+#[test]
+fn transfer_marker_roundtrips_refuses_mutation_and_charges_only_present_format_bytes(){
+    let(journal,_,envelope,authority)=prepared();let policy=shadow::verify(&envelope,&STANDARD.encode(authority.verifying_key().as_bytes()),1,Utc::now()).unwrap();
+    let mut queue=broker::Queue::default();let id=queue.admit(&journal,&policy,&broker::parse(&event_request(uuid::Uuid::new_v4(),1)).unwrap()).unwrap();
+    let old=serde_json::to_value(&queue).unwrap();assert!(old["pending"][0].get("transfer_started").is_none());
+    queue.pending[0].transfer_started=true;let size=shadow::serialized_size(&queue).unwrap();
+    let padding=broker::MAX_BYTES+24-size;queue.pending[0].event.prompt.as_mut().unwrap().push_str(&"x".repeat(padding));
+    queue.pending[0].transfer_started=false;assert_eq!(shadow::serialized_size(&queue).unwrap(),broker::MAX_BYTES);queue.validate().unwrap();
+    queue.pending[0].transfer_started=true;assert_eq!(shadow::serialized_size(&queue).unwrap(),broker::MAX_BYTES+24);queue.validate().unwrap();
+    let bytes=serde_json::to_vec(&queue).unwrap();let mut restored:broker::Queue=serde_json::from_slice(&bytes).unwrap();restored.validate().unwrap();
+    assert!(restored.pending[0].transfer_started);
+    assert!(!restored.complete(&shadow::ShadowCompletion::parse_for(id,&json!({"model":"synthetic-model"})).unwrap()));
+    restored.pending[0].event.prompt.as_mut().unwrap().push('x');assert!(restored.validate().is_err());
+    let mut malformed=old.clone();malformed["pending"][0]["transfer_started"]=json!("true");assert!(serde_json::from_value::<broker::Queue>(malformed).is_err());
+    let mut oversized=old;let mut row=oversized["pending"][0].clone();row["transfer_started"]=json!(true);oversized["pending"]=json!(vec![row;broker::MAX_EVENTS+1]);
+    let oversized:broker::Queue=serde_json::from_value(oversized).unwrap();assert!(oversized.validate().is_err());
+}
+
+#[test]
+fn offered_retry_allows_only_privacy_narrowing_and_never_metadata_or_identity_changes(){
+    let(journal,_,envelope,authority)=prepared();let policy=shadow::verify(&envelope,&STANDARD.encode(authority.verifying_key().as_bytes()),1,Utc::now()).unwrap();
+    let original=shadow::browser_event(&policy,journal.catalog_revision,json!({"kind":"prompt","provider":"chatgpt.com","source":"browser","tool":"chrome",
+        "action":"observed","characters":1,"labels":[],"prompt":"synthetic"})).unwrap();
+    let mut narrow=original.clone();narrow.discard_content();narrow.files.clear();
+    assert!(crate::cache_replay_authority::narrow_offered(&original,&serde_json::to_value(narrow).unwrap()).is_ok());
+    for field in ["id","model","action"]{
+        let mut changed=serde_json::to_value(&original).unwrap();changed[field]=match field{"id"=>json!(uuid::Uuid::new_v4()),"action"=>json!("blocked"),_=>json!("injected-model")};
+        assert!(crate::cache_replay_authority::narrow_offered(&original,&changed).is_err());
+    }
+}
+
+// These tests exercise the actual portable observation/token implementation used
+// by the Windows adapter, with real signed journals and the production driver.
+struct PortableReplayAuthority {
+    journal:cache::Journal, keys:cache::Keys, catalogue:Envelope, queue:broker::Queue,
+    observation:crate::cache_replay_authority::Observation,
+    boot:String, staged:bool, dirty:bool, saves:usize,
+}
+enum PortableReplayOperation {
+    Policy,
+    Replace { envelope:Envelope, catalog:Envelope },
+}
+impl PortableReplayAuthority {
+    fn save(&mut self) -> crate::Result<()> {
+        self.dirty=true;
+        if !self.staged { self.queue.validate()?; self.saves+=1; self.dirty=false; }
+        Ok(())
+    }
+}
+impl crate::cache_replay::Target for PortableReplayAuthority {
+    type Operation=PortableReplayOperation; type Output=bool;
+    type Snapshot=(cache::Journal,broker::Queue,bool);
+    type Token=crate::cache_replay_authority::Token; type Ticket=Option<u64>;
+    fn token(&self)->crate::Result<Self::Token>{self.observation.token(&self.journal)}
+    fn snapshot(&self)->Self::Snapshot{(self.journal.clone(),self.queue.clone(),self.dirty)}
+    fn restore(&mut self,snapshot:Self::Snapshot){self.journal=snapshot.0;self.queue=snapshot.1;self.dirty=snapshot.2;}
+    fn staging(&mut self,enabled:bool){self.staged=enabled;}
+    fn flush(&mut self)->crate::Result<()>{if self.dirty{self.save()?;}Ok(())}
+    fn begin_exchange(&mut self,_operation:&Self::Operation,request:&Value)->crate::Result<Option<u64>>{
+        Ok(if request["op"]=="policy_v3"{Some(self.observation.ticket()?)}else{None})
+    }
+    fn is_refused_reply(&self,request:&Value,reply:&crate::cache_replay::Reply)->bool{
+        request["op"]=="policy_v3"&&matches!(reply,crate::cache_replay::Reply::Value(value)if matches!(crate::cache_replay_authority::classify(Some(value.clone())),crate::cache_replay_authority::Input::Refused))
+    }
+    fn accept_changed_token(&self,expected:&Self::Token,request:&Value,reply:&crate::cache_replay::Reply,ticket:&Option<u64>)->crate::Result<bool>{
+        self.observation.accept_changed_token(&self.journal,expected,request,reply,*ticket)
+    }
+    fn observe(&mut self,_operation:&Self::Operation,request:&Value,reply:&crate::cache_replay::Reply,ticket:Option<u64>)->crate::Result<()>{
+        if request["op"]!="policy_v3"{return Ok(());}
+        let input=crate::cache_replay_authority::classify(match reply{crate::cache_replay::Reply::Value(value)=>Some(value.clone()),crate::cache_replay::Reply::Unreachable=>None});
+        let effect=self.observation.observe(&mut self.journal,&self.keys,&mut self.queue,input,ticket.unwrap(),Some(&self.boot),1000)?;
+        if effect.save{self.save()?;}Ok(())
+    }
+    fn attempt(&mut self,operation:&Self::Operation,transcript:&mut crate::cache_replay::Transcript)->crate::Result<bool>{
+        let input=crate::cache_replay_authority::classify(transcript.exchange(&json!({"op":"policy_v3"})).ok());
+        match input{
+            crate::cache_replay_authority::Input::Refused=>Ok(false),
+            crate::cache_replay_authority::Input::Unreachable=>{let result=self.journal.remaining(&self.boot,1000,cache::Presence::Unreachable);self.save()?;result.map(|_|true)},
+            crate::cache_replay_authority::Input::Authorized{..}=>{
+                if let PortableReplayOperation::Replace{envelope,catalog}=operation{cache::prepare(&mut self.journal,&self.keys,envelope,catalog)?;}
+                self.journal.recovered(&self.boot,1000)?;self.save()?;Ok(true)
+            }
+        }
+    }
+}
+// Capture one exact admitted signed catalogue; its revision-one content contains a timestamp.
+fn portable_replay_prepared() -> (cache::Journal, cache::Keys, Envelope, SigningKey, Envelope) {
+    let policy_key = authority();
+    let keys = cache::Keys::generate();
+    let pin = cache::Pin {
+        installation: uuid::Uuid::new_v4().to_string(),
+        edition: "community".into(),
+        origin: "https://example.test".into(),
+        organization_anchor: STANDARD.encode(policy_key.verifying_key().as_bytes()),
+        signing_key: keys.public(),
+    };
+    let mut journal = cache::Journal::new(pin).unwrap();
+    let policy = policy(&policy_key);
+    let catalogue=catalog(&policy_key);
+    cache::prepare(&mut journal, &keys, &policy, &catalogue).unwrap();
+    assert_eq!(cache::envelope_hash(&catalogue).unwrap(),journal.catalog_hash);
+    (journal, keys, policy, policy_key, catalogue)
+}
+
+fn portable_replay_fixture()->(PortableReplayAuthority,Value,SigningKey,Envelope){
+    let(mut journal,keys,envelope,authority,catalogue)=portable_replay_prepared();
+    let policy=shadow::verify(&envelope,&STANDARD.encode(authority.verifying_key().as_bytes()),1,Utc::now()).unwrap();
+    let response=replay_live_response(&journal,&envelope,&policy);
+    let boot=uuid::Uuid::new_v4().to_string();journal.recovered(&boot,100).unwrap();
+    (PortableReplayAuthority{journal,keys,catalogue,queue:broker::Queue::default(),observation:Default::default(),boot,staged:false,dirty:false,saves:0},response,authority,envelope)
+}
+fn portable_deadline()->std::time::Instant{std::time::Instant::now()+std::time::Duration::from_secs(5)}
+
+#[test]
+fn production_portable_driver_reuses_delayed_same_policy_without_cancelling_the_slower_principal(){
+    use std::sync::{Arc,Mutex,mpsc};use std::thread;
+    let(target,response,_,_)=portable_replay_fixture();let slot=Arc::new(Mutex::new(Some(target)));
+    let a_slot=slot.clone();let a_response=response.clone();let(started,seen)=mpsc::channel();let(release,wait)=mpsc::channel();
+    let a=thread::spawn(move||crate::cache_replay::drive(&a_slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|{
+        started.send(()).unwrap();wait.recv().unwrap();crate::cache_replay::Reply::Value(a_response.clone())
+    }));
+    seen.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(crate::cache_replay::drive(&slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|crate::cache_replay::Reply::Value(response.clone())).unwrap());
+    let epoch=slot.lock().unwrap().as_ref().unwrap().observation.epoch();
+    release.send(()).unwrap();assert!(a.join().unwrap().unwrap());
+    assert_eq!(slot.lock().unwrap().as_ref().unwrap().observation.epoch(),epoch);
+}
+
+#[test]
+fn production_portable_driver_keeps_delayed_refusal_across_newer_uncertainty(){
+    use std::sync::{Arc,Mutex,mpsc};use std::thread;
+    let(target,_,_,_)=portable_replay_fixture();let slot=Arc::new(Mutex::new(Some(target)));let a_slot=slot.clone();
+    let(started,seen)=mpsc::channel();let(release,wait)=mpsc::channel();
+    let a=thread::spawn(move||crate::cache_replay::drive(&a_slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|{
+        started.send(()).unwrap();wait.recv().unwrap();crate::cache_replay::Reply::Value(json!({"ok":false}))
+    }));
+    seen.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+    assert!(crate::cache_replay::drive(&slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|crate::cache_replay::Reply::Unreachable).unwrap());
+    assert!(slot.lock().unwrap().as_ref().unwrap().journal.deadline.is_some());
+    release.send(()).unwrap();assert!(!a.join().unwrap().unwrap());
+    {let guard=slot.lock().unwrap();let current=guard.as_ref().unwrap();assert!(current.journal.cache.is_none());assert!(!current.journal.armed);}
+    assert!(crate::cache_replay::drive(&slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|crate::cache_replay::Reply::Unreachable).is_err());
+}
+
+#[test]
+fn production_portable_driver_newer_positive_and_replacement_protect_against_old_refusal(){
+    use std::sync::{Arc,Mutex,mpsc};use std::thread;
+    for replace in [false,true]{
+        let(target,mut response,key,envelope)=portable_replay_fixture();let catalogue=target.catalogue.clone();let slot=Arc::new(Mutex::new(Some(target)));let a_slot=slot.clone();
+        let(started,seen)=mpsc::channel();let(release,wait)=mpsc::channel();
+        let a=thread::spawn(move||crate::cache_replay::drive(&a_slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|{
+            started.send(()).unwrap();wait.recv().unwrap();crate::cache_replay::Reply::Value(json!({"ok":false}))
+        }));
+        seen.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let operation=if replace{
+            let mut policy:shadow::ShadowPolicy=serde_json::from_slice(&STANDARD.decode(envelope.payload).unwrap()).unwrap();
+            policy.revision+=1;policy.issued_at+=Duration::milliseconds(1);policy.expires_at+=Duration::milliseconds(1);
+            policy.config["collection"]["store_content"]=json!(false);
+            let envelope=signed(&key,&policy);
+            response["policy"]=crate::native::browser_policy(&policy);
+            response["cache_policy_hash"]=json!(cache::envelope_hash(&envelope).unwrap());
+            response["cache_policy_content_hash"]=json!(cache::policy_content_hash(&policy).unwrap());
+            PortableReplayOperation::Replace{envelope,catalog:catalogue}
+        }else{PortableReplayOperation::Policy};
+        assert!(crate::cache_replay::drive(&slot,&operation,portable_deadline(),||unreachable!(),|_,_|crate::cache_replay::Reply::Value(response.clone())).unwrap());
+        let generation=slot.lock().unwrap().as_ref().unwrap().journal.generation;
+        release.send(()).unwrap();assert!(a.join().unwrap().is_err());
+        let guard=slot.lock().unwrap();let current=guard.as_ref().unwrap();
+        assert!(current.journal.cache.is_some());assert!(current.journal.armed);assert_eq!(current.journal.generation,generation);
+        assert_eq!(current.journal.policy_revision,if replace{2}else{1});
+    }
+}
+
+#[test]
+fn production_portable_driver_never_applies_old_refusal_to_another_pin_or_generation(){
+    use std::sync::{Arc,Mutex,mpsc};use std::thread;
+    for replace_pin in [false,true]{
+        let(target,_,_key,envelope)=portable_replay_fixture();let slot=Arc::new(Mutex::new(Some(target)));let a_slot=slot.clone();
+        let(started,seen)=mpsc::channel();let(release,wait)=mpsc::channel();
+        let a=thread::spawn(move||crate::cache_replay::drive(&a_slot,&PortableReplayOperation::Policy,portable_deadline(),||unreachable!(),|_,_|{
+            started.send(()).unwrap();wait.recv().unwrap();crate::cache_replay::Reply::Value(json!({"ok":false}))
+        }));
+        seen.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        {
+            let mut guard=slot.lock().unwrap();
+            if replace_pin{*guard=Some(portable_replay_fixture().0);}
+            else{let current=guard.as_mut().unwrap();current.journal.invalidate().unwrap();
+                cache::prepare(&mut current.journal,&current.keys,&envelope,&current.catalogue).unwrap();
+                current.journal.recovered(&current.boot,1000).unwrap();current.save().unwrap();}
+        }
+        let generation=slot.lock().unwrap().as_ref().unwrap().journal.generation;
+        release.send(()).unwrap();assert!(a.join().unwrap().is_err());
+        let guard=slot.lock().unwrap();let current=guard.as_ref().unwrap();
+        assert!(current.journal.cache.is_some());assert!(current.journal.armed);assert_eq!(current.journal.generation,generation);
+    }
 }

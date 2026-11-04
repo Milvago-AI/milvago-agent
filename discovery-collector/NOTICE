@@ -1,0 +1,12 @@
+Milvago discovery collector
+Copyright (c) 2026 Milvago AI, LLC
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+Uses the adjacent Apache-2.0 discovery engine; see its NOTICE for Julius
+OpenClaw and Hermes probe attribution. Direct third-party runtime dependencies:
+serde 1.0.229, serde_json 1.0.151, reqwest 0.12.28, sha2 0.11.0,
+libc 0.2.190, windows-sys 0.61.2 (MIT OR Apache-2.0);
+tonic and tonic-prost 0.14.6, tokio 1.53.1, tower 0.5.3,
+hyper-util 0.1.20 (MIT); prost 0.14.4 (Apache-2.0).
+Test-only dependencies: h2 0.4.20, bytes 1.12.1 (MIT),
+http 1.5.0 (MIT OR Apache-2.0). Transitive versions: Cargo.lock.
