@@ -6,10 +6,10 @@ All notable changes to this repository are recorded here. The format follows
 
 ## [Unreleased]
 
-## [0.7.0] - not yet released
+## [0.7.44] - not yet released
 
-The release pipeline is prepared for shared agent and extension version `0.7.0`; `v0.7.0` has
-not been published. It supersedes the unpublished `0.6.5`.
+The Community release is prepared for agent and extension version `0.7.44`; it has
+not been published. Earlier local qualification versions are not reused for these bytes.
 
 ### Added
 
@@ -29,10 +29,10 @@ not been published. It supersedes the unpublished `0.6.5`.
 
 ### Changed
 
-- Keep the agent and browser extension on common version 0.7.0.
+- Keep the agent and browser extension on common version 0.7.44.
 - Advertise catalogue engine `0.7.0` for the new declarative routes and body formats.
   Upgrade the agent and browser extension together before activating the new server
-  catalogue; published agent `0.6.4` cannot apply it. Compatible signed `0.7.0` packages
+  catalogue; published agent `0.6.4` cannot apply it. Compatible signed `0.7.44` packages
   and real installation qualification are still required before release.
 - Reduce the cognitive complexity of the extension's `capture.js`, without behaviour change.
 - Upgrade rand to 0.10.2 and sha2 to 0.11.0 while preserving system randomness and lowercase SHA-256 formats.
