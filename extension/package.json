@@ -8,7 +8,7 @@
     "test": "node --test *.test.js"
   },
   "devDependencies": {
-    "eslint": "10.12.0",
+    "eslint": "10.14.0",
     "jsdom": "30.1.3"
   },
   "overrides": {
